@@ -1,4 +1,4 @@
-# $Id: Oracle.pm,v 1.37 2001/03/03 18:53:14 rvsutherland Exp $ 
+# $Id: Oracle.pm,v 1.38 2001/03/11 17:19:25 rvsutherland Exp $ 
 #
 # Copyright (c) 2000, 2001 Richard Sutherland - United States of America
 #
@@ -9,7 +9,7 @@ require 5.004;
 
 BEGIN
 {
-  $DDL::Oracle::VERSION = "1.04"; # Also update version in pod text below!
+  $DDL::Oracle::VERSION = "1.05"; # Also update version in pod text below!
 }
 
 package DDL::Oracle;
@@ -18,7 +18,6 @@ use strict;
 
 my $block_size;
 my $dbh;
-my $dbh2;
 my $ddl;
 my $host;
 my $instance;
@@ -115,15 +114,11 @@ sub configure
   $^W = 0;
 
   $dbh               = $args{ 'dbh'  };
-  $attr{ 'dbh2' }    = $args{ 'dbh2' };
   $attr{ 'view' }    = ( "\U$args{ 'view'  }" eq 'USER' ) ? 'USER' : 'DBA';
-  $attr{ 'view2' }   = ( "\U$args{ 'view2' }" eq 'USER' ) ? 'USER' : 'DBA';
   $attr{ 'schema'  } = ( exists $args{ 'schema'  }  ) ? $args{ 'schema'  } : 1;
-  $attr{ 'schema2' } = ( exists $args{ 'schema2' }  ) ? $args{ 'schema2' } : 1;
   $attr{ 'resize'  } = ( exists $args{ 'resize'  }  ) ? $args{ 'resize'  } : 1;
+  $attr{ 'prompt'  } = ( exists $args{ 'prompt'  }  ) ? $args{ 'prompt'  } : 1;
   $attr{ 'heading' } = ( exists $args{ 'heading' }  ) ? $args{ 'heading' } : 1;
-  $attr{ 'blksize' } = $args{ 'blksize' };
-  $attr{ 'version' } = $args{ 'version' };
 
   _set_sizing();
   _get_oracle_release();
@@ -173,6 +168,7 @@ sub compile
                                ); 
   }
 
+  _scratch_prompts()    unless $attr{ prompt };
   return $ddl;
 }
 
@@ -196,6 +192,7 @@ sub create
     $ddl .= $create{ $type }->( $schema, $owner, $name, $attr{ view } ); 
   }
 
+  _scratch_prompts()    unless $attr{ prompt };
   return $ddl;
 }
 
@@ -219,6 +216,7 @@ sub drop
     $ddl .= $drop{ $type }->( $schema, $name, $type, $owner,  $attr{ view } ); 
   }
 
+  _scratch_prompts()    unless $attr{ prompt };
   return $ddl;
 }
 
@@ -242,6 +240,7 @@ sub resize
     $ddl .= $resize{ $type }->( $schema, $owner, $name, $attr{ view } ); 
   }
 
+  _scratch_prompts()    unless $attr{ prompt };
   return $ddl;
 }
 
@@ -4622,23 +4621,18 @@ sub _generate_heading
 #
 sub _get_oracle_release
 {
-  $oracle_release = $attr{ version };
-
-  unless ( $oracle_release )
-  {
-    $sth = $dbh->prepare(
+  $sth = $dbh->prepare(
       "
        SELECT
-              banner
+              version
        FROM
-              v\$version
+              product_component_version
        WHERE
-              banner LIKE 'Oracle%'
+              product LIKE 'Oracle%'
       ");
 
-    $sth->execute;
-    ( $oracle_release ) = $sth->fetchrow_array;
-  }
+  $sth->execute;
+  $oracle_release = $sth->fetchrow_array;
 
   (
     $oracle_release,
@@ -5804,6 +5798,22 @@ sub _resize_table_partition
   return $sql;
 }
 
+# sub _scratch_prompts
+#
+# Eliminates all PROMPT statements
+#
+sub _scratch_prompts
+{
+  # Drop all lines beginning with PROMPT
+  $ddl = ( join "\n",grep !/^PROMPT/,split /\n/,$ddl );
+
+  # This would have left the first line blank, so drop it
+  $ddl =~ s|\A\n||;
+
+  # Get rid of double blank lines
+  $ddl =~ s|\n\n+|\n\n|g;
+}
+
 # sub _segments_attributes
 #
 # Formats the segment attributes portion of CREATE TABLE and CREATE INDEX
@@ -5900,26 +5910,34 @@ sub _set_schema
 #
 sub _set_sizing 
 {
-  $block_size = $attr{ blksize } || 0;
-  if ( $block_size )
-  {
-    $block_size = sprintf( "%.0f", abs( $block_size /= 1024 ) );
-  }
-  else
-  {
-    $sth = $dbh->prepare(
+  $sth = $dbh->prepare(
       "
        SELECT
-              value
+              block_size
        FROM
-              v\$parameter
+              (
+                SELECT
+                       bytes / blocks   AS block_size
+                FROM
+                       user_segments
+                WHERE
+                           bytes  IS NOT NULL
+                       AND blocks IS NOT NULL
+                UNION
+                SELECT
+                       bytes / blocks   AS block_size
+                FROM
+                       user_free_space
+                WHERE
+                           bytes  IS NOT NULL
+                       AND blocks IS NOT NULL
+              )
        WHERE
-              name = 'db_block_size'
+              rownum < 2
       ");
 
-    $sth->execute;
-    $block_size = $sth->fetchrow_array / 1024;
-  }
+  $sth->execute;
+  $block_size = $sth->fetchrow_array / 1024;
 
   if ( $attr{ 'resize' } == 1 )
   {
@@ -6206,7 +6224,7 @@ DDL::Oracle - a DDL generator for Oracle databases
 
 =head1 VERSION
 
-VERSION = 1.04
+VERSION = 1.05
 
 =head1 SYNOPSIS
 
@@ -6296,12 +6314,10 @@ several session level attributes.  These are:
 
                NOTE: The user connecting should have SELECT privileges
                      on the following views (in addition to the DBA or
-                     USER views), but see attributes 'heading', 'blksize'
-                     and 'version' below for exceptions:
+                     USER views), but see attributes 'heading' for
+                     exceptions:
 
-                         V$VERSION
                          V$DATABASE
-                         V$PARAMETER
 
                      And, in order to generate CREATE SNAPSHOT LOG
                      statements, you will also need to create a PUBLIC
@@ -6345,15 +6361,12 @@ several session level attributes.  These are:
                heading (and eliminate the query against V$DATABASE).
                The default is "1".
 
-      blksize  Defines the database block size.  If this attribute is
-               supplied, you eliminate the query against V$PARAMETER.
-               The default is to query V$PARAMETER for this value.
-
-      version  A quoted string which defines the version of the database,
-               and must be a version supported by the module (currently
-               7.x, 8.0 and 8.1).  If this attribute is supplied, you
-               eliminate the query against V$VERSION.  The default is to
-               query V$VERSION for this value.
+      prompt   Defines whether to include a PROMPT statement along
+               with the DDL.  If the output is intended for use in
+               SQL*Plus, this will cause SQL*Plus to display a comment
+               about each statement before it executes, which can be
+               helpful in a multi-statement file.  "1" means include
+               the prompt; "0" or "" means to suppress the prompt.
 
 new  
 

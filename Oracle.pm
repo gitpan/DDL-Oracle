@@ -1,4 +1,4 @@
-# $Id: Oracle.pm,v 1.38 2001/03/11 17:19:25 rvsutherland Exp $ 
+# $Id: Oracle.pm,v 1.40 2001/03/18 14:19:13 rvsutherland Exp $ 
 #
 # Copyright (c) 2000, 2001 Richard Sutherland - United States of America
 #
@@ -9,7 +9,7 @@ require 5.004;
 
 BEGIN
 {
-  $DDL::Oracle::VERSION = "1.05"; # Also update version in pod text below!
+  $DDL::Oracle::VERSION = "1.06"; # Also update version in pod text below!
 }
 
 package DDL::Oracle;
@@ -96,6 +96,13 @@ my %drop =
   'type'                  => \&_drop_schema_object,
   'user'                  => \&_drop_user,
   'view'                  => \&_drop_schema_object,
+);
+
+my %show_space =
+(
+  'index'                 => \&_show_free_space,
+  'table'                 => \&_show_free_space,
+  'cluster'               => \&_show_free_space,
 );
 
 my %resize =
@@ -214,6 +221,29 @@ sub drop
     my $schema = _set_schema( $owner );
 
     $ddl .= $drop{ $type }->( $schema, $name, $type, $owner,  $attr{ view } ); 
+  }
+
+  _scratch_prompts()    unless $attr{ prompt };
+  return $ddl;
+}
+
+sub show_space
+{
+  my $self = shift;
+  my $type = lc( $self->{ type } );
+
+  die "\nObject type '$type' is invalid for 'show_space' method.\n\n"
+    unless $show_space{ $type };
+
+  my $list  = $self->{ list };
+  my $class = ref( $self );
+  _generate_heading( $class, 'FREE SPACE', $type, $list );
+
+  foreach my $row ( @{ $self->{ list } } )
+  {
+    my ( $owner, $name ) = @$row;
+
+    $ddl .= $show_space{ $type }->( $owner, $name, $type, $attr{ view } ); 
   }
 
   _scratch_prompts()    unless $attr{ prompt };
@@ -4046,7 +4076,13 @@ sub _create_trigger
 {
   my ( $schema, $owner, $name, $view ) = @_;
 
-  my $stmt =
+  my $stmt;
+  if (
+          $oracle_major > 8
+       or ( $oracle_major == 8 and $oracle_minor > 0 )
+     )
+  {
+    $stmt =
       "
        SELECT
               trigger_type
@@ -4067,6 +4103,32 @@ sub _create_trigger
        WHERE
                   trigger_name = UPPER( ? )
       ";
+  }
+  else
+  {
+    $stmt =
+      "
+       SELECT
+              trigger_type
+            , RTRIM(triggering_event)
+            , table_owner
+            , table_name
+              -- Only table triggers before 8i
+            , 'TABLE'                           AS base_object_type
+            , referencing_names
+            , description
+            , DECODE(
+                      when_clause
+                     ,null,null
+                     ,'WHEN (' || when_clause || ')' || CHR(10)
+                    )
+            , trigger_body
+       FROM
+              ${view}_triggers
+       WHERE
+                  trigger_name = UPPER( ? )
+      ";
+  }
 
   if ( $view eq 'DBA' )
   {
@@ -4120,7 +4182,6 @@ sub _create_trigger
   $sql .= "/\n\n";
 
   return $sql;
-#here
 }
 
 # sub _create_type
@@ -4576,8 +4637,17 @@ sub _generate_heading
           "REM from: $instance, an Oracle Release $oracle_release instance\n" .
           "REM\n" .
           "REM on:   " . scalar ( localtime ) . "\n" .
-          "REM\n" .
-          "REM Generating $action \U$type \Lstatement";
+          "REM\n";
+
+  if ( $action eq 'FREE SPACE' )
+  {
+    $ddl .= "REM Generating $action \Lreport";
+  }
+  else
+  {
+    $ddl .= "REM Generating $action \U$type \Lstatement";
+  }
+
   $ddl .= ( @$list == 1 ) ? '' : "s";
   $ddl .= " for:\n" .
           "REM\n"; 
@@ -4988,6 +5058,163 @@ sub _key_columns
 sub _partition_key_columns
 {
   return _key_columns( @_, 'PART' );
+}
+
+# sub _print_space
+#
+# Returns a formatted string containing the space analysis report.
+#
+sub _print_space
+{
+  my ( $owner, $name, $type, $partition ) = @_;
+
+  my (
+       $total_blocks,
+       $total_bytes,
+       $unused_blocks,
+       $unused_bytes,
+       $last_file_id,
+       $last_block_id,
+       $last_block,
+       $free_blocks,
+     );
+
+  my $max_length = 20;
+  my $freelist_group_id = 0;
+
+  if ( $partition )
+  {
+    $sth = $dbh->prepare(
+                          "
+                           BEGIN 
+                             dbms_space.unused_space (
+                                                       ?,?,?,?,?,?,?,?,?,?,?
+                                                     ) ;
+                           END ;
+                          "
+                        );
+    $sth->bind_param( 1, "\U$owner" );
+    $sth->bind_param( 2, "\U$name"  );
+    $sth->bind_param( 3, "\U$type"  );
+    $sth->bind_param_inout( 4 , \$total_blocks , $max_length );
+    $sth->bind_param_inout( 5 , \$total_bytes  , $max_length );
+    $sth->bind_param_inout( 6 , \$unused_blocks, $max_length );
+    $sth->bind_param_inout( 7 , \$unused_bytes , $max_length );
+    $sth->bind_param_inout( 8 , \$last_file_id , $max_length );
+    $sth->bind_param_inout( 9 , \$last_block_id, $max_length );
+    $sth->bind_param_inout( 10, \$last_block   , $max_length );
+    $sth->bind_param( 11, $partition );
+    $sth->execute;
+
+    $sth = $dbh->prepare(
+                          "
+                           BEGIN 
+                             dbms_space.free_blocks(
+                                                      ?,?,?,?,?,?,?
+                                                    ) ;
+                           END ;
+                          "
+                        );
+    $sth->bind_param( 1, "\U$owner"          );
+    $sth->bind_param( 2, "\U$name"           );
+    $sth->bind_param( 3, "\U$type"           );
+    $sth->bind_param( 4, $freelist_group_id  );
+    $sth->bind_param_inout( 5 , \$free_blocks, $max_length );
+    $sth->bind_param( 6, '' );
+    $sth->bind_param( 7, $partition );
+    $sth->execute;
+  }
+  else
+  {
+    $sth = $dbh->prepare(
+                          "
+                           BEGIN 
+                             dbms_space.unused_space (
+                                                       ?,?,?,?,?,?,?,?,?,?
+                                                     ) ;
+                           END ;
+                          "
+                        );
+    $sth->bind_param( 1, "\U$owner" );
+    $sth->bind_param( 2, "\U$name"  );
+    $sth->bind_param( 3, "\U$type"  );
+    $sth->bind_param_inout( 4 , \$total_blocks , $max_length );
+    $sth->bind_param_inout( 5 , \$total_bytes  , $max_length );
+    $sth->bind_param_inout( 6 , \$unused_blocks, $max_length );
+    $sth->bind_param_inout( 7 , \$unused_bytes , $max_length );
+    $sth->bind_param_inout( 8 , \$last_file_id , $max_length );
+    $sth->bind_param_inout( 9 , \$last_block_id, $max_length );
+    $sth->bind_param_inout( 10, \$last_block   , $max_length );
+    $sth->execute;
+
+    $sth = $dbh->prepare(
+                          "
+                           BEGIN 
+                             dbms_space.free_blocks(
+                                                      ?,?,?,?,?
+                                                    ) ;
+                           END ;
+                          "
+                        );
+    $sth->bind_param( 1, "\U$owner"          );
+    $sth->bind_param( 2, "\U$name"           );
+    $sth->bind_param( 3, "\U$type"           );
+    $sth->bind_param( 4, $freelist_group_id  );
+    $sth->bind_param_inout( 5 , \$free_blocks, $max_length );
+    $sth->execute;
+  }
+
+  my $text;
+
+  if ( $partition )
+  {
+    $text = "Partition $partition         BYTES";
+  }
+  else
+  {
+    $text = "                                                 BYTES";
+  }
+
+  $text .= "     BLOCKS\n" .
+           "                                          ============" .
+           "  =========\n" .
+           sprintf(
+                    "Used BELOW the high water mark            %12d  %9d\n",
+                    $total_bytes - $unused_bytes 
+                      - $free_blocks * $block_size * 1024,
+                    $total_blocks - $unused_blocks - $free_blocks
+                  ) .
+           sprintf(
+                    "Free ABOVE the high water mark            %12d  %9d\n",
+                    $unused_bytes, $unused_blocks
+                  ) .
+           sprintf(
+                    "Free BELOW the high water mark            %12d  %9d\n",
+                    $free_blocks * $block_size * 1024, $free_blocks
+                  ) .
+           "                                          ------------" .
+           "  ---------\n" .
+           sprintf(
+                    "              TOTAL in segment            %12d  %9d\n\n",
+                    $total_bytes, $total_blocks
+                  ) .
+           "                                     FILE_ID  BLOCK_ID" .
+           "  BLOCK_NBR\n" .
+           "                                     =======  ========" .
+           "  =========\n" .
+           sprintf(
+                    "Last extent having data              %7d  %8d  %9d\n\n",
+                    $last_file_id, $last_block_id, $last_block
+                  );
+
+  return (
+           $text,
+           $total_blocks,
+           $total_bytes,
+           $unused_blocks,
+           $unused_bytes,
+           $free_blocks,
+         );
 }
 
 # sub _range_partitions
@@ -5969,6 +6196,192 @@ sub _set_sizing
   }
 }
 
+#sub _show_free_space
+#
+# Reutrns a report in the form of:
+#
+# Space analysis for: [schema.]<object name>
+# 
+#                                                  BYTES     BLOCKS
+#                                           ============  =========
+# Used BELOW the high water mark                 1325056        647
+# Free ABOVE the high water mark                  716800        350
+# Free BELOW the high water mark                    6144          3
+#                                           ------------  ---------
+#               TOTAL in segment                 2048000       1000
+# 
+#                                      FILE_ID  BLOCK_ID  BLOCK_NBR
+#                                      =======  ========  =========
+# Last extent having data                    9     10287        150
+#
+sub _show_free_space
+{
+  my ( $owner, $name, $type, $view ) = @_;
+
+  my $stmt =
+      "
+       SELECT
+              'Yes, I can execute package DBMS_SPACE'
+       FROM
+              all_tab_privs
+       WHERE
+                  privilege    = 'EXECUTE'
+              AND table_name   = 'DBMS_SPACE'
+              AND table_schema = 'SYS'
+      ";
+
+  $sth = $dbh->prepare( $stmt );
+  $sth->execute;
+  my ( $can_execute ) = $sth->fetchrow_array;
+  die "Either you or PUBLIC must have EXECUTE privilege on package\n",
+      "sys.DBMS_SPACE in order to produce the FREE SPACE report.\n\n"
+    unless $can_execute;
+
+  if ( $oracle_major == 7 or "\U$type" eq 'CLUSTER' )
+  {
+    $stmt =
+      "
+       SELECT
+              'NO'                    AS partitioned
+       FROM
+              ${view}_segments
+       WHERE
+                  segment_name = UPPER( ? )
+              AND segment_type = UPPER( '$type' )
+      ";
+  }
+  else
+  {
+    my $plural = ( "\U$type" eq 'INDEX' ) ? 'ES' : 'S';
+
+    $stmt =
+      "
+       SELECT
+              partitioned
+       FROM
+              ${view}_$type$plural
+       WHERE
+                  ${type}_name = UPPER( ? )
+      ";
+  }
+
+  if ( $view eq 'DBA' )
+  {
+      $stmt .=
+        "
+              AND owner       = UPPER('$owner')
+        ";
+  }
+
+  $sth = $dbh->prepare( $stmt );
+  $sth->execute( $name );
+  my ( $partitioned ) = $sth->fetchrow_array;
+  die "\u\L$type \U$name \Ldoes not exist.\n\n" unless $partitioned;
+
+  my $text  = "Space analysis for: \U$owner.$name\n\n";
+
+  if ( $partitioned eq 'YES' )
+  {
+    my (
+         $section,
+         $total_blocks,
+         $total_bytes,
+         $unused_blocks,
+         $unused_bytes,
+         $free_blocks,
+         $sum_total_blocks,
+         $sum_total_bytes,
+         $sum_unused_blocks,
+         $sum_unused_bytes,
+         $sum_free_blocks,
+       );
+
+    $stmt =
+      "
+       SELECT
+              RPAD(partition_name,30)
+            , segment_type
+       FROM
+              ${view}_segments
+       WHERE
+                  segment_name = UPPER( ? )
+      ";
+
+    if ( $view eq 'DBA' )
+    {
+      $stmt .=
+        "
+              AND owner       = UPPER('$owner')
+        ";
+    }
+
+    $stmt .=
+      "
+       ORDER
+          BY
+              partition_name
+      ";
+
+    $sth = $dbh->prepare( $stmt );
+    $sth->execute( $name );
+    my $aref = $sth->fetchall_arrayref;
+
+    foreach my $row (@$aref )
+    {
+      my ( $partition, $seg_type ) = @$row;
+
+      (
+        $section,
+        $total_blocks,
+        $total_bytes,
+        $unused_blocks,
+        $unused_bytes,
+        $free_blocks,
+      ) = _print_space( $owner, $name, $seg_type, $partition );
+
+      $text .= $section;
+
+      $sum_total_blocks  += $total_blocks;
+      $sum_total_bytes   += $total_bytes;
+      $sum_unused_blocks += $unused_blocks;
+      $sum_unused_bytes  += $unused_bytes;
+      $sum_free_blocks   += $free_blocks;
+    }
+
+    $text .= "TOTAL segment                                    BYTES" .
+             "     BLOCKS\n" .
+             "                                          ============" .
+             "  =========\n" .
+             sprintf(
+                      "Used BELOW the high water mark            %12d  %9d\n",
+                      $sum_total_bytes - $sum_unused_bytes 
+                        - $sum_free_blocks * $block_size * 1024,
+                      $sum_total_blocks - $sum_unused_blocks - $sum_free_blocks
+                    ) .
+             sprintf(
+                      "Free ABOVE the high water mark            %12d  %9d\n",
+                      $sum_unused_bytes, $sum_unused_blocks
+                    ) .
+             sprintf(
+                      "Free BELOW the high water mark            %12d  %9d\n",
+                      $sum_free_blocks * $block_size * 1024, $sum_free_blocks
+                    ) .
+             "                                          ------------" .
+             "  ---------\n" .
+             sprintf(
+                      "        GRAND TOTAL in segment            %12d  %9d\n\n",
+                      $sum_total_bytes, $sum_total_blocks
+                    );
+
+    return $text;
+  }
+  else  # Not partitioned
+  {
+    ( my $section ) = _print_space( $owner, $name, $type );
+    return $text . $section;
+  }
+}
+
 #sub _subpartition_key_columns
 #
 # Returns a formatted string containing the subpartitioning key columns
@@ -6224,7 +6637,7 @@ DDL::Oracle - a DDL generator for Oracle databases
 
 =head1 VERSION
 
-VERSION = 1.05
+VERSION = 1.06
 
 =head1 SYNOPSIS
 
@@ -6414,16 +6827,16 @@ The B<compile> method generates the DDL to compile the list of Oracle objects.
 The 'type' defined in the 'new' method is limited to 'function', 'package',
 'procedure', 'trigger' and 'view'.
 
+show_space
+
+The B<show_space> method produces a report showing used/unused bytes and
+blocks above/below the high water mark in a segment.  It includes the
+free blocks below the high water mark.  For partitioned objects, it shows
+the information for each partition, with grand totals for the table/index.
+The object does NOT need to be analyzed for this report to be accurate --
+it uses package sys.DBMS_SPACE to collect the data.
+
 =head1 BUGS
-
-The generated DDL contains the Schema and Object Name in lower case.  In the
-case of triggers, this will cause a problem if the "... ON <schema>.<table>"
-clause is quoted.  For example, a trigger on table MY_TABLE in schema ME
-written as '...BEFORE INSERT ON "ME"."MY_TABLE"...' will generate the DDL as
-
-   '... BEFORE INSERT ON "me"."my_table"...'
-
-There are no plans to change this.
 
 =head1 FILES
 

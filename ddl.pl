@@ -1,6 +1,6 @@
 #! /usr/bin/perl -w
 
-# $Id: ddl.pl,v 1.10 2001/03/03 18:41:31 rvsutherland Exp $
+# $Id: Ddl.pl,v 1.11 2001/03/20 01:49:51 rvsutherland Exp $
 
 use strict;
 
@@ -23,8 +23,7 @@ DDL::Oracle->configure(
                         resize   => 1,
 #                        view     => 'user',
 #                        heading  => 0,
-#                        blksize  => 10240,
-#                        version  => '7.3.4.5.6',
+#                        prompt   => 0,
                       );
 
 my $user = getlogin
@@ -74,8 +73,11 @@ elsif ( $action eq "resize" ){
 elsif ( $action eq "compile" ){
     $sql = $obj->compile;
 }
+elsif ( $action eq "show_space" ){
+    $sql = $obj->show_space;
+}
 else{
-    die "\nDon't know how to '$action'.\n";
+    die "\n$0 doesn't know how to '$action'.\n";
 } ;
 
 print $sql;

@@ -1,4 +1,4 @@
-# $Id: Oracle.pm,v 1.35 2001/02/18 16:28:03 rvsutherland Exp $ 
+# $Id: Oracle.pm,v 1.36 2001/02/24 22:05:56 rvsutherland Exp $ 
 #
 # Copyright (c) 2000, 2001 Richard Sutherland - United States of America
 #
@@ -9,7 +9,7 @@ require 5.004;
 
 BEGIN
 {
-  $DDL::Oracle::VERSION = "1.02"; # Also update version in pod text below!
+  $DDL::Oracle::VERSION = "1.03"; # Also update version in pod text below!
 }
 
 package DDL::Oracle;
@@ -53,6 +53,7 @@ my %create =
   'materialized view'     => \&_create_materialized_view,
   'materialized view log' => \&_create_materialized_view_log,
   'package'               => \&_create_package,
+  'package body'          => \&_create_package_body,
   'procedure'             => \&_create_procedure,
   'profile'               => \&_create_profile,
   'role'                  => \&_create_role,
@@ -117,9 +118,10 @@ sub configure
   $attr{ 'dbh2' }    = $args{ 'dbh2' };
   $attr{ 'view' }    = ( "\U$args{ 'view'  }" eq 'USER' ) ? 'USER' : 'DBA';
   $attr{ 'view2' }   = ( "\U$args{ 'view2' }" eq 'USER' ) ? 'USER' : 'DBA';
-  $attr{ 'schema'  } = (  exists $args{ 'schema'  }  ) ? $args{ 'schema'  } : 1;
-  $attr{ 'schema2' } = (  exists $args{ 'schema2' }  ) ? $args{ 'schema2' } : 1;
-  $attr{ 'resize'  } = (  exists $args{ 'resize'  }  ) ? $args{ 'resize'  } : 1;
+  $attr{ 'schema'  } = ( exists $args{ 'schema'  }  ) ? $args{ 'schema'  } : 1;
+  $attr{ 'schema2' } = ( exists $args{ 'schema2' }  ) ? $args{ 'schema2' } : 1;
+  $attr{ 'resize'  } = ( exists $args{ 'resize'  }  ) ? $args{ 'resize'  } : 1;
+  $attr{ 'heading' } = ( exists $args{ 'heading' }  ) ? $args{ 'heading' } : 1;
 
   _set_sizing();
   _get_oracle_release();
@@ -148,7 +150,8 @@ sub compile
   my $self = shift;
   my $type = lc( $self->{ type } );
 
-  die "\nObject type '$type' is invalid.\n\n" unless $create{ $type };
+  die "\nObject type '$type' is invalid for 'compile' method.\n\n"
+    unless $compile{ $type };
 
   my $list  = $self->{ list };
   my $class = ref( $self );
@@ -176,7 +179,8 @@ sub create
   my $self = shift;
   my $type = lc( $self->{ type } );
 
-  die "\nObject type '$type' is invalid.\n\n" unless $create{ $type };
+  die "\nObject type '$type' is invalid for 'create' method.\n\n"
+    unless $create{ $type };
 
   my $list  = $self->{ list };
   my $class = ref( $self );
@@ -198,7 +202,8 @@ sub drop
   my $self = shift;
   my $type = lc( $self->{ type } );
 
-  die "\nObject type '$type' is invalid.\n\n" unless $drop{ $type };
+  die "\nObject type '$type' is invalid for 'drop' method.\n\n"
+    unless $drop{ $type };
 
   my $list  = $self->{ list };
   my $class = ref( $self );
@@ -220,7 +225,8 @@ sub resize
   my $self = shift;
   my $type = lc( $self->{ type } );
 
-  die "\nObject type '$type' is invalid.\n\n" unless $resize{ $type };
+  die "\nObject type '$type' is invalid for 'resize' method.\n\n"
+   unless $resize{ $type };
 
   my $list  = $self->{ list };
   my $class = ref( $self );
@@ -1416,6 +1422,427 @@ sub _create_iot
          _create_comments( $schema, $owner, $name, $view );
 }
 
+# sub _create_materialized_view
+#
+# Returns DDL to create the named materialized view
+# by calling _create_mview (which is shared with
+# _create_snapshot)
+#
+sub _create_materialized_view
+{
+  _create_mview( @_, 'MATERIALIZED VIEW' );
+}
+
+# sub _create_materialized_view_log
+#
+# Returns DDL to create the named materialized view log
+# by calling _create_mview (which is shared with
+# _create_snapshot_log)
+#
+sub _create_materialized_view_log
+{
+  _create_mview_log( @_, 'MATERIALIZED VIEW' );
+}
+
+# sub _create_mview
+# 
+# Returns DDL to create the named snapshot or materialized view
+# in the form of:
+#
+#     CREATE {MATERIALIZED VIEW|SNAPSHOT} [schema.]<name>
+#     <table properties>
+#
+sub _create_mview
+{
+  my ( $schema, $owner, $name, $view, $type ) = @_;
+
+  my $sql;
+  my $stmt =
+      "
+       SELECT
+              m.container_name
+            , DECODE(
+                      m.build_mode
+                     ,'YES','USING PREBUILT TABLE'
+                     ,DECODE(
+                              m.last_refresh_date
+                             ,null,'BUILD DEFERRED'
+                             ,'BUILD IMMEDIATE'
+                            )
+                    )                                  AS build_mode
+            , DECODE(
+                      m.refresh_method
+                     ,'NEVER','NEVER REFRESH'
+                     ,'REFRESH ' || m.refresh_method
+                    )                                  AS refresh_method
+            , DECODE(
+                      m.refresh_mode
+                     ,'NEVER',null
+                     ,'ON ' || m.refresh_mode
+                    )                                  AS refresh_mode
+            , TO_CHAR(s.start_with, 'DD-MON-YYYY HH24:MI:SS')
+                                                       AS start_with
+            , s.next
+            , DECODE(
+                      s.refresh_method
+                     ,'PRIMARY KEY','WITH  PRIMARY KEY'
+                     ,'ROWID'      ,'WITH  ROWID'
+                     ,null
+                    )                                  AS using_pk
+            , s.master_rollback_seg
+            , DECODE(
+                      m.updatable
+                     ,'N',null
+                     ,DECODE(
+                              m.rewrite_enabled
+                             ,'Y','FOR UPDATE ENABLE QUERY REWRITE'
+                             ,'N','FOR UPDATE DISABLE QUERY REWRITE'
+                            )
+                    )                                  AS updatable
+            , s.query
+       FROM
+              ${view}_mviews     m
+            , ${view}_snapshots  s
+       WHERE
+                  m.mview_name  = UPPER( ? )
+              AND s.name        = m.mview_name
+      ";
+
+  if ( $view eq 'DBA' )
+  {
+    $stmt .=
+        "
+              AND m.owner       = UPPER('$owner')
+              AND s.owner       = m.owner
+        "
+  }
+
+  $dbh->{ LongReadLen } = 65536;    # Allows Query to be 64K
+  $dbh->{ LongTruncOk } = 1;
+
+  $sth = $dbh->prepare( $stmt );
+  $sth->execute( $name );
+  my @row = $sth->fetchrow_array;
+  my $lctype = ( $type eq 'SNAPSHOT' ) ? 'Snapshpt' : 'Materialized View';
+  die "\n$lctype \U$name \Ldoes not exist.\n\n" unless @row;
+
+  my ( 
+       $table, 
+       $build_mode, 
+       $refresh_method, 
+       $refresh_mode,
+       $start_with,
+       $next,
+       $using_pk,
+       $master_rb_seg,
+       $updatable,
+       $query,
+     ) = @row;
+
+  $stmt =
+      "
+       SELECT
+              index_name
+       FROM
+              ${view}_indexes
+       WHERE
+                  table_name = UPPER( ? )
+      ";
+
+  if ( $view eq 'DBA' )
+  {
+    $stmt .=
+        "
+              AND owner      = UPPER('$owner')
+        "; }
+
+  $sth = $dbh->prepare( $stmt );
+  $sth->execute( $table );
+  @row = $sth->fetchrow_array;
+
+  my ( $index ) = @row;
+
+  $sql  = "PROMPT " .
+          "CREATE $type \L$schema$name\n\n" .
+          "CREATE $type \L$schema$name  \n" .
+          _create_mview_table( $owner, $owner, $table, $view ) .
+          "$build_mode\n" .
+          "USING INDEX\n" .
+          _create_mview_index( $schema, $owner, $index, $view ) .
+          "$refresh_method $refresh_mode\n";
+
+  if ( $refresh_method ne 'NEVER REFRESH' )
+  {
+    $sql .= "START WITH TO_DATE('$start_with','DD-MON-YYYY HH24:MI:SS')\n"
+      if $start_with;
+
+    $sql .= "NEXT  $next\n"
+      if $next;
+
+    $sql .= "$using_pk\n"
+      if $using_pk;
+
+    $sql .= "USING MASTER ROLLBACK SEGMENT \L$master_rb_seg\n"
+      if $master_rb_seg;
+  }
+
+  $sql .= "$updatable\n"
+    if $updatable;
+
+  $sql .= "AS\n" .
+          $query;
+
+  return $sql .
+         ";\n\n";
+}
+
+# sub _create_mview_index
+#
+# Returns DDL for the USING INDEX definition part of:
+#
+#     CREATE MATERIALIZED VIEW
+#     CREATE SNAPSHOT
+#
+# statements.  This is created by calling _create_index, and
+# then stripping off the PROMPT and CREATE INDEX portions and the
+# column list, leaving just the physical attributes and partitioning clauses
+#
+sub _create_mview_index
+{
+  # Snapshots don't use attributes PCTUSED and PCTFREE.
+  # This will prevent sub _segment_attributes from including them.
+  $isasnapindx = 1;
+
+  my $done;
+  my $started;
+  my @lines_in = split /\n/, _create_index( @_ );
+  my @lines_out;
+
+  LINE:
+    foreach my $line ( @lines_in )
+    {
+      # Ignore everything before the INITRANS clause.
+      # This includes REMs, CREATE INDEX, columns, etc.
+      $started++    if $line =~ /^INITRANS/;
+      next LINE     if not $started;
+
+      # Set $done when we hit a semicolon
+      $done = $line =~ s/\;$//;
+
+      # But keep everything in between except blank lines
+      # and any [NO]LOGGINING clauses
+      push @lines_out, $line    unless $line =~ /^$|LOGGING/;
+
+      # Exit when we get to the semicolon and ignore the rest.
+      # This eliminates the ';' and any COMMENTs.
+      last LINE if $done;
+    }
+
+  my $sql = join "\n", @lines_out;
+  
+  $isasnapindx = 0;
+
+  return $sql .  "\n";
+}
+
+# sub _create_mview_log
+# 
+# Returns DDL to create the named log (snapshot or materialized view)
+# in the form of:
+#
+#     CREATE {MATERIALIZED VIEW|SNAPSHOT} LOG [schema.]<name>
+#     <table properties>
+#     WITH {PRIMARY KEY|ROWID|PRIMARY KEY, ROWID}
+#     [<filter columns>]
+#
+sub _create_mview_log
+{
+  my ( $schema, $owner, $name, $view, $type ) = @_;
+
+  my $sql;
+  my $stmt =
+      "
+       SELECT
+              log_table
+            , rowids
+            , primary_key
+            , filter_columns
+       FROM
+              ${view}_snapshot_logs
+       WHERE
+                  master     = UPPER( ? )
+      ";
+
+  if ( $view eq 'DBA' )
+  {
+    $stmt .=
+        "
+              AND log_owner  = UPPER('$owner')
+        "; }
+
+  $sth = $dbh->prepare( $stmt );
+  $sth->execute( $name );
+  my @row = $sth->fetchrow_array;
+  my $lctype = ( $type eq 'SNAPSHOT' ) ? 'Snapshpt' : 'Materialized View';
+  die "\n$lctype Log on \U$name \Ldoes not exist.\n\n" unless @row;
+
+  my ( $table, $rowids, $primary_key, $filter_columns, $refreshable ) = @row;
+
+  $sql  = "PROMPT " .
+          "CREATE $type LOG ON \L$schema$name\n\n" .
+          "CREATE $type LOG ON \L$schema$name  \n" .
+          _create_mview_table( $schema, $owner, $table, $view );
+
+  if ( $rowids eq 'YES' and $primary_key eq 'YES' )
+  {
+    $sql .= "WITH PRIMARY KEY, ROWID "
+  }
+  elsif ( $rowids eq 'YES' )
+  {
+    $sql .= "WITH ROWID "
+  }
+  elsif ( $primary_key eq 'YES' )
+  {
+    $sql .= "WITH PRIMARY KEY "
+  }
+
+  $stmt =
+      "
+       SELECT
+              column_name
+       FROM
+              dba_snapshot_log_filter_cols
+       WHERE
+                  name  = UPPER( ? )
+              AND owner = UPPER( ? )
+       MINUS
+       SELECT
+              column_name
+       FROM
+              ${view}_cons_columns  c
+            , ${view}_constraints   d
+       WHERE
+                  d.table_name      = UPPER( ? )
+              AND d.constraint_type = 'P'
+              AND c.table_name      = d.table_name
+              AND c.constraint_name = d.constraint_name
+      ";
+
+  if ( $view eq 'DBA' )
+  {
+    $stmt .=
+        "
+              AND d.owner           = UPPER('$owner')
+              AND c.owner           = d.owner
+        "; }
+
+  $sth = $dbh->prepare( $stmt );
+  $sth->execute( $name, $owner, $name );
+  my $aref = $sth->fetchall_arrayref;
+
+  if ( @$aref )
+  {
+
+    my $comma  = '   ';
+    $sql .= "\n(\n";
+
+    foreach my $row ( @$aref )
+    {
+      $sql .= "$comma \L$row->[0]\n";
+      $comma = '  ,'
+    }
+
+    $sql .= ") ";
+  }
+
+  return $sql .
+         ";\n\n";
+}
+
+# sub _create_mview_table
+#
+# Returns DDL for the table definition part of:
+#
+#     CREATE MATERIALIZED VIEW
+#     CREATE MATERIALIZED VIEW LOG
+#     CREATE SNAPSHOT
+#     CREATE SNAPSHOT LOG
+#
+# statements.  This is created by calling _create_table, and
+# then stripping off the PROMPT and CREATE TABLE portions and the
+# column list, leaving just the physical attributes and partitioning clauses
+#
+sub _create_mview_table
+{
+  # Snapshots and their logs don't use attribute INITRANS.
+  # This will prevent sub _segment_attributes from including it.
+  $isasnaptabl = 1;
+
+  my $done;
+  my $started;
+  my @lines_in = split /\n/, _create_table( @_ );
+  my @lines_out;
+
+  LINE:
+    foreach my $line( @lines_in )
+    {
+      # Ignore everything before the PARALLEL clause.
+      # This includes REMs, CREATE TABLE, column definitions, etc.
+      $started++    if $line =~ /^PARALLEL/;
+      next LINE     if not $started;
+
+      # Set $done when we hit a semicolon
+      $done = $line =~ s/\;$//;
+
+      # But keep everything in between
+      push @lines_out, $line    unless $line =~ /^$/;
+
+      # Exit when we get to the semicolon and ignore the rest.
+      # This eliminates the ';' and any COMMENTs.
+      last LINE if $done;
+    }
+
+  my $sql = join "\n", @lines_out;
+  
+  $isasnaptabl = 0;
+
+  return $sql .  "\n";
+}
+
+# sub _create_package
+#
+# Returns DDL to create the named package in the form of:
+#
+#     CREATE OR REPLACE PACKAGE [schema.]<name>
+#     AS
+#     <source>
+# 
+# by calling _display_source
+#
+sub _create_package
+{
+  my $sql  = _display_source( @_, 'PACKAGE' );
+
+  return $sql;
+}
+
+# sub _create_package_body
+#
+# Returns DDL to create the named procedure in the form of:
+#
+#     CREATE OR REPLACE PACKAGE BODY [schema.]<name>
+#     AS
+#     <source>
+# 
+# by calling _display_source
+#
+sub _create_package_body
+{
+  my $sql  = _display_source( @_, 'PACKAGE BODY' );
+
+  return $sql;
+}
+
 # sub _create_partitioned_index
 #
 # Creates the GLOBAL/LOCAL partition syntax part of a CREATE INDEX statement.
@@ -2394,6 +2821,21 @@ sub _create_partitioned_table
   return $sql . _create_comments( $schema, $owner, $name, $view );
 }
 
+# sub _create_procedure
+#
+# Returns DDL to create the named procedure in the form of:
+#
+#     CREATE OR REPLACE PROCEDURE [schema.]<name>
+#     AS
+#     <source>
+# 
+# by calling _display_source
+#
+sub _create_procedure
+{
+  return _display_source( @_, 'PROCEDURE' );
+}
+
 # sub _create_profile
 #
 # Returns DDL to create the named profile in the form of:
@@ -2569,430 +3011,6 @@ sub _create_rollback_segment
          ")\n" .
          "TABLESPACE     \L$tablespace_name\n" .
          ";\n\n" ; 
-}
-
-# sub _create_materialized_view
-#
-# Returns DDL to create the named materialized view
-# by calling _create_mview (which is shared with
-# _create_snapshot)
-#
-sub _create_materialized_view
-{
-  _create_mview( @_, 'MATERIALIZED VIEW' );
-}
-
-# sub _create_materialized_view_log
-#
-# Returns DDL to create the named materialized view log
-# by calling _create_mview (which is shared with
-# _create_snapshot_log)
-#
-sub _create_materialized_view_log
-{
-  _create_mview_log( @_, 'MATERIALIZED VIEW' );
-}
-
-# sub _create_mview
-# 
-# Returns DDL to create the named snapshot or materialized view
-# in the form of:
-#
-#     CREATE {MATERIALIZED VIEW|SNAPSHOT} [schema.]<name>
-#     <table properties>
-#
-sub _create_mview
-{
-  my ( $schema, $owner, $name, $view, $type ) = @_;
-
-  my $sql;
-  my $stmt =
-      "
-       SELECT
-              m.container_name
-            , DECODE(
-                      m.build_mode
-                     ,'YES','USING PREBUILT TABLE'
-                     ,DECODE(
-                              m.last_refresh_date
-                             ,null,'BUILD DEFERRED'
-                             ,'BUILD IMMEDIATE'
-                            )
-                    )                                  AS build_mode
-            , DECODE(
-                      m.refresh_method
-                     ,'NEVER','NEVER REFRESH'
-                     ,'REFRESH ' || m.refresh_method
-                    )                                  AS refresh_method
-            , DECODE(
-                      m.refresh_mode
-                     ,'NEVER',null
-                     ,'ON ' || m.refresh_mode
-                    )                                  AS refresh_mode
-            , TO_CHAR(s.start_with, 'DD-MON-YYYY HH24:MI:SS')
-                                                       AS start_with
-            , s.next
-            , DECODE(
-                      s.refresh_method
-                     ,'PRIMARY KEY','WITH  PRIMARY KEY'
-                     ,'ROWID'      ,'WITH  ROWID'
-                     ,null
-                    )                                  AS using_pk
-            , s.master_rollback_seg
-            , DECODE(
-                      m.updatable
-                     ,'N',null
-                     ,DECODE(
-                              m.rewrite_enabled
-                             ,'Y','FOR UPDATE ENABLE QUERY REWRITE'
-                             ,'N','FOR UPDATE DISABLE QUERY REWRITE'
-                            )
-                    )                                  AS updatable
-            , s.query
-       FROM
-              ${view}_mviews     m
-            , ${view}_snapshots  s
-       WHERE
-                  m.mview_name  = UPPER( ? )
-              AND s.name        = m.mview_name
-      ";
-
-  if ( $view eq 'DBA' )
-  {
-    $stmt .=
-        "
-              AND m.owner       = UPPER('$owner')
-              AND s.owner       = m.owner
-        "
-  }
-
-  $dbh->{ LongReadLen } = 65536;    # Allows Query to be 64K
-  $dbh->{ LongTruncOk } = 1;
-
-  $sth = $dbh->prepare( $stmt );
-  $sth->execute( $name );
-  my @row = $sth->fetchrow_array;
-  my $lctype = ( $type eq 'SNAPSHOT' ) ? 'Snapshpt' : 'Materialized View';
-  die "\n$lctype \U$name \Ldoes not exist.\n\n" unless @row;
-
-  my ( 
-       $table, 
-       $build_mode, 
-       $refresh_method, 
-       $refresh_mode,
-       $start_with,
-       $next,
-       $using_pk,
-       $master_rb_seg,
-       $updatable,
-       $query,
-     ) = @row;
-
-  $stmt =
-      "
-       SELECT
-              index_name
-       FROM
-              ${view}_indexes
-       WHERE
-                  table_name = UPPER( ? )
-      ";
-
-  if ( $view eq 'DBA' )
-  {
-    $stmt .=
-        "
-              AND owner      = UPPER('$owner')
-        "; }
-
-  $sth = $dbh->prepare( $stmt );
-  $sth->execute( $table );
-  @row = $sth->fetchrow_array;
-
-  my ( $index ) = @row;
-
-  $sql  = "PROMPT " .
-          "CREATE $type \L$schema$name\n\n" .
-          "CREATE $type \L$schema$name  \n" .
-          _create_mview_table( $owner, $owner, $table, $view ) .
-          "$build_mode\n" .
-          "USING INDEX\n" .
-          _create_mview_index( $schema, $owner, $index, $view ) .
-          "$refresh_method $refresh_mode\n";
-
-  if ( $refresh_method ne 'NEVER REFRESH' )
-  {
-    $sql .= "START WITH TO_DATE('$start_with','DD-MON-YYYY HH24:MI:SS')\n"
-      if $start_with;
-
-    $sql .= "NEXT  $next\n"
-      if $next;
-
-    $sql .= "$using_pk\n"
-      if $using_pk;
-
-    $sql .= "USING MASTER ROLLBACK SEGMENT \L$master_rb_seg\n"
-      if $master_rb_seg;
-  }
-
-  $sql .= "$updatable\n"
-    if $updatable;
-
-  $sql .= "AS\n" .
-          $query;
-
-  return $sql .
-         ";\n\n";
-}
-
-# sub _create_mview_index
-#
-# Returns DDL for the USING INDEX definition part of:
-#
-#     CREATE MATERIALIZED VIEW
-#     CREATE SNAPSHOT
-#
-# statements.  This is created by calling _create_index, and
-# then stripping off the PROMPT and CREATE INDEX portions and the
-# column list, leaving just the physical attributes and partitioning clauses
-#
-sub _create_mview_index
-{
-  # Snapshots don't use attributes PCTUSED and PCTFREE.
-  # This will prevent sub _segment_attributes from including them.
-  $isasnapindx = 1;
-
-  my $done;
-  my $started;
-  my @lines_in = split /\n/, _create_index( @_ );
-  my @lines_out;
-
-  LINE:
-    foreach my $line ( @lines_in )
-    {
-      # Ignore everything before the INITRANS clause.
-      # This includes REMs, CREATE INDEX, columns, etc.
-      $started++    if $line =~ /^INITRANS/;
-      next LINE     if not $started;
-
-      # Set $done when we hit a semicolon
-      $done = $line =~ s/\;$//;
-
-      # But keep everything in between except blank lines
-      # and any [NO]LOGGINING clauses
-      push @lines_out, $line    unless $line =~ /^$|LOGGING/;
-
-      # Exit when we get to the semicolon and ignore the rest.
-      # This eliminates the ';' and any COMMENTs.
-      last LINE if $done;
-    }
-
-  my $sql = join "\n", @lines_out;
-  
-  $isasnapindx = 0;
-
-  return $sql .  "\n";
-}
-
-# sub _create_mview_log
-# 
-# Returns DDL to create the named log (snapshot or materialized view)
-# in the form of:
-#
-#     CREATE {MATERIALIZED VIEW|SNAPSHOT} LOG [schema.]<name>
-#     <table properties>
-#     WITH {PRIMARY KEY|ROWID|PRIMARY KEY, ROWID}
-#     [<filter columns>]
-#
-sub _create_mview_log
-{
-  my ( $schema, $owner, $name, $view, $type ) = @_;
-
-  my $sql;
-  my $stmt =
-      "
-       SELECT
-              log_table
-            , rowids
-            , primary_key
-            , filter_columns
-       FROM
-              ${view}_snapshot_logs
-       WHERE
-                  master     = UPPER( ? )
-      ";
-
-  if ( $view eq 'DBA' )
-  {
-    $stmt .=
-        "
-              AND log_owner  = UPPER('$owner')
-        "; }
-
-  $sth = $dbh->prepare( $stmt );
-  $sth->execute( $name );
-  my @row = $sth->fetchrow_array;
-  my $lctype = ( $type eq 'SNAPSHOT' ) ? 'Snapshpt' : 'Materialized View';
-  die "\n$lctype Log on \U$name \Ldoes not exist.\n\n" unless @row;
-
-  my ( $table, $rowids, $primary_key, $filter_columns, $refreshable ) = @row;
-
-  $sql  = "PROMPT " .
-          "CREATE $type LOG ON \L$schema$name\n\n" .
-          "CREATE $type LOG ON \L$schema$name  \n" .
-          _create_mview_table( $schema, $owner, $table, $view );
-
-  if ( $rowids eq 'YES' and $primary_key eq 'YES' )
-  {
-    $sql .= "WITH PRIMARY KEY, ROWID "
-  }
-  elsif ( $rowids eq 'YES' )
-  {
-    $sql .= "WITH ROWID "
-  }
-  elsif ( $primary_key eq 'YES' )
-  {
-    $sql .= "WITH PRIMARY KEY "
-  }
-
-  $stmt =
-      "
-       SELECT
-              column_name
-       FROM
-              dba_snapshot_log_filter_cols
-       WHERE
-                  name  = UPPER( ? )
-              AND owner = UPPER( ? )
-       MINUS
-       SELECT
-              column_name
-       FROM
-              ${view}_cons_columns  c
-            , ${view}_constraints   d
-       WHERE
-                  d.table_name      = UPPER( ? )
-              AND d.constraint_type = 'P'
-              AND c.table_name      = d.table_name
-              AND c.constraint_name = d.constraint_name
-      ";
-
-  if ( $view eq 'DBA' )
-  {
-    $stmt .=
-        "
-              AND d.owner           = UPPER('$owner')
-              AND c.owner           = d.owner
-        "; }
-
-  $sth = $dbh->prepare( $stmt );
-  $sth->execute( $name, $owner, $name );
-  my $aref = $sth->fetchall_arrayref;
-
-  if ( @$aref )
-  {
-
-    my $comma  = '   ';
-    $sql .= "\n(\n";
-
-    foreach my $row ( @$aref )
-    {
-      $sql .= "$comma \L$row->[0]\n";
-      $comma = '  ,'
-    }
-
-    $sql .= ") ";
-  }
-
-  return $sql .
-         ";\n\n";
-}
-
-# sub _create_mview_table
-#
-# Returns DDL for the table definition part of:
-#
-#     CREATE MATERIALIZED VIEW
-#     CREATE MATERIALIZED VIEW LOG
-#     CREATE SNAPSHOT
-#     CREATE SNAPSHOT LOG
-#
-# statements.  This is created by calling _create_table, and
-# then stripping off the PROMPT and CREATE TABLE portions and the
-# column list, leaving just the physical attributes and partitioning clauses
-#
-sub _create_mview_table
-{
-  # Snapshots and their logs don't use attribute INITRANS.
-  # This will prevent sub _segment_attributes from including it.
-  $isasnaptabl = 1;
-
-  my $done;
-  my $started;
-  my @lines_in = split /\n/, _create_table( @_ );
-  my @lines_out;
-
-  LINE:
-    foreach my $line( @lines_in )
-    {
-      # Ignore everything before the PARALLEL clause.
-      # This includes REMs, CREATE TABLE, column definitions, etc.
-      $started++    if $line =~ /^PARALLEL/;
-      next LINE     if not $started;
-
-      # Set $done when we hit a semicolon
-      $done = $line =~ s/\;$//;
-
-      # But keep everything in between
-      push @lines_out, $line    unless $line =~ /^$/;
-
-      # Exit when we get to the semicolon and ignore the rest.
-      # This eliminates the ';' and any COMMENTs.
-      last LINE if $done;
-    }
-
-  my $sql = join "\n", @lines_out;
-  
-  $isasnaptabl = 0;
-
-  return $sql .  "\n";
-}
-
-# sub _create_package
-#
-# Returns DDL to create the named procedure in the form of:
-#
-#     CREATE OR REPLACE PACKAGE [schema.]<name>
-#     AS
-#     <source>
-# 
-#     CREATE OR REPLACE PACKAGE BODY [schema.]<name>
-#     AS
-#     <source>
-# 
-# by calling _display_source (twice)
-#
-sub _create_package
-{
-  my $sql  = _display_source( @_, 'PACKAGE' );
-     $sql .= _display_source( @_, 'PACKAGE BODY' );
-
-  return $sql;
-}
-
-# sub _create_procedure
-#
-# Returns DDL to create the named procedure in the form of:
-#
-#     CREATE OR REPLACE PROCEDURE [schema.]<name>
-#     AS
-#     <source>
-# 
-# by calling _display_source
-#
-sub _create_procedure
-{
-  return _display_source( @_, 'PROCEDURE' );
 }
 
 # sub _create_sequence
@@ -4016,8 +4034,8 @@ sub _create_tablespace
 # Returns DDL to create the named trigger in the form of:
 #
 #     CREATE OR REPLACE TRIGGER [schema.]<name>
-#     {BEFORE|AFTER|INSTEAD OF} <dml event>
-#     ON {[schema.]<table>|DATABASE|SCHEMA}
+#     {BEFORE|AFTER|INSTEAD OF} <triggering event>
+#     [OF <column list ]ON {[schema.]<table>|DATABASE|SCHEMA}
 #     REFERENCING <new> AS NEW <old> AS OLD
 #     [WHEN <whatever>]
 #     [FOR EACH ROW]
@@ -4030,11 +4048,17 @@ sub _create_trigger
   my $stmt =
       "
        SELECT
-              description
+              trigger_type
+            , RTRIM(triggering_event)
+            , table_owner
+            , table_name
+            , base_object_type
+            , referencing_names
+            , description
             , DECODE(
                       when_clause
                      ,null,null
-                     ,'WHEN ' || SUBSTR(when_clause,5) || CHR(10)
+                     ,'WHEN (' || when_clause || ')' || CHR(10)
                     )
             , trigger_body
        FROM
@@ -4059,47 +4083,43 @@ sub _create_trigger
   my @row = $sth->fetchrow_array;
   die "\nTrigger \U$schema$name \Ldoes not exist.\n\n" unless @row;
 
-  my ( $description, $when, $body ) = @row;
+  my (
+       $trigger_type,
+       $event,
+       $table_owner,
+       $table,
+       $base_type,
+       $ref_names,
+       $description,
+       $when,
+       $body,
+     ) = @row;
 
-  # $description has 3+ lines
-  # The 1st is the [schema.]<name> -- we don't need this
-  # The 2nd has the DML Event + Object Name (incl schema, if entered)
-  #    For capitalization purposes, break Line 2 into two pieces --
-  #    the event (upper case) + the object (lower case)
-  # The 3rd might have the "BEFORE EACH ROW" -- we want this
+  my ( $trg_type ) = $trigger_type =~ /(BEFORE|AFTER|INSTEAD OF)/;
+  my ( $columns )  = $description  =~ /$trg_type $event(.*) ON /i;
+  my $schema2 = _set_schema( $table_owner );
+  my $object = ( $base_type eq 'TABLE'  ) ? $schema2 . $table   :
+               ( $base_type eq 'SCHEMA' ) ? $schema  . 'SCHEMA' : $base_type;
+  $ref_names =~ s/ING (\w+) AS NEW (\w+)/ING \L$1 \UAS NEW \L$2/;
 
-  # find the end of the 1st line, and get rid of it
-  my $offset = index( $description, "\n" );
-  $description = uc( substr( $description, $offset + 1 ) );
-
-  # find the word "ON" -- it's the divider between event & object
-  $offset = index( $description, ' ON ' ) + 4;
-  my $event  = substr( $description, 0, $offset );
-
-  $description = lc( substr( $description, $offset ) );
-  $offset = index( $description, "\n" );
-  my $object  = substr( $description, 0, $offset );
-
-  chomp( my $action = $event . $object );
-
-  # the rest must be the FOR EACH ROW, if it's there
-  my $other = uc( substr( $description, $offset + 1 ) );
-  $other =~ s/\n\n+/\n\n/g;
-
-  # body seems to end in a null character
+  # Body sometimes ends in a null
   $body =~ s/\c@//g;
 
   my $sql = "PROMPT " .
             "CREATE OR REPLACE TRIGGER \L$schema$name\n\n" .
             "CREATE OR REPLACE TRIGGER \L$schema$name\n" .
-            "$action" .
-            "$when" .
-            "\n$other" .
-            "$body" ;
+            "$trg_type $event\U$columns ON \L$object\n";
 
+  $sql .= "$ref_names\n"      if $base_type =~ /TABLE|VIEW/;
+  $sql .= "FOR EACH ROW\n"    if $trigger_type =~ /EACH ROW/;
+  $sql .= $when               if $when;
+
+  $sql .= $body;
   $sql .= "\n"    unless $sql =~ /\Z\n/;
   $sql .= "/\n\n";
 
+  return $sql;
+#here
 }
 
 # sub _create_type
@@ -4314,7 +4334,7 @@ sub _display_source
       # source.text already includes <TYPE> <name> 
       # We want to insert the schema right before the name
 
-      @$row->[0] =~ s/$type\s+\S+/$type \L$schema$name/;
+      @$row->[0] =~ s/$type\s+\S+/$type \L$schema$name/i;
     }
 
     $sql .= "@$row->[0]";
@@ -4543,6 +4563,8 @@ sub _drop_user
 #
 sub _generate_heading
 {
+  return unless $attr{ heading };
+
   my ( $module, $action, $type, $list ) = @_;
 
   $ddl =  "REM This DDL was reverse engineered by\n" .
@@ -6181,7 +6203,7 @@ DDL::Oracle - a DDL generator for Oracle databases
 
 =head1 VERSION
 
-VERSION = 1.02
+VERSION = 1.03
 
 =head1 SYNOPSIS
 
@@ -6266,10 +6288,10 @@ configure
 The B<configure> method is used to supply the DBI connection and to set
 several session level options.  These are:
 
-      dbh     A reference to a valid DBI connection (obtained via
-              DBI->connect).  This is a mandatory argument.
+      dbh      A reference to a valid DBI connection (obtained via
+               DBI->connect).  This is a mandatory argument.
 
-              NOTE:  The user connecting MUST have SELECT privileges
+               NOTE:  The user connecting MUST have SELECT privileges
                      on the following (in addition to the DBA or USER
                      views):
 
@@ -6292,26 +6314,30 @@ several session level options.  These are:
                      select privileges on SYS.COL$, wherein the real
                      name of the column or function definition is held.
 
-      schema  Defines whether and what to use as the schema for DDL
-              on objects which use this syntax.  "1" means use the
-              owner of the object as the schema; "0" or "" means
-              omit the schema syntax; any other arbtrary string will
-              be imbedded in the DDL as the schema.  The default is "1".
+      schema   Defines whether and what to use as the schema for DDL
+               on objects which use this syntax.  "1" means use the
+               owner of the object as the schema; "0" or "" means
+               omit the schema syntax; any other arbtrary string will
+               be imbedded in the DDL as the schema.  The default is "1".
 
-      resize  Defines whether and what to use in resizing segments.
-              "1" means resize segments using the default algorithm;
-              "0" or "" means keep the current INITIAL and NEXT
-              values; any other string will be interpreted as a
-              resize definition.  The default is "1".
+      resize   Defines whether and what to use in resizing segments.
+               "1" means resize segments using the default algorithm;
+               "0" or "" means keep the current INITIAL and NEXT
+               values; any other string will be interpreted as a
+               resize definition.  The default is "1".
 
-              To establish a user defined algorithm, define this with
-              a string consisting of n sets of LIMIT:INITIAL:NEXT.
-              LIMIT is expressed in Database Blocks.  The highest LIMIT
-              may contain the string 'UNLIMITED', and in any event will
-              be forced to be so by DDL::Oracle.
+               To establish a user defined algorithm, define this with
+               a string consisting of n sets of LIMIT:INITIAL:NEXT.
+               LIMIT is expressed in Database Blocks.  The highest LIMIT
+               may contain the string 'UNLIMITED', and in any event will
+               be forced to be so by DDL::Oracle.
 
-      view    Defines which Dictionary views to query:  DBA or USER
-             (e.g., DBA_TABLES or USER_TABLES).  The default is DBA.
+      view     Defines which Dictionary views to query:  DBA or USER
+               (e.g., DBA_TABLES or USER_TABLES).  The default is DBA.
+
+      heading  Defines whether to include a Heading having Host, Instance,
+               Date/Time, List of generated Objects, etc.  Set to "0" to
+               suppress the heading.  The default is "1".
 
 new  
 

@@ -1,6 +1,6 @@
 #! /usr/bin/perl -w
 
-# $Id: copy_user.pl,v 1.7 2001/03/03 18:41:31 rvsutherland Exp $
+# $Id: copy_user.pl,v 1.8 2001/04/28 13:49:32 rvsutherland Exp $
 
 use strict;
 
@@ -74,7 +74,7 @@ foreach $new_user( @users )
     # substitute the new password for the VALUES 'ABCDEF...'.
 
     # For example:
-    my $password = $new_user . '123';
+    my $password = $new_user;
     $new_sql =~ s/VALUES \S+/$password/go;
   }
 

@@ -1,6 +1,6 @@
 #! /usr/bin/perl -w
 
-# $Id: defrag.pl,v 1.17 2001/01/27 16:23:25 rvsutherland Exp $
+# $Id: defrag.pl,v 1.18 2001/04/28 13:51:28 rvsutherland Exp $
 #
 # Copyright (c) 2000, 2001 Richard Sutherland - United States of America
 #
@@ -80,7 +80,9 @@ my $tblsp;
 my $text;
 my $user = getlogin
         || scalar getpwuid( $REAL_USER_ID )
-        || undef;
+        || undef
+     unless $OSNAME eq 'MSWin32';
+$user = 'Unknown User'    unless $user;
 
 ########################################################################
 

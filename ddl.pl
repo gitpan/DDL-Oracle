@@ -1,6 +1,6 @@
 #! /usr/bin/perl -w
 
-# $Id: ddl.pl,v 1.12 2001/03/31 18:27:42 rvsutherland Exp $
+# $Id: Ddl.pl,v 1.13 2001/04/28 13:50:25 rvsutherland Exp $
 
 use strict;
 
@@ -49,6 +49,7 @@ die "\nYou must specify an object.\n"
    unless (
                 $name
              or "\U$type" eq 'COMPONENTS'
+             or "\U$type" eq 'SCHEMA'
           );
 
 print STDERR "\n";

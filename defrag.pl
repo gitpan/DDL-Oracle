@@ -1,6 +1,6 @@
 #! /usr/bin/perl -w
 
-# $Id: defrag.pl,v 1.9 2000/12/09 17:38:56 rvsutherland Exp $
+# $Id: defrag.pl,v 1.12 2000/12/31 12:51:59 rvsutherland Exp $
 #
 # Copyright (c) 2000 Richard Sutherland - United States of America
 #
@@ -21,6 +21,7 @@ my %uniq;
 my @constraints;
 my @export_objects;
 my @export_temps;
+my @logfiles;
 my @perf_tables = ( 
                    'DBA_ALL_TABLES',
                    'DBA_INDEXES', 
@@ -36,6 +37,8 @@ my @perf_tables = (
                   );
 my @sizing_array;
 
+my $add_ndx_log;
+my $add_tbl_log;
 my $add_temp_log;
 my $add_temp_sql;
 my $alttblsp;
@@ -45,15 +48,19 @@ my $create_tbl_ddl;
 my $create_temp_ddl;
 my $date;
 my $dbh;
+my $drop_all_log;
 my $drop_ddl;
 my $drop_temp_ddl;
 my $drop_temp_log;
 my $drop_temp_sql;
 my $expdir;
+my $exp_log;
+my $header10;
 my $home = $ENV{HOME}
         || $ENV{LOGDIR}
         || ( getpwuid( $REAL_USER_ID ) )[7]
         || die "\nCan't determine HOME directory.\n";
+my $imp_log;
 my $logdir;
 my $obj;
 my $other_constraints;
@@ -75,7 +82,6 @@ my $text;
 my $user = getlogin
         || scalar getpwuid( $REAL_USER_ID )
         || undef;
-
 
 ########################################################################
 
@@ -183,6 +189,8 @@ $stmt =
             , segment_name
             , partition_name
             , segment_type
+            , partitioning_type
+            , analyzed
        FROM
               THE_PARTITIONS
        ORDER
@@ -196,7 +204,14 @@ $aref = $sth->fetchall_arrayref;
 
 foreach $row ( @$aref )
 {
-  my ( $owner, $table, $partition, $type ) = @$row;
+  my ( 
+       $owner, 
+       $table, 
+       $partition, 
+       $type, 
+       $partitioning_type,
+       $analyzed
+     ) = @$row;
 
   $obj = DDL::Oracle->new(
                            type => 'exchange table',
@@ -217,7 +232,9 @@ foreach $row ( @$aref )
   push @export_objects, "\L$owner.$temp";
 
   # Change the CREATE TABLE statement to create the temp
-  $create_tbl =~ s|\L$owner.$table|\L$owner.$temp|g;
+  my $ownr    = escaped_dollar_signs( $owner );
+  my $tabl    = escaped_dollar_signs( $table );
+  $create_tbl =~ s|\L$ownr.$tabl|\L$owner.$temp|g;
 
   my $exchange = index_and_exchange( $temp, @$row );
 
@@ -245,11 +262,12 @@ foreach $row ( @$aref )
                          );
   my $resize = $obj->resize;
   # Remove REM lines created by DDL::Oracle
-  $resize = ( join "\n", grep !/^REM/, split /\n/, $resize ) . "\n\n";
+  $resize =  ( join "\n", grep !/^REM/, split /\n/, $resize ) . "\n\n";
+  $resize =~ s|\;|\nTABLESPACE \L$tblsp \;\n\n|;
 
-  my $drop_temp = $drop_tbl .
-                  trunc( @$row ) .
-                  $resize;
+  my $drop_temp =  $drop_tbl .
+                   trunc( @$row ) .
+                   $resize;
 
   $create_temp_ddl  = group_header( 1 )   unless $create_temp_ddl;
   $create_temp_ddl .= $create_tbl .
@@ -343,17 +361,20 @@ $stmt =
        SELECT DISTINCT
               owner
             , table_name
+            , analyzed
        FROM
             (
               SELECT
                      owner
                    , table_name
+                   , analyzed
               FROM
                      THE_TABLES
               UNION ALL
               SELECT
                      owner
                    , table_name
+                   , analyzed
               FROM
                      THE_IOTs
             )
@@ -368,11 +389,6 @@ $aref = $sth->fetchall_arrayref;
 
 if ( @$aref )
 {
-  foreach $row ( @$aref )
-  {
-    push @export_objects, "\L@$row->[0].@$row->[1]";
-  }
-
   $obj = DDL::Oracle->new(
                            type => 'table',
                            list => $aref,
@@ -381,6 +397,24 @@ if ( @$aref )
   $drop_ddl       .= group_header( 4 ) . $obj->drop;
 
   $create_tbl_ddl .= group_header( 8 ) . $obj->create;
+
+  foreach $row ( @$aref )
+  {
+    my ( $owner, $table, $analyzed ) = @$row;
+
+    push @export_objects, "\L$owner.$table";
+
+    if ( $analyzed eq 'YES' )
+    {
+      $create_ndx_ddl .= group_header( 10 )    unless $header10++;
+
+      $create_ndx_ddl .= "PROMPT " .
+                         "ANALYZE TABLE \L$owner.$table\n\n" .
+                         "ANALYZE TABLE \L$owner.$table " .
+                         "ESTIMATE STATISTICS ;\n\n";
+    }
+  }
+
 }
 
 #
@@ -446,7 +480,7 @@ $drop_ddl .= group_header( 5 ) . $obj->drop    if @$aref;
 
 $stmt =
       "
-       SELECT DISTINCT
+       SELECT
               owner
             , index_name
        FROM 
@@ -499,9 +533,11 @@ $drop_ddl .= group_header( 6 ) . $obj->drop    if @$aref;
 
 $stmt =
       "
-       SELECT DISTINCT
+       SELECT
               owner
             , index_name
+            , table_name
+            , analyzed
        FROM 
               THE_INDEXES
        ORDER
@@ -518,7 +554,22 @@ $obj = DDL::Oracle->new(
                          list => $aref,
                        );
 
-$create_ndx_ddl .= group_header( 10 ) . $obj->create    if @$aref;
+$create_ndx_ddl .= group_header( 10 )    unless $header10++;
+
+$create_ndx_ddl .= $obj->create    if @$aref;
+
+foreach $row( @$aref )
+{
+  my ( $owner, $index, $table, $analyzed ) = @$row;
+
+  if ( $analyzed eq 'YES' )
+  {
+    $create_ndx_ddl .= "PROMPT " .
+                       "ANALYZE INDEX \L$owner.$index\n\n" .
+                       "ANALYZE INDEX \L$owner.$index \UESTIMATE STATISTICS\n" .
+                       "   FOR ALL INDEXED COLUMNS ;\n\n";
+  }
+}
 
 #
 # Step 7 - Create all Primary Key, Unique and Check constraints on our
@@ -751,6 +802,13 @@ foreach $row ( @$aref )
                "ALTER TABLESPACE @$row->[0] COALESCE ;\n\n",
 }
 
+# Get rid of double blank lines
+$drop_ddl        =~ s|\n\n+|\n\n|g;
+$drop_temp_ddl   =~ s|\n\n+|\n\n|g;
+$create_tbl_ddl  =~ s|\n\n+|\n\n|g;
+$create_ndx_ddl  =~ s|\n\n+|\n\n|g;
+$create_temp_ddl =~ s|\n\n+|\n\n|g;
+
 drop_perf_temps();
 
 #
@@ -760,28 +818,23 @@ drop_perf_temps();
 if ( $create_temp_ddl )
 {
   $add_temp_sql = "$sqldir/$prefix${tblsp}_add_temp.sql";
-  $add_temp_log = "$sqldir/$prefix${tblsp}_add_temp.log";
   print "Create temps            : $add_temp_sql\n";
   write_file( $add_temp_sql, $create_temp_ddl, 'REM' );
 
   $drop_temp_sql = "$sqldir/$prefix${tblsp}_drop_temp.sql";
-  $drop_temp_log = "$sqldir/$prefix${tblsp}_drop_temp.log";
   print "Drop temps              : $drop_temp_sql\n";
   write_file( $drop_temp_sql, $drop_temp_ddl, 'REM' );
 }
 
 my $drop_all_sql = "$sqldir/$prefix${tblsp}_drop_all.sql";
-my $drop_all_log = "$sqldir/$prefix${tblsp}_drop_all.log";
 print "Drop objects            : $drop_all_sql\n";
 write_file( $drop_all_sql, $drop_ddl, 'REM' );
 
 my $add_tbl_sql = "$sqldir/$prefix${tblsp}_add_tbl.sql";
-my $add_tbl_log = "$sqldir/$prefix${tblsp}_add_tbl.log";
 print "Create tables           : $add_tbl_sql\n";
 write_file( $add_tbl_sql, $create_tbl_ddl, 'REM' );
 
 my $add_ndx_sql = "$sqldir/$prefix${tblsp}_add_ndx.sql";
-my $add_ndx_log = "$sqldir/$prefix${tblsp}_add_ndx.log";
 print "Create indexes          : $add_ndx_sql\n\n";
 write_file( $add_ndx_sql, $create_ndx_ddl, 'REM' );
 
@@ -791,82 +844,90 @@ eval { system ("mknod $pipefile p") };
 
 if ( $create_temp_ddl )
 {
-  $prttn_exp_par  = "$expdir/prttn_$prefix${tblsp}_exp.par";
-  $prttn_exp_log  = "$logdir/prttn_$prefix${tblsp}_exp.log";
-  $prttn_exp_text = "log         = $prttn_exp_log\n" .
-                    "file        = $pipefile\n" .
-                    "rows        = y\n" .
-                    "grants      = y\n" .
-                    "#direct      = y\n" .   # Has bug on Import??
-                    "buffer      = 65536\n" .
-                    "indexes     = n\n" .
-                    "compress    = n\n" .
-                    "triggers    = y\n" .
-                    "constraints = n\n" .
-                    "tables      = (\n" .
-                    "                  " .
-                    join ( "\n                , ", @export_temps ) .
-                    "\n              )\n\n";
+  $prttn_exp_par   = "$expdir/$prefix${tblsp}_prttn_exp.par";
+  $prttn_exp_text  = "log          = $prttn_exp_log\n" .
+                     "file         = $pipefile\n" .
+                     "rows         = y\n" .
+                     "grants       = y\n";
+
+  # My linux Oracle 8.1.6 has a bug, so
+  $prttn_exp_text .= "direct       = y\n"    unless $OSNAME eq 'linux';
+
+  $prttn_exp_text .= "buffer       = 65536\n" .
+                     "indexes      = n\n" .
+                     "compress     = n\n" .
+                     "triggers     = y\n" .
+                     "statistics   = n\n" .
+                     "constraints  = n\n" .
+                     "recordlength = 65536\n" .
+                     "tables       = (\n" .
+                     "                   " .
+                     join ( "\n                 , ", @export_temps ) .
+                     "\n               )\n\n";
 
   print "Partition Export parfile: $prttn_exp_par\n";
   print "Partition Export logfile: $prttn_exp_log\n";
   write_file( $prttn_exp_par, $prttn_exp_text, '#' );
 
-  $prttn_imp_par  = "$expdir/prttn_$prefix${tblsp}_imp.par";
-  $prttn_imp_log  = "$logdir/prttn_$prefix${tblsp}_imp.log";
-  $prttn_imp_text = "log         = $prttn_imp_log\n" .
-                    "file        = $pipefile\n" .
-                    "rows        = y\n" .
-                    "commit      = y\n" .
-                    "ignore      = y\n" .
-                    "buffer      = 65536\n" .
-                    "analyze     = n\n" .
-                    "full        = y\n\n" .
-                    "#tables      = (\n" .
-                    "#                  " .
-                    join ( "\n#                , ", @export_temps ) .
-                    "\n#              )\n\n";
+  $prttn_imp_par  = "$expdir/$prefix${tblsp}_prttn_imp.par";
+  $prttn_imp_text = "log          = $prttn_imp_log\n" .
+                    "file         = $pipefile\n" .
+                    "rows         = y\n" .
+                    "commit       = y\n" .
+                    "ignore       = y\n" .
+                    "buffer       = 65536\n" .
+                    "analyze      = n\n" .
+                    "recordlength = 65536\n" .
+                    "full         = y\n\n" .
+                    "#tables       = (\n" .
+                    "#                   " .
+                    join ( "\n#                 , ", @export_temps ) .
+                    "\n#               )\n\n";
 
   print "Partition Import parfile: $prttn_imp_par\n";
   print "Partition Import logfile: $prttn_imp_log\n\n";
   write_file( $prttn_imp_par, $prttn_imp_text, '#' );
 }
 
-my $exp_par  = "$expdir/$prefix${tblsp}_exp.par";
-my $exp_log  = "$logdir/$prefix${tblsp}_exp.log";
-my $exp_text = "log         = $exp_log\n" .
-               "file        = $pipefile\n" .
-               "rows        = y\n" .
-               "grants      = y\n" .
-               "#direct      = y\n" .   # Has bug on Import??
-               "buffer      = 65536\n" .
-               "indexes     = n\n" .
-               "compress    = n\n" .
-               "triggers    = y\n" .
-               "constraints = n\n" .
-               "tables      = (\n" .
-               "                  " .
-               join ( "\n                , ", @export_objects ) .
-               "\n              )\n\n";
+my $exp_par   = "$expdir/$prefix${tblsp}_exp.par";
+my $exp_text  = "log          = $exp_log\n" .
+                "file         = $pipefile\n" .
+                "rows         = y\n" .
+                "grants       = y\n";
+
+  # My linux Oracle 8.1.6 has a bug, so
+   $exp_text .= "direct       = y\n"    unless $OSNAME eq 'linux';
+
+   $exp_text .= "buffer       = 65536\n" .
+                "indexes      = n\n" .
+                "compress     = n\n" .
+                "triggers     = y\n" .
+                "statistics   = n\n" .
+                "constraints  = n\n" .
+                "recordlength = 65536\n" .
+                "tables       = (\n" .
+                "                   " .
+                join ( "\n                 , ", @export_objects ) .
+                "\n               )\n\n";
 
 print "Table Export parfile    : $exp_par\n";
 print "Table Export logfile    : $exp_log\n";
 write_file( $exp_par, $exp_text, '#' );
 
 my $imp_par  = "$expdir/$prefix${tblsp}_imp.par";
-my $imp_log  = "$logdir/$prefix${tblsp}_imp.log";
-my $imp_text = "log         = $imp_log\n" .
-               "file        = $pipefile\n" .
-               "rows        = y\n" .
-               "commit      = y\n" .
-               "ignore      = y\n" .
-               "buffer      = 65536\n" .
-               "analyze     = n\n" .
-               "full        = y\n\n" .
-               "#tables      = (\n" .
-               "#                  " .
-               join ( "\n#                , ", @export_objects ) .
-               "\n#              )\n\n";
+my $imp_text = "log          = $imp_log\n" .
+               "file         = $pipefile\n" .
+               "rows         = y\n" .
+               "commit       = y\n" .
+               "ignore       = y\n" .
+               "buffer       = 65536\n" .
+               "analyze      = n\n" .
+               "recordlength = 65536\n" .
+               "full         = y\n\n" .
+               "#tables       = (\n" .
+               "#                   " .
+               join ( "\n#                 , ", @export_objects ) .
+               "\n#               )\n\n";
 
 print "Table Import parfile    : $imp_par\n";
 print "Table Import logfile    : $imp_log\n\n";
@@ -882,7 +943,7 @@ print "\n";
 
 my $i     = 0;
 my $shell = "$sqldir/$prefix$tblsp.sh";
-my $gzip  = "$expdir/prttn_$prefix$tblsp.dmp.gz";
+my $gzip  = "$expdir/$prefix${tblsp}_prttn.dmp.gz";
 
 if ( $create_temp_ddl )
 {
@@ -956,7 +1017,7 @@ create_shell( $script, $text );
 
 if ( $create_temp_ddl )
 {
-  $gzip  = "$expdir/prttn_$prefix$tblsp.dmp.gz";
+  $gzip  = "$expdir/$prefix${tblsp}_prttn.dmp.gz";
 
   print "\n*** The following 2 scripts ARE FOR FALLBACK PURPOSES ONLY!!\n" .
         "*** Use these scripts ONLY IF Shell #2 HAD ERRORS.\n\n";
@@ -1131,6 +1192,37 @@ sub drop_perf_temps
   }
 }
 
+# sub escaped_dollar_signs
+#
+# Routines dealing with the Temp tables, indexes and constraints must
+# substitute generated names for the names of real objects returned by
+# DDL::Oracle.  However, Oracle allows dollar signs ('$') within names
+# for database objects.  This causes problems with the s/// operator,
+# since it sees the '$' as a meta character, causing the substitution
+# to fail.
+#
+# This little subroutine inserts a '\' in front of each '$', which
+# effectively escapes it for the s/// operator.
+#
+sub escaped_dollar_signs
+{
+  my ( $str ) = @_;
+
+  my $pos = 0;
+
+  until ( $pos == -1 )
+  {
+    $pos = index( $str, '$', $pos );
+    if ( $pos > -1 )
+    {
+      substr( $str, $pos, 0 ) = qq#\\#;
+      $pos += 2;
+    }
+  }
+
+  return $str;
+}
+
 # sub get_args
 #
 # Uses supplied module Getopt::Long to place command line options into the
@@ -1171,26 +1263,62 @@ sub get_args
 
   $tblsp = uc( $args{ tablespace } ) or
   die "\n***Error:  You must specify --tablespace=<NAME>\n",
-      "$0 aborted,\n\n";
+      "\n$0 aborted,\n\n";
 
   $sqldir = ( $args{ sqldir } eq "." ) ? cwd : $args{ sqldir };
-  die "\n***Error:  sqldir defined as '$sqldir', which is not a Directory\n",
-      "$0 aborted,\n\n"
+  die "\n***Error:  sqldir '$sqldir', is not a Directory\n",
+      "\n$0 aborted,\n\n"
     unless -d $sqldir;
 
+  die "\n***Error:  sqldir '$sqldir', is not a writeable Directory\n",
+      "\n$0 aborted,\n\n"
+    unless -w $sqldir;
+
   $logdir = ( $args{ logdir } eq "." ) ? cwd : $args{ logdir };
-  die "\n***Error:  logdir defined as '$logdir', which is not a Directory\n",
-      "$0 aborted,\n\n"
+  die "\n***Error:  logdir '$logdir', is not a Directory\n",
+      "\n$0 aborted,\n\n"
     unless -d $logdir;
 
+  die "\n***Error:  logdir '$logdir', is not a writeable Directory\n",
+      "\n$0 aborted,\n\n"
+    unless -w $logdir;
+
   $expdir = ( $args{ expdir } eq "." ) ? cwd : $args{ expdir };
-  die "\n***Error:  expdir defined as '$expdir', which is not a Directory\n",
-      "$0 aborted,\n\n"
+  die "\n***Error:  expdir '$expdir', is not a Directory\n",
+      "\n$0 aborted,\n\n"
     unless -d $expdir;
 
-  $alttblsp = uc( $args{ alttablespace } );
+  die "\n***Error:  sqldir '$expdir', is not a writeable Directory\n",
+      "\n$0 aborted,\n\n"
+    unless -w $expdir;
 
   $prefix = $args{ prefix };
+
+  $add_ndx_log     = "$logdir/$prefix${tblsp}_add_ndx.log";
+  $add_tbl_log     = "$logdir/$prefix${tblsp}_add_tbl.log";
+  $add_temp_log    = "$logdir/$prefix${tblsp}_add_temp.log";
+  $drop_all_log    = "$logdir/$prefix${tblsp}_drop_all.log";
+  $drop_temp_log   = "$logdir/$prefix${tblsp}_drop_temp.log";
+  $exp_log         = "$logdir/$prefix${tblsp}_exp.log";
+  $imp_log         = "$logdir/$prefix${tblsp}_imp.log";
+  $prttn_exp_log   = "$logdir/$prefix${tblsp}_prttn_exp.log";
+  $prttn_imp_log   = "$logdir/$prefix${tblsp}_prttn_imp.log";
+
+  push @logfiles, (
+                    $add_ndx_log,
+                    $add_tbl_log,
+                    $add_temp_log,
+                    $drop_all_log,
+                    $drop_temp_log,
+                    $exp_log,
+                    $imp_log,
+                    $prttn_exp_log,
+                    $prttn_imp_log,
+                  );
+
+  validate_log_names( \@logfiles );
+
+  $alttblsp = uc( $args{ alttablespace } );
 
   connect_to_oracle();      # Will fail unless sid, user, password are OK
 
@@ -1318,7 +1446,15 @@ sub group_header
 #
 sub index_and_exchange
 {
-  my ( $temp, $owner, $table, $partition, $type ) = @_;
+  my ( 
+       $temp,
+       $owner, 
+       $table, 
+       $partition, 
+       $type, 
+       $partitioning_type,
+       $analyzed
+     ) = @_;
 
   my $sql;
   my $text;
@@ -1376,8 +1512,14 @@ sub index_and_exchange
     $sql =  ( join "\n", grep !/^REM/, split /\n/, $sql ) . "\n\n";
 
     my $indx =  "${tblsp}_${date}_" . unique_nbr();
-    $sql     =~ s|\L$owner.$index|\L$owner.$indx|g;
-    $sql     =~ s|\L$owner.$table|\L$owner.$temp|g;
+
+    # Change the CREATE INDEX statement
+    # to use the Temp Index and Table names
+    my $ownr = escaped_dollar_signs( $owner );
+    my $tabl = escaped_dollar_signs( $table );
+    my $indr = escaped_dollar_signs( $index );
+    $sql     =~ s|\L$ownr.$indr|\L$owner.$indx|g;
+    $sql     =~ s|\L$ownr.$tabl|\L$owner.$temp|g;
 
     $text .= $sql;
   }
@@ -1416,16 +1558,31 @@ sub index_and_exchange
     $sql =  ( join "\n", grep !/^REM/, split /\n/, $sql ) . "\n\n";
 
     my $cons =  "${tblsp}_${date}_" . unique_nbr();
-    $sql     =~ s|\L$owner.$table|\L$owner.$temp|g;
-    $sql     =~ s|\L$constraint|\L$cons|g;
+
+    # Change the ALTER TABLE ADD CONSTRAINT statement
+    # to use the Temp Constraint and Table names
+    my $ownr = escaped_dollar_signs( $owner );
+    my $tabl = escaped_dollar_signs( $table );
+    my $conr = escaped_dollar_signs( $constraint );
+    $sql     =~ s|\L$ownr.$tabl|\L$owner.$temp|g;
+    $sql     =~ s|\L$conr|\L$cons|g;
 
     $text .= $sql;
+  }
+
+  if ( $analyzed eq 'YES' )
+  {
+    $text .= "PROMPT " .
+             "ANALYZE TABLE \L$owner.$temp\n\n" .
+             "ANALYZE TABLE \L$owner.$temp \UESTIMATE STATISTICS\n" .
+             "   FOR TABLE\n" .
+             "   FOR ALL INDEXED COLUMNS ;\n\n";
   }
 
   $text .= "PROMPT " .
            "ALTER TABLE \L$owner.$table \UEXCHANGE $type \L$partition\n\n" .
            "ALTER TABLE \L$owner.$table\n" .
-           "   \UEXCHANGE $type \L$partition \UWITH TABLE \L$temp\n" .
+           "   \UEXCHANGE $type \L$partition \UWITH TABLE \L$owner.$temp\n" .
            "   INCLUDING INDEXES\n".
            "   WITHOUT VALIDATION ;\n\n";
 
@@ -1506,15 +1663,39 @@ sub initialize_queries
        ON COMMIT PRESERVE ROWS
        AS
        SELECT
-              owner
-            , segment_name
-            , partition_name
-            , SUBSTR(segment_type,7)       AS segment_type
+              s.owner
+            , s.segment_name
+            , s.partition_name
+            , SUBSTR(s.segment_type,7)                 AS segment_type
+            , p.partitioning_type                      AS partitioning_type
+            , DECODE(
+                      s.segment_type
+                     ,'TABLE PARTITION'   ,DECODE(
+                                                   a.last_analyzed
+                                                  ,null,'NO'
+                                                  ,'YES'
+                                                 )
+                     ,'TABLE SUBPARTITION',DECODE(
+                                                   b.last_analyzed
+                                                  ,null,'NO'
+                                                  ,'YES'
+                                                 )
+                    )                                  AS analyzed
        FROM
-              dba_segments  s
+              dba_segments          s
+            , dba_part_tables       p
+            , dba_tab_partitions    a
+            , dba_tab_subpartitions b
        WHERE
-                  segment_type LIKE 'TABLE%PARTITION'
-              AND tablespace_name = '$tblsp'
+                  p.table_name            = s.segment_name
+              AND s.segment_type       LIKE 'TABLE%PARTITION'
+              AND s.tablespace_name       = '$tblsp'
+              AND a.table_name        (+) = s.segment_name
+              AND b.table_name        (+) = s.segment_name
+              AND a.partition_name    (+) = s.partition_name
+              AND b.subpartition_name (+) = s.partition_name
+              AND a.table_owner       (+) = s.owner
+              AND b.table_owner       (+) = s.owner
               AND EXISTS (
                            SELECT
                                   null
@@ -1526,6 +1707,16 @@ sub initialize_queries
                                   AND owner            = s.owner
                                   AND segment_name     = s.segment_name
                          )
+              AND (
+                      s.owner
+                    , s.segment_name
+                  ) NOT IN (
+                             SELECT
+                                    owner
+                                  , table_name
+                             FROM
+                                    dba_snapshots
+                           )
       ";
 
   $dbh->do( $stmt );
@@ -1533,7 +1724,7 @@ sub initialize_queries
   # This query produces a list of THE INDEXES (and their tables) -- those
   # non-partitioned indexes which reside in THE TABLESPACE, plus indexes 
   # which have at least one partition in THE TABLESPACE.  These indexes are
-  # on tables other than the tables of THE PARTITIONS but may me on THE
+  # on tables other than the tables of THE PARTITIONS but may be on THE
   # TABLES.
   #
   $stmt =
@@ -1545,12 +1736,18 @@ sub initialize_queries
               owner
             , index_name
             , table_name
+            , MAX(analyzed)        AS analyzed
        FROM
             (
               SELECT
                      owner
                    , index_name
                    , table_name
+                   , DECODE(
+                             last_analyzed
+                            ,null,'NO'
+                            ,'YES'
+                           )                  AS analyzed
               FROM
                      dba_indexes
               WHERE
@@ -1561,6 +1758,11 @@ sub initialize_queries
                      i.owner
                    , i.index_name
                    , i.table_name
+                   , DECODE(
+                             p.last_analyzed
+                            ,null,'NO'
+                            ,'YES'
+                           )                  AS analyzed
               FROM
                      dba_indexes         i
                    , dba_ind_partitions  p
@@ -1574,6 +1776,11 @@ sub initialize_queries
                      i.owner
                    , i.index_name
                    , i.table_name
+                   , DECODE(
+                             p.last_analyzed
+                            ,null,'NO'
+                            ,'YES'
+                           )                  AS analyzed
               FROM
                      dba_indexes            i
                    , dba_ind_subpartitions  p
@@ -1594,6 +1801,11 @@ sub initialize_queries
                         FROM
                                THE_PARTITIONS
                       )
+       GROUP
+          BY
+              owner
+            , index_name
+            , table_name
       ";
 
   $dbh->do( $stmt );
@@ -1610,35 +1822,61 @@ sub initialize_queries
        SELECT
               owner
             , table_name
+            , MAX(analyzed)        AS analyzed
        FROM
-              dba_indexes
-       WHERE
-                  tablespace_name = '$tblsp'
-              AND index_type      = 'IOT - TOP'
-       UNION ALL
-       SELECT
-              i.owner
-            , i.table_name
-       FROM
-              dba_indexes         i
-            , dba_ind_partitions  p
-       WHERE
-                  p.tablespace_name = '$tblsp'
-              AND i.index_type      = 'IOT - TOP'
-              AND i.owner           = p.index_owner
-              AND i.table_name      = p.index_name
-       UNION ALL
-       SELECT
-              i.owner
-            , i.table_name
-       FROM
-              dba_indexes            i
-            , dba_ind_subpartitions  p
-       WHERE
-                  p.tablespace_name = '$tblsp'
-              AND i.index_type      = 'IOT - TOP'
-              AND i.owner           = p.index_owner
-              AND i.table_name      = p.index_name
+            (
+              SELECT
+                     owner
+                   , table_name
+                   , DECODE(
+                             last_analyzed
+                            ,null,'NO'
+                            ,'YES'
+                           )                  AS analyzed
+              FROM
+                     dba_indexes
+              WHERE
+                         tablespace_name = '$tblsp'
+                     AND index_type      = 'IOT - TOP'
+              UNION ALL
+              SELECT
+                     i.owner
+                   , i.table_name
+                   , DECODE(
+                             p.last_analyzed
+                            ,null,'NO'
+                            ,'YES'
+                           )                  AS analyzed
+              FROM
+                     dba_indexes         i
+                   , dba_ind_partitions  p
+              WHERE
+                         p.tablespace_name = '$tblsp'
+                     AND i.index_type      = 'IOT - TOP'
+                     AND i.owner           = p.index_owner
+                     AND i.table_name      = p.index_name
+              UNION ALL
+              SELECT
+                     i.owner
+                   , i.table_name
+                   , DECODE(
+                             p.last_analyzed
+                            ,null,'NO'
+                            ,'YES'
+                           )                  AS analyzed
+              FROM
+                     dba_indexes            i
+                   , dba_ind_subpartitions  p
+              WHERE
+                         p.tablespace_name = '$tblsp'
+                     AND i.index_type      = 'IOT - TOP'
+                     AND i.owner           = p.index_owner
+                     AND i.table_name      = p.index_name
+            )
+       GROUP
+          BY
+              owner
+            , table_name
       ";
 
   $dbh->do( $stmt );
@@ -1655,55 +1893,97 @@ sub initialize_queries
        SELECT
               owner
             , table_name
+            , MAX(analyzed)        AS analyzed
        FROM
-              dba_tables
-       WHERE
-              tablespace_name   = '$tblsp'
-       UNION ALL
-       SELECT DISTINCT
-              table_owner
+            (
+              SELECT
+                     owner
+                   , table_name
+                   , DECODE(
+                             last_analyzed
+                            ,null,'NO'
+                            ,'YES'
+                           )                  AS analyzed
+              FROM
+                     dba_tables
+              WHERE
+                     tablespace_name   = '$tblsp'
+              UNION ALL
+              SELECT
+                     table_owner
+                   , table_name
+                   , DECODE(
+                             last_analyzed
+                            ,null,'NO'
+                            ,'YES'
+                           )                  AS analyzed
+              FROM
+                     dba_tab_partitions  t
+              WHERE
+                         tablespace_name   = '$tblsp'
+                     AND NOT EXISTS (
+                                      SELECT
+                                             null
+                                      FROM
+                                             dba_tab_partitions
+                                      WHERE
+                                                 table_owner = t.table_owner
+                                             AND table_name  = t.table_name
+                                             AND tablespace_name <> '$tblsp'
+                                      UNION ALL
+                                      SELECT
+                                             null
+                                      FROM
+                                             dba_tab_subpartitions
+                                      WHERE
+                                                 table_owner = t.table_owner
+                                             AND table_name  = t.table_name
+                                             AND tablespace_name <> '$tblsp'
+                                    )
+              UNION ALL
+              SELECT
+                     table_owner
+                   , table_name
+                   , DECODE(
+                             last_analyzed
+                            ,null,'NO'
+                            ,'YES'
+                           )                  AS analyzed
+              FROM
+                     dba_tab_subpartitions  t
+              WHERE
+                         tablespace_name   = '$tblsp'
+                     AND NOT EXISTS (
+                                      SELECT
+                                             null
+                                      FROM
+                                             dba_tab_subpartitions
+                                      WHERE
+                                                 table_owner = t.table_owner
+                                             AND table_name  = t.table_name
+                                             AND tablespace_name <> '$tblsp'
+                                    )
+              -- Ignore Snapshots/Materialized Views.
+              -- Yeah, it's a cop out.
+              MINUS
+              SELECT
+                     owner
+                   , table_name
+                   , 'YES'                    AS analyzed
+              FROM
+                     dba_snapshots
+              MINUS
+              SELECT
+                     owner
+                   , table_name
+                   , 'NO'                     AS analyzed
+              FROM
+                     dba_snapshots
+            )
+       GROUP
+          BY
+              owner
             , table_name
-       FROM
-              dba_tab_partitions  t
-       WHERE
-                  tablespace_name   = '$tblsp'
-              AND NOT EXISTS (
-                               SELECT
-                                      null
-                               FROM
-                                      dba_tab_partitions
-                               WHERE
-                                          table_owner      = t.table_owner
-                                      AND table_name       = t.table_name
-                                      AND tablespace_name <> '$tblsp'
-                               UNION ALL
-                               SELECT
-                                      null
-                               FROM
-                                      dba_tab_subpartitions
-                               WHERE
-                                          table_owner      = t.table_owner
-                                      AND table_name       = t.table_name
-                                      AND tablespace_name <> '$tblsp'
-                             )
-       UNION ALL
-       SELECT DISTINCT
-              table_owner
-            , table_name
-       FROM
-              dba_tab_subpartitions  t
-       WHERE
-                  tablespace_name   = '$tblsp'
-              AND NOT EXISTS (
-                               SELECT
-                                      null
-                               FROM
-                                      dba_tab_subpartitions
-                               WHERE
-                                          table_owner      = t.table_owner
-                                      AND table_name       = t.table_name
-                                      AND tablespace_name <> '$tblsp'
-                             )
       ";
 
   $dbh->do( $stmt );
@@ -1715,14 +1995,24 @@ sub initialize_queries
 #
 sub move
 {
-  my ( $owner, $table, $partition, $type, $tblsp ) = @_;
+  my ( 
+       $owner, 
+       $table, 
+       $partition, 
+       $type, 
+       $part_type,
+       $analyzed,
+       $tblsp,
+     ) = @_;
 
   my $sql = "PROMPT " .
             "ALTER TABLE \L$owner.$table \UMOVE $type \L$partition\n\n" .
             "ALTER TABLE \L$owner.$table \UMOVE $type \L$partition\n" .
             "TABLESPACE \L$tblsp\n";
 
-  if ( $type eq 'PARTITION' )
+  # Can't specify INITIAL/NEXT on HASH partitions,
+  # and all subpartitions are currently HASH
+  if ( $type eq 'PARTITION' and $part_type eq 'RANGE' )
   {
     $sql .= "STORAGE\n" .
             "(\n" .
@@ -1772,7 +2062,8 @@ sub print_help
 
   --logdir=PATH *
 
-           Directory to place the import/export .log files.  Defaults to
+           Directory to place the import/export .log files, as well
+           as the SPOOLed .log files created by SQL*Plus.  Defaults to
            environment variable DBA_LOG, or to the current directory.
 
   --password=PASSWORD
@@ -1781,8 +2072,9 @@ sub print_help
            externally.  Respresents a security risk on Unix systems.
 
            If USER is given and PASSWORD is not, program will prompt
-           for PASSWORD.  This would be preferable, since the password
-           will then not be visible in a 'ps' command.
+           for PASSWORD.  This would be preferable to entering the
+           password on the command line, since the password will then
+           not be visible in a 'ps' command.
 
   --prefix=STRING *
 
@@ -2014,7 +2306,7 @@ sub trunc
 
 # sub unique_nbr
 #
-# Generates a unique number between 1 and 99999 for use in Temp Table names
+# Generates a unique 6-digit number for use in Temp Table names
 #
 sub unique_nbr
 {
@@ -2022,12 +2314,34 @@ sub unique_nbr
 
   while( 1 )
   {
-    $nbr = int( rand 999999 ) + 1;
+    $nbr = int( rand 900000 ) + 100000;
     $uniq{ $nbr }++;
     last unless $uniq{ $nbr } > 1;
   }
 
   return $nbr
+}
+
+# sub validate_log_names
+#
+# Ensures that log files are writeable.  These files are not actually
+# OPENed during the program, so this check is not foolproof, but it
+# might save a little time just in case the filename is unwriteable.
+#
+sub validate_log_names
+{
+  my ( $aref ) = @_;
+
+  foreach my $file ( @$aref )
+  {
+    die "\n***Error:  Log file $file\n",
+        "           is not writeable\n",
+        "\n$0 aborted,\n\n"
+      unless (
+                  -e $file and -w $file
+               or not -e $file
+             );
+  }
 }
 
 # sub write_file
@@ -2058,6 +2372,61 @@ sub write_header
             "$remark Created by $0\n",
             "$remark on ", scalar localtime,"\n\n\n\n";
 }
+
+# $Log: defrag.pl,v $
+# Revision 1.12  2000/12/31 12:51:59  rvsutherland
+# Added ANALYZE TABLE/INDEX following Import, for previously analyzed objects
+#
+# Revision 1.11  2000/12/31 00:46:58  rvsutherland
+# Before starting, verified that Log files were writiable.
+# Modified queries in anticipation of adding ANALYZE TABLE statements
+#
+# Revision 1.10  2000/12/28 21:45:25  rvsutherland
+# Upgraded to handle table names containing '$'.
+# Corrected Statement Group 15 to MOVE the partitions back to THE TABLESPACE.
+# Put all Log files in logdir (were going to sqldir -- go figure)
+# Corrected NEXT size if object reached last tier (was null)
+#
+# Revision 1.9  2000/12/09 17:38:56  rvsutherland
+# Additional tuning refinements.
+# Minor cleanup of code.
+#
+# Revision 1.8  2000/12/06 00:43:45  rvsutherland
+# Significant performance improvements.
+# No, make that MAJOR gains (i.e., orders of magnitude for large databases).
+# To wit:
+#   Replaced convoluted Dictionary views with 8i Temporary Tables
+#   Widely (but not entirely) switched to bind variables (was interpolated,
+#     causing reparsing in most cases).
+# Also fixed error on REBUILD of Global and non-partitioned indexes.
+#
+# Revision 1.7  2000/12/02 14:06:20  rvsutherland
+# Completed 'exchange' method for handling partitions,
+# including REBUILD of UNUSABLE indexes.
+# Removed 'resize' method for handling partitions.
+#
+# Revision 1.6  2000/11/26 20:10:54  rvsutherland
+# Added 'exchange' method for handling partitions.  Will probably
+# remove the 'resize' method next update.
+#
+# Revision 1.5  2000/11/24 18:36:00  rvsutherland
+# Restructured file writes
+# Revamped 'resize' method for handling partitions
+#
+# Revision 1.4  2000/11/19 20:08:58  rvsutherland
+# Added 'resize' partitions option.
+# Restructured file creation.
+# Added shell scripts to simplify executing generated files.
+# Modified selection of IOT tables (now handled same as indexes)
+# Added validation of input arguments -- meaning we now check for
+# hanging chad and pregnant votes  ;-)
+#
+# Revision 1.3  2000/11/17 21:35:53  rvsutherland
+# Commented out Direct Path export -- Import has a bug (at least on Linux)
+#
+# Revision 1.2  2000/11/16 09:14:38  rvsutherland
+# Major restructure to take advantage of DDL::Oracle.pm
+#
 
 __END__
 

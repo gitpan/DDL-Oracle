@@ -1,4 +1,4 @@
-# $Id: Oracle.pm,v 1.24 2000/12/09 17:40:14 rvsutherland Exp $ 
+# $Id: Oracle.pm,v 1.26 2000/12/29 23:18:13 rvsutherland Exp $ 
 #
 # Copyright (c) 2000 Richard Sutherland - United States of America
 #
@@ -9,7 +9,7 @@ require 5.004;
 
 BEGIN
 {
-  $DDL::Oracle::VERSION = "0.24"; # Also update version in pod text below!
+  $DDL::Oracle::VERSION = "0.27"; # Also update version in pod text below!
 }
 
 package DDL::Oracle;
@@ -20,6 +20,13 @@ my $block_size;
 my $dbh;
 my $dbh2;
 my $ddl;
+my $host;
+my $instance;
+my $isasnapindx;
+my $isasnaptabl;
+my $oracle_major;
+my $oracle_minor;
+my $oracle_release;
 my $sth;
 
 my @size_arr;
@@ -34,12 +41,16 @@ my %create =
  'exchange table'        => \&_create_exchange_table,
   function               => \&_create_function,
   index                  => \&_create_index,
+ 'materialized view'     => \&_create_materialized_view,
+ 'materialized view log' => \&_create_materialized_view_log,
   package                => \&_create_package,
   procedure              => \&_create_procedure,
   profile                => \&_create_profile,
   role                   => \&_create_role,
  'rollback segment'      => \&_create_rollback_segment,
   sequence               => \&_create_sequence,
+  snapshot               => \&_create_snapshot,
+ 'snapshot log'          => \&_create_snapshot_log,
   synonym                => \&_create_synonym,
   table                  => \&_create_table,
  'table family'          => \&_create_table_family,
@@ -60,7 +71,7 @@ my %drop =
   index                  => \&_drop_schema_object,
   library                => \&_drop_object,
  'materialized view'     => \&_drop_schema_object,
-# 'materialized view log' => \&_drop_log,
+ 'materialized view log' => \&_drop_materialized_view_log,
   package                => \&_drop_schema_object,
   procedure              => \&_drop_schema_object,
   profile                => \&_drop_profile,
@@ -68,7 +79,7 @@ my %drop =
  'rollback segment'      => \&_drop_object,
   sequence               => \&_drop_schema_object,
  'snapshot'              => \&_drop_schema_object,
-# 'snapshot log'          => \&_drop_log,
+ 'snapshot log'          => \&_drop_snapshot_log,
   synonym                => \&_drop_synonym,
   table                  => \&_drop_table,
   tablespace             => \&_drop_tablespace,
@@ -84,7 +95,6 @@ my %resize =
   table                  => \&_resize_table,
 );
 
-########################################################################
 ############################# Class Methods ############################
 
 sub configure
@@ -103,6 +113,7 @@ sub configure
   $attr{ resize  } = (  exists $args{ resize  }  ) ? $args{ resize  } : 1;
 
   _set_sizing();
+  _get_oracle_release();
 }
 
 sub new
@@ -637,7 +648,9 @@ sub _create_exchange_table
        FROM
               ${view}_segments
        WHERE
-                  segment_name   = UPPER( ? )
+--                  segment_name   = UPPER( ? )
+--              AND partition_name = UPPER( ? )
+                  segment_name   = UPPER( '$name' )
               AND partition_name = UPPER( ? )
       ";
 
@@ -650,7 +663,8 @@ sub _create_exchange_table
   }
 
   $sth = $dbh->prepare( $stmt );
-  $sth->execute( $name, $partition );
+#  $sth->execute( $name, $partition );
+  $sth->execute( $partition );
   my @row = $sth->fetchrow_array;
   die "Partition \U$partition \Lof \ETable \U$name \Ldoes not exist,\n"
     unless @row;
@@ -737,128 +751,6 @@ sub _create_function
   return _display_source( @_, 'FUNCTION' );
 }
 
-# sub _granted_privs
-#
-# Returns DDL to create GRANT statements to the named grantee 
-# in the form of:
-#
-#     [GRANT <role >            TO <name> {WITH ADMIN OPTION]]
-#     [GRANT <system privilege> TO <name> {WITH ADMIN OPTION]]
-#     [GRANT <privilege> ON <object> TO <name> {WITH GRANT OPTION]]
-#
-sub _granted_privs
-{
-  my ( $name ) = @_;
-
-  my $sql;
-
-  # Add role privileges
-  my $stmt =
-      "
-       SELECT
-              granted_role
-            , DECODE(
-                      admin_option
-                     ,'YES','WITH ADMIN OPTION'
-                     ,null
-                    )                         AS admin_option
-       FROM
-              dba_role_privs
-       WHERE
-              grantee = UPPER( ? )
-       ORDER
-          BY
-              granted_role
-      ";
-
-  $sth = $dbh->prepare( $stmt );
-  $sth->execute( $name );
-  my $aref = $sth->fetchall_arrayref;
-
-  foreach my $row( @$aref )
-  {
-    $sql .= "PROMPT " .
-            "GRANT \L@$row->[0] \UTO \L$name \U@$row->[1] \n\n" .
-            "GRANT \L@$row->[0] \UTO \L$name \U@$row->[1];\n\n";
-  }
-
-  # Add system privileges
-  $stmt =
-      "
-       SELECT
-              privilege
-            , DECODE(
-                      admin_option
-                     ,'YES','WITH ADMIN OPTION'
-                     ,null
-                    )                         AS admin_option
-       FROM
-              dba_sys_privs
-       WHERE
-              grantee = UPPER( ? )
-       ORDER
-          BY
-              privilege
-      ";
-
-  $sth = $dbh->prepare( $stmt );
-  $sth->execute( $name );
-  $aref = $sth->fetchall_arrayref;
-
-  foreach my $row( @$aref )
-  {
-    $sql .= "PROMPT " .
-            "GRANT \L@$row->[0] \UTO \L$name \U@$row->[1] \n\n" .
-            "GRANT \L@$row->[0] \UTO \L$name \U@$row->[1];\n\n";
-  }
-
-  # Add object privileges
-  $stmt =
-      "
-       SELECT
-              privilege
-            , owner
-            , table_name
-            , DECODE(
-                      grantable
-                     ,'YES','WITH GRANT OPTION'
-                     ,null
-                    )                         AS grantable
-       FROM
-              dba_tab_privs
-       WHERE
-              grantee = UPPER( ? )
-       ORDER
-          BY
-              table_name
-            , privilege
-      ";
-
-  $sth = $dbh->prepare( $stmt );
-  $sth->execute( $name );
-  $aref = $sth->fetchall_arrayref;
-
-  foreach my $row( @$aref )
-  {
-    my (
-         $privilege,
-         $owner,
-         $table,
-         $grantable,,
-       ) = @$row;
-
-    my $schema = _set_schema( $owner );
-
-    $sql .= "PROMPT " .
-            "GRANT \L$privilege \UON \L$schema$table \UTO \L$name " .
-            "\U$grantable \n\n" .
-            "GRANT \L$privilege \UON \L$schema$table \UTO \L$name " .
-            "\U$grantable;\n\n";
-  }
-
-  return $sql;
-}
-
 # sub _create_index
 #
 # Returns DDL to create the named index and its partition(s) in the form of:
@@ -889,7 +781,30 @@ sub _create_index
   my ( $schema, $owner, $name, $view ) = @_;
 
   my $sql;
-  my $stmt =
+  my $stmt;
+
+  if ( $oracle_major == 7 )
+  {
+     $stmt =
+      "
+       SELECT
+              'N/A'                           AS partitioned
+            , table_name
+            , DECODE(
+                      uniqueness
+                     ,'UNIQUE',' UNIQUE'
+                     ,null
+                    )
+            , null                            AS bitmap
+       FROM
+              ${view}_indexes
+       WHERE
+                  index_name = UPPER( ? )
+      ";
+  }
+  else               # We're Oracle8 or newer
+  {
+     $stmt =
       "
        SELECT
               partitioned
@@ -909,6 +824,7 @@ sub _create_index
        WHERE
                   index_name = UPPER( ? )
       ";
+  }
 
   if ( $view eq 'DBA' )
   {
@@ -930,7 +846,58 @@ sub _create_index
        $bitmap 
      ) = @row;
 
-  $stmt =
+  if ( $oracle_major == 7 )
+  {
+    $stmt =
+      "
+       SELECT
+              LTRIM(i.degree)
+            , LTRIM(i.instances)
+              -- Physical Properties
+            , 'INDEX'                       AS organization
+              -- Segment Attributes
+            , 'N/A'                         AS cache
+            , 'N/A'                         AS pct_used
+            , i.pct_free
+            , DECODE(
+                      i.ini_trans
+                     ,0,1
+                     ,null,1
+                     ,i.ini_trans
+                    )                       AS ini_trans
+            , DECODE(
+                      i.max_trans
+                     ,0,255
+                     ,null,255
+                     ,i.max_trans
+                    )                       AS max_trans
+              -- Storage Clause
+            , i.initial_extent
+            , i.next_extent
+            , i.min_extents
+            , DECODE(
+                      i.max_extents
+                     ,2147483645,'unlimited'
+                     ,           i.max_extents
+                    )                       AS max_extents
+            , i.pct_increase
+            , NVL(i.freelists,1)
+            , NVL(i.freelist_groups,1)
+            , 'N/A'                         AS buffer_pool
+            , 'N/A'                         AS logging
+            , LOWER(i.tablespace_name)      AS tablespace_name
+            , s.blocks
+       FROM
+              ${view}_indexes   i
+            , ${view}_segments  s
+       WHERE
+                  i.index_name   = UPPER( ? )
+              AND s.segment_name = i.index_name
+      ";
+  }
+  else               # We're Oracle8 or newer
+  {
+    $stmt =
       "
        SELECT
               LTRIM(i.degree)
@@ -980,6 +947,7 @@ sub _create_index
                   i.index_name   = UPPER( ? )
               AND s.segment_name = i.index_name
       ";
+  }
 
   if ( $view eq 'DBA' )
   {
@@ -1148,10 +1116,116 @@ sub _create_partitioned_index
 {
   my ( $schema, $owner, $name, $view, $sql ) = @_;
 
-  my $stmt =
+  my $stmt;
+
+  if ( $oracle_major == 8 and $oracle_minor == 0 )
+  {
+    $stmt =
       "
        SELECT
-              -- Indexes may partition only by RANDE or RANGE/HASH
+              -- 8.0 Indexes may partition only by RANGE
+              i.partitioning_type
+            , 'N/A'                         AS subpartitioning_type
+            , i.locality
+              -- Physical Properties
+            , 'INDEX'                       AS organization
+              -- Segment Attributes
+            , 'N/A'                         AS cache
+            , 'N/A'                         AS pct_used
+            , i.def_pct_free
+            , DECODE(
+                      i.def_ini_trans
+                     ,0,1
+                     ,null,1
+                     ,i.def_ini_trans
+                    )                       AS ini_trans
+            , DECODE(
+                      i.def_max_trans
+                     ,0,255
+                     ,null,255
+                     ,i.def_max_trans
+                    )                       AS max_trans
+              -- Storage Clause
+            ,DECODE(
+                     i.def_initial_extent
+                    ,'DEFAULT',s.initial_extent
+                    ,i.def_initial_extent * $block_size * 1024
+                   )                        AS initial_extent
+            ,DECODE(
+                     i.def_next_extent
+                    ,'DEFAULT',s.next_extent
+                    ,i.def_next_extent * $block_size * 1024
+                   )                        AS next_extent
+            , DECODE(
+                      i.def_min_extents
+                     ,'DEFAULT',s.min_extents
+                     ,i.def_min_extents
+                    )                       AS min_extents
+            , DECODE(
+                      i.def_max_extents
+                     ,'DEFAULT',DECODE(
+                                        s.max_extents
+                                       ,2147483645,'unlimited'
+                                       ,s.max_extents
+                                      )
+                     ,2147483645,'unlimited'
+                     ,i.def_max_extents
+                    )                       AS max_extents
+            , DECODE(
+                      i.def_pct_increase
+                     ,'DEFAULT',s.pct_increase
+                     ,i.def_pct_increase
+                    )                       AS pct_increase
+            , DECODE(
+                      i.def_freelists
+                     ,0,1
+                     ,null,1
+                     ,i.def_freelists
+                    )                       AS freelists
+            , DECODE(
+                      i.def_freelist_groups
+                     ,0,1
+                     ,null,1
+                     ,i.def_freelist_groups
+                    )                       AS freelist_groups
+            , 'N/A'                         AS buffer_pool
+            , DECODE(
+                      i.def_logging
+                     ,'NO','NOLOGGING'
+                     ,     'LOGGING'
+                    )                       AS logging
+            , LOWER(NVL(i.def_tablespace_name,s.tablespace_name))
+              -- Don't have default blocks, so use larger of initial/next
+            , GREATEST(
+                        DECODE(
+                                i.def_initial_extent
+                               ,'DEFAULT',s.initial_extent / $block_size / 1024
+                               ,i.def_initial_extent
+                              )
+                       ,DECODE(
+                                i.def_next_extent
+                               ,'DEFAULT',s.next_extent / $block_size / 1024
+                               ,i.def_next_extent
+                              )
+                      )                     AS blocks
+       FROM
+              ${view}_part_indexes  i
+            , ${view}_tablespaces   s
+            , ${view}_part_tables   t
+       WHERE
+                  -- def_tablspace is sometimes NULL in PART_INDEXES,
+                  -- we'll have to go over to the table for the defaults
+                  i.index_name      = UPPER( ? )
+              AND t.table_name      = i.table_name
+              AND s.tablespace_name = t.def_tablespace_name
+      ";
+  }
+  else               # We're Oracle8i or newer
+  {
+    $stmt =
+      "
+       SELECT
+              -- Indexes may partition only by RANGE or RANGE/HASH
               i.partitioning_type
             , i.subpartitioning_type
             , i.locality
@@ -1247,6 +1321,7 @@ sub _create_partitioned_index
               AND t.table_name      = i.table_name
               AND s.tablespace_name = t.def_tablespace_name
       ";
+  }
 
   if ( $view eq 'DBA' )
   {
@@ -1302,7 +1377,93 @@ sub _create_partitioned_iot
 {
   my ( $schema, $owner, $name, $view ) = @_;
 
-  my $stmt =
+  my $stmt;
+
+  if ( $oracle_major == 8 and $oracle_minor == 0 )
+  {
+    $stmt =
+      "
+       SELECT
+              -- Table Properties
+              'N/A'                         AS monitoring
+            , t.table_name
+              -- Parallel Clause
+            , LTRIM(t.degree)               AS degree
+            , LTRIM(t.instances)            AS instances
+              -- Physical Properties
+            , 'INDEX'                       AS organization
+              -- Segment Attributes
+            , DECODE(
+                      LTRIM(t.cache)
+                     ,'Y','CACHE'
+                     ,    'NOCACHE'
+                    )                       AS cache
+            , 'N/A'                         AS pct_used
+            , p.def_pct_free                AS pct_free
+            , p.def_ini_trans               AS ini_trans
+            , p.def_max_trans               AS max_trans
+              -- Storage Clause
+            ,DECODE(
+                     p.def_initial_extent
+                    ,'DEFAULT',s.initial_extent
+                    ,p.def_initial_extent * $block_size * 1024
+                   )                        AS initial_extent
+            ,DECODE(
+                     p.def_next_extent
+                    ,'DEFAULT',s.next_extent
+                    ,p.def_next_extent * $block_size * 1024
+                   )                        AS next_extent
+            , DECODE(
+                      p.def_min_extents
+                     ,'DEFAULT',s.min_extents
+                     ,p.def_min_extents
+                    )                       AS min_extents
+            , DECODE(
+                      p.def_max_extents
+                     ,'DEFAULT',DECODE(
+                                        s.max_extents
+                                       ,2147483645,'unlimited'
+                                       ,s.max_extents
+                                      )
+                     ,2147483645,'unlimited'
+                     ,p.def_max_extents
+                    )                       AS max_extents
+            , DECODE(
+                      p.def_pct_increase
+                     ,'DEFAULT',s.pct_increase
+                     ,p.def_pct_increase
+                    )                       AS pct_increase
+            , DECODE(
+                      p.def_freelists
+                     ,0,1
+                     ,NVL(p.def_freelists,1)
+                    )                       AS freelists
+            , DECODE(
+                      p.def_freelist_groups
+                     ,0,1
+                     ,NVL(p.def_freelist_groups,1)
+                    )                       AS freelist_groups
+            , 'N/A'                         AS buffer_pool
+            , DECODE(
+                      p.def_logging 
+                     ,'NO','NOLOGGING'
+                     ,     'LOGGING'
+                    )                       AS logging
+            , LOWER(p.def_tablespace_name)  AS tablespace_name
+            , t.blocks - NVL(t.empty_blocks,0)
+       FROM
+              ${view}_all_tables    t
+            , ${view}_part_indexes  p
+            , ${view}_tablespaces   s
+       WHERE
+                  t.table_name      = UPPER('$name')
+              AND p.table_name      = t.table_name
+              AND s.tablespace_name = p.def_tablespace_name
+      ";
+  }
+  else               # We're Oracle8i or newer
+  {
+    $stmt =
       "
        SELECT
               -- Table Properties
@@ -1385,6 +1546,7 @@ sub _create_partitioned_iot
               AND p.table_name      = t.table_name
               AND s.tablespace_name = p.def_tablespace_name
       ";
+  }
 
   if ( $view eq 'DBA' )
   {
@@ -1438,7 +1600,97 @@ sub _create_partitioned_table
 {
   my ( $schema, $owner, $name, $view ) = @_;
 
-  my $stmt =
+  my $stmt;
+
+  if ( $oracle_major == 8 and $oracle_minor == 0 )
+  {
+    $stmt =
+      "
+       SELECT
+              -- Table Properties
+              'N/A'                         AS monitoring
+            , t.table_name
+              -- Parallel Clause
+            , LTRIM(t.degree)               AS degree
+            , LTRIM(t.instances)            AS instances
+              -- Physical Properties
+            , DECODE(
+                      t.iot_type
+                     ,'IOT','INDEX'
+                     ,      'HEAP'
+                    )                       AS organization
+              -- Segment Attributes
+            , DECODE(
+                      LTRIM(t.cache)
+                     ,'Y','CACHE'
+                     ,    'NOCACHE'
+                    )                       AS cache
+            , p.def_pct_used
+            , p.def_pct_free                AS pct_free
+            , p.def_ini_trans               AS ini_trans
+            , p.def_max_trans               AS max_trans
+              -- Storage Clause
+            ,DECODE(
+                     p.def_initial_extent
+                    ,'DEFAULT',s.initial_extent
+                    ,p.def_initial_extent * $block_size * 1024
+                   )                        AS initial_extent
+            ,DECODE(
+                     p.def_next_extent
+                    ,'DEFAULT',s.next_extent
+                    ,p.def_next_extent * $block_size * 1024
+                   )                        AS next_extent
+            , DECODE(
+                      p.def_min_extents
+                     ,'DEFAULT',s.min_extents
+                     ,p.def_min_extents
+                    )                       AS min_extents
+            , DECODE(
+                      p.def_max_extents
+                     ,'DEFAULT',DECODE(
+                                        s.max_extents
+                                       ,2147483645,'unlimited'
+                                       ,s.max_extents
+                                      )
+                     ,2147483645,'unlimited'
+                     ,p.def_max_extents
+                    )                       AS max_extents
+            , DECODE(
+                      p.def_pct_increase
+                     ,'DEFAULT',s.pct_increase
+                     ,p.def_pct_increase
+                    )                       AS pct_increase
+            , DECODE(
+                      p.def_freelists
+                     ,0,1
+                     ,NVL(p.def_freelists,1)
+                    )                       AS freelists
+            , DECODE(
+                      p.def_freelist_groups
+                     ,0,1
+                     ,NVL(p.def_freelist_groups,1)
+                    )                       AS freelist_groups
+            , 'N/A'                         AS buffer_pool
+            , DECODE(
+                      p.def_logging 
+                     ,'NO','NOLOGGING'
+                     ,     'LOGGING'
+                    )                       AS logging
+            , LOWER(p.def_tablespace_name)  AS tablespace_name
+            , t.blocks - NVL(t.empty_blocks,0)
+       FROM
+              ${view}_all_tables   t
+            , ${view}_part_tables  p
+            , ${view}_tablespaces  s
+       WHERE
+                  t.table_name      = UPPER('$name')
+              AND p.table_name      = t.table_name
+              AND s.tablespace_name = p.def_tablespace_name
+      ";
+  }
+  else               # We're Oracle8i or newer
+  {
+    $stmt =
       "
        SELECT
               -- Table Properties
@@ -1525,6 +1777,7 @@ sub _create_partitioned_table
               AND p.table_name      = t.table_name
               AND s.tablespace_name = p.def_tablespace_name
       ";
+  }
 
   if ( $view eq 'DBA' )
   {
@@ -1540,7 +1793,24 @@ sub _create_partitioned_table
   $sql =~ /ORGANIZATION\s+(\w+)/gm;
   my $organization = $1;
 
-  $stmt =
+  if ( $oracle_major == 8 and $oracle_minor == 0 )
+  {
+    $stmt =
+      "
+       SELECT
+              partitioning_type
+            , partition_count
+            , 'N/A'                        AS subpartitioning_type
+            , 'N/A'                        AS def_subpartition_count
+       FROM
+              ${view}_part_tables
+       WHERE
+                  table_name = UPPER( ? )
+      ";
+  }
+  else               # We're Oracle8i or newer
+  {
+    $stmt =
       "
        SELECT
               partitioning_type
@@ -1552,6 +1822,7 @@ sub _create_partitioned_table
        WHERE
                   table_name = UPPER( ? )
       ";
+  }
 
   if ( $view eq 'DBA' )
   {
@@ -1589,7 +1860,47 @@ sub _create_partitioned_table
 
     $sql .= "(\n";
 
-    $stmt =
+    if ( $oracle_major == 8 and $oracle_minor == 0 )
+    {
+       $stmt =
+      "
+       SELECT
+              partition_name
+            , high_value
+            , 'N/A'
+            , pct_used
+            , pct_free
+            , ini_trans
+            , max_trans
+              -- Storage Clause
+            , initial_extent
+            , next_extent
+            , min_extent
+            , DECODE(
+                      max_extent
+                     ,2147483645,'unlimited'
+                     ,           max_extent
+                    )                       AS max_extents
+            , pct_increase
+            , NVL(freelists,1)
+            , NVL(freelist_groups,1)
+            , 'N/A'                         AS buffer_pool
+            , DECODE(
+                      logging 
+                     ,'NO','NOLOGGING'
+                     ,     'LOGGING'
+                    )                       AS logging
+            , LOWER(tablespace_name)
+            , blocks - NVL(empty_blocks,0)
+       FROM
+              ${view}_tab_partitions
+       WHERE
+                  table_name =  UPPER( ? )
+      ";
+    }
+    else               # We're Oracle8i or newer
+    {
+      $stmt =
       "
        SELECT
               partition_name
@@ -1624,6 +1935,7 @@ sub _create_partitioned_table
        WHERE
                   table_name =  UPPER( ? )
       ";
+    }
 
     if ( $view eq 'DBA' )
     {
@@ -1936,6 +2248,393 @@ sub _create_rollback_segment
          ";\n\n" ; 
 }
 
+# sub _create_materialized_view
+#
+# Returns DDL to create the named materialized view
+# by calling _create_mview (which is shared with
+# _create_snapshot)
+#
+sub _create_materialized_view
+{
+  _create_mview( @_, 'MATERIALIZED VIEW' );
+}
+
+# sub _create_materialized_view_log
+#
+# Returns DDL to create the named materialized view log
+# by calling _create_mview (which is shared with
+# _create_snapshot_log)
+#
+sub _create_materialized_view_log
+{
+  _create_mview_log( @_, 'MATERIALIZED VIEW' );
+}
+
+# sub _create_mview
+# 
+# Returns DDL to create the named snapshot or materialized view
+# in the form of:
+#
+#     CREATE {MATERIALIZED VIEW|SNAPSHOT} [schema.]<name>
+#     <table properties>
+#
+sub _create_mview
+{
+  my ( $schema, $owner, $name, $view, $type ) = @_;
+
+  my $sql;
+  my $stmt =
+      "
+       SELECT
+              m.container_name
+            , DECODE(
+                      m.build_mode
+                     ,'YES','USING PREBUILT TABLE'
+                     ,DECODE(
+                              m.last_refresh_date
+                             ,null,'BUILD DEFERRED'
+                             ,'BUILD IMMEDIATE'
+                            )
+                    )                                  AS build_mode
+            , DECODE(
+                      m.refresh_method
+                     ,'NEVER','NEVER REFRESH'
+                     ,'REFRESH ' || m.refresh_method
+                    )                                  AS refresh_method
+            , DECODE(
+                      m.refresh_mode
+                     ,'NEVER',null
+                     ,'ON ' || m.refresh_mode
+                    )                                  AS refresh_mode
+            , TO_CHAR(s.start_with, 'DD-MON-YYYY HH24:MI:SS')
+                                                       AS start_with
+            , s.next
+            , DECODE(
+                      s.refresh_method
+                     ,'PRIMARY KEY','WITH  PRIMARY KEY'
+                     ,'ROWID'      ,'WITH  ROWID'
+                     ,null
+                    )                                  AS using_pk
+            , s.master_rollback_seg
+            , DECODE(
+                      m.updatable
+                     ,'N',null
+                     ,DECODE(
+                              m.rewrite_enabled
+                             ,'Y','FOR UPDATE ENABLE QUERY REWRITE'
+                             ,'N','FOR UPDATE DISABLE QUERY REWRITE'
+                            )
+                    )                                  AS updatable
+            , s.query
+       FROM
+              ${view}_mviews     m
+            , ${view}_snapshots  s
+       WHERE
+                  m.mview_name  = UPPER( ? )
+              AND s.name        = m.mview_name
+      ";
+
+  if ( $view eq 'DBA' )
+  {
+    $stmt .=
+        "
+              AND m.owner       = UPPER('$owner')
+              AND s.owner       = m.owner
+        "
+  }
+
+  $dbh->{ LongReadLen } = 65536;    # Allows Query to be 64K
+  $dbh->{ LongTruncOk } = 1;
+
+  $sth = $dbh->prepare( $stmt );
+  $sth->execute( $name );
+  my @row = $sth->fetchrow_array;
+  my $lctype = ( $type eq 'SNAPSHOT' ) ? 'Snapshpt' : 'Materialized View';
+  die "\n$lctype \U$name \Ldoes not exist.\n\n" unless @row;
+
+  my ( 
+       $table, 
+       $build_mode, 
+       $refresh_method, 
+       $refresh_mode,
+       $start_with,
+       $next,
+       $using_pk,
+       $master_rb_seg,
+       $updatable,
+       $query,
+     ) = @row;
+
+  $stmt =
+      "
+       SELECT
+              index_name
+       FROM
+              ${view}_indexes
+       WHERE
+                  table_name = UPPER( ? )
+      ";
+
+  if ( $view eq 'DBA' )
+  {
+    $stmt .=
+        "
+              AND owner      = UPPER('$owner')
+        "; }
+
+  $sth = $dbh->prepare( $stmt );
+  $sth->execute( $table );
+  @row = $sth->fetchrow_array;
+
+  my ( $index ) = @row;
+
+  $sql  = "PROMPT " .
+          "CREATE $type \L$schema$name\n\n" .
+          "CREATE $type \L$schema$name  \n" .
+          _create_mview_table( $owner, $owner, $table, $view ) .
+          "$build_mode\n" .
+          "USING INDEX\n" .
+          _create_mview_index( $schema, $owner, $index, $view ) .
+          "$refresh_method $refresh_mode\n";
+
+  if ( $refresh_method ne 'NEVER REFRESH' )
+  {
+    $sql .= "START WITH TO_DATE('$start_with','DD-MON-YYYY HH24:MI:SS')\n"
+      if $start_with;
+
+    $sql .= "NEXT  $next\n"
+      if $next;
+
+    $sql .= "$using_pk\n"
+      if $using_pk;
+
+    $sql .= "USING MASTER ROLLBACK SEGMENT \L$master_rb_seg\n"
+      if $master_rb_seg;
+  }
+
+  $sql .= "$updatable\n"
+    if $updatable;
+
+  $sql .= "AS\n" .
+          $query;
+
+  return $sql .
+         ";\n\n";
+}
+
+# sub _create_mview_index
+#
+# Returns DDL for the USING INDEX definition part of:
+#
+#     CREATE MATERIALIZED VIEW
+#     CREATE SNAPSHOT
+#
+# statements.  This is created by calling _create_index, and
+# then stripping off the PROMPT and CREATE INDEX portions and the
+# column list, leaving just the physical attributes and partitioning clauses
+#
+sub _create_mview_index
+{
+  # Snapshots don't use attributes PCTUSED and PCTFREE.
+  # This will prevent sub _segment_attributes from including them.
+  $isasnapindx = 1;
+
+  my $done;
+  my $started;
+  my @lines_in = split /\n/, _create_index( @_ );
+  my @lines_out;
+
+  LINE:
+    foreach my $line( @lines_in )
+    {
+      # Ignore everything before the INITRANS clause.
+      # This includes REMs, CREATE INDEX, columns, etc.
+      $started++    if $line =~ /^INITRANS/;
+      next LINE     if not $started;
+
+      # Set $done when we hit a semicolon
+      $done = $line =~ s/\;$//;
+
+      # But keep everything in between except blank lines
+      # and any [NO]LOGGINING clauses
+      push @lines_out, $line    unless $line =~ /^$|LOGGING/;
+
+      # Exit when we get to the semicolon and ignore the rest.
+      # This eliminates the ';' and any COMMENTs.
+      last LINE if $done;
+    }
+
+  my $sql = join "\n", @lines_out;
+  
+  $isasnapindx = 0;
+
+  return $sql .  "\n";
+}
+
+# sub _create_mview_log
+# 
+# Returns DDL to create the named log (snapshot or materialized view)
+# in the form of:
+#
+#     CREATE {MATERIALIZED VIEW|SNAPSHOT} LOG [schema.]<name>
+#     <table properties>
+#     WITH {PRIMARY KEY|ROWID|PRIMARY KEY, ROWID}
+#     [<filter columns>]
+#
+sub _create_mview_log
+{
+  my ( $schema, $owner, $name, $view, $type ) = @_;
+
+  my $sql;
+  my $stmt =
+      "
+       SELECT
+              log_table
+            , rowids
+            , primary_key
+            , filter_columns
+       FROM
+              ${view}_snapshot_logs
+       WHERE
+                  master     = UPPER( ? )
+      ";
+
+  if ( $view eq 'DBA' )
+  {
+    $stmt .=
+        "
+              AND log_owner  = UPPER('$owner')
+        "; }
+
+  $sth = $dbh->prepare( $stmt );
+  $sth->execute( $name );
+  my @row = $sth->fetchrow_array;
+  my $lctype = ( $type eq 'SNAPSHOT' ) ? 'Snapshpt' : 'Materialized View';
+  die "\n$lctype Log on \U$name \Ldoes not exist.\n\n" unless @row;
+
+  my ( $table, $rowids, $primary_key, $filter_columns, $refreshable ) = @row;
+
+  $sql  = "PROMPT " .
+          "CREATE $type LOG ON \L$schema$name\n\n" .
+          "CREATE $type LOG ON \L$schema$name  \n" .
+          _create_mview_table( $schema, $owner, $table, $view );
+
+  if ( $rowids eq 'YES' and $primary_key eq 'YES' )
+  {
+    $sql .= "WITH PRIMARY KEY, ROWID "
+  }
+  elsif ( $rowids eq 'YES' )
+  {
+    $sql .= "WITH ROWID "
+  }
+  elsif ( $primary_key eq 'YES' )
+  {
+    $sql .= "WITH PRIMARY KEY "
+  }
+
+  $stmt =
+      "
+       SELECT
+              column_name
+       FROM
+              dba_snapshot_log_filter_cols
+       WHERE
+                  name  = UPPER( ? )
+              AND owner = UPPER( ? )
+       MINUS
+       SELECT
+              column_name
+       FROM
+              ${view}_cons_columns  c
+            , ${view}_constraints   d
+       WHERE
+                  d.table_name      = UPPER( ? )
+              AND d.constraint_type = 'P'
+              AND c.table_name      = d.table_name
+              AND c.constraint_name = d.constraint_name
+      ";
+
+  if ( $view eq 'DBA' )
+  {
+    $stmt .=
+        "
+              AND d.owner           = UPPER('$owner')
+              AND c.owner           = d.owner
+        "; }
+
+  $sth = $dbh->prepare( $stmt );
+  $sth->execute( $name, $owner, $name );
+  my $aref = $sth->fetchall_arrayref;
+
+  if ( @$aref )
+  {
+
+    my $comma  = '   ';
+    $sql .= "\n(\n";
+
+    foreach my $row( @$aref )
+    {
+      $sql .= "$comma \L$row->[0]\n";
+      $comma = '  ,'
+    }
+
+    $sql .= ") ";
+  }
+
+  return $sql .
+         ";\n\n";
+}
+
+# sub _create_mview_table
+#
+# Returns DDL for the table definition part of:
+#
+#     CREATE MATERIALIZED VIEW
+#     CREATE MATERIALIZED VIEW LOG
+#     CREATE SNAPSHOT
+#     CREATE SNAPSHOT LOG
+#
+# statements.  This is created by calling _create_table, and
+# then stripping off the PROMPT and CREATE TABLE portions and the
+# column list, leaving just the physical attributes and partitioning clauses
+#
+sub _create_mview_table
+{
+  # Snapshots and their logs don't use attribute INITRANS.
+  # This will prevent sub _segment_attributes from including it.
+  $isasnaptabl = 1;
+
+  my $done;
+  my $started;
+  my @lines_in = split /\n/, _create_table( @_ );
+  my @lines_out;
+
+  LINE:
+    foreach my $line( @lines_in )
+    {
+      # Ignore everything before the PARALLEL clause.
+      # This includes REMs, CREATE TABLE, column definitions, etc.
+      $started++    if $line =~ /^PARALLEL/;
+      next LINE     if not $started;
+
+      # Set $done when we hit a semicolon
+      $done = $line =~ s/\;$//;
+
+      # But keep everything in between
+      push @lines_out, $line    unless $line =~ /^$/;
+
+      # Exit when we get to the semicolon and ignore the rest.
+      # This eliminates the ';' and any COMMENTs.
+      last LINE if $done;
+    }
+
+  my $sql = join "\n", @lines_out;
+  
+  $isasnaptabl = 0;
+
+  return $sql .  "\n";
+}
+
 # sub _create_package
 #
 # Returns DDL to create the named procedure in the form of:
@@ -2064,6 +2763,28 @@ sub _create_sequence
          ";\n\n";
 }
 
+# sub _create_snapshot
+#
+# Returns DDL to create the named materialized view
+# by calling _create_mview (which is shared with
+# _create_materialized_view)
+#
+sub _create_snapshot
+{
+  _create_mview( @_, 'SNAPSHOT' );
+}
+
+# sub _create_snapshot_log
+#
+# Returns DDL to create the named snapshot log
+# by calling _create_mview (which is shared with
+# _create_materialized_log)
+#
+sub _create_snapshot_log
+{
+  _create_mview_log( @_, 'SNAPSHOT' );
+}
+
 # sub _create_synonym
 #
 # Returns DDL to create the named synonym in the form of:
@@ -2147,7 +2868,24 @@ sub _create_table
   my ( $schema, $owner, $name, $view ) = @_;
 
   my $sql;
-  my $stmt =
+  my $stmt;
+
+  if ( $oracle_major == 7 )
+  {
+    $stmt =
+      "
+       SELECT
+              'NO'                    AS partitioned
+            , 'NOT IOT'               AS iot_type
+       FROM
+              ${view}_tables
+       WHERE
+                  table_name = UPPER( ? )
+      ";
+  }
+  else
+  {
+    $stmt =
       "
        SELECT
               partitioned
@@ -2157,6 +2895,7 @@ sub _create_table
        WHERE
                   table_name = UPPER( ? )
       ";
+  }
 
   if ( $view eq 'DBA' )
   {
@@ -2191,7 +2930,131 @@ sub _create_table
 
   # We must be a plain, vanilla, non-partitioned, relational table.
 
-  $stmt =
+  if ( $oracle_major == 7 )
+  {
+    $stmt =
+      "
+       SELECT
+              -- Table Properties
+              'N/A'                         AS monitoring
+            , 'N/A'                         AS table_name
+              -- Parallel Clause
+            , LTRIM(t.degree)
+            , LTRIM(t.instances)
+              -- Physical Properties
+            , 'N/A'                         AS organization
+              -- Segment Attributes
+            , DECODE(
+                      LTRIM(t.cache)
+                     ,'Y','CACHE'
+                     ,    'NOCACHE'
+                    )
+            , t.pct_used
+            , t.pct_free
+            , DECODE(
+                      t.ini_trans
+                     ,0,1
+                     ,null,1
+                     ,t.ini_trans
+                    )                       AS ini_trans
+            , DECODE(
+                      t.max_trans
+                     ,0,255
+                     ,null,255
+                     ,t.max_trans
+                    )                       AS max_trans
+              -- Storage Clause
+            , t.initial_extent
+            , t.next_extent
+            , t.min_extents
+            , DECODE(
+                      t.max_extents
+                     ,2147483645,'unlimited'
+                     ,           t.max_extents
+                    )                       AS max_extents
+            , t.pct_increase
+            , NVL(t.freelists,1)
+            , NVL(t.freelist_groups,1)
+            , 'N/A'                         AS buffer_pool
+            , 'N/A'                         AS logging
+            , LOWER(t.tablespace_name)      AS tablespace_name
+            , s.blocks - NVL(t.empty_blocks,0)
+       FROM
+              ${view}_tables    t
+            , ${view}_segments  s
+       WHERE
+                  t.table_name   = UPPER('$name')
+              AND t.table_name   = s.segment_name
+      ";
+  }
+  elsif ( $oracle_major == 8 and $oracle_minor == 0 )
+  {
+    $stmt =
+      "
+       SELECT
+              -- Table Properties
+              'N/A'                         AS monitoring
+            , 'N/A'                         AS table_name
+              -- Parallel Clause
+            , LTRIM(t.degree)
+            , LTRIM(t.instances)
+              -- Physical Properties
+            , DECODE(
+                      t.iot_type
+                     ,'IOT','INDEX'
+                     ,      'HEAP'
+                    )                       AS organization
+              -- Segment Attributes
+            , DECODE(
+                      LTRIM(t.cache)
+                     ,'Y','CACHE'
+                     ,    'NOCACHE'
+                    )
+            , t.pct_used
+            , t.pct_free
+            , DECODE(
+                      t.ini_trans
+                     ,0,1
+                     ,null,1
+                     ,t.ini_trans
+                    )                       AS ini_trans
+            , DECODE(
+                      t.max_trans
+                     ,0,255
+                     ,null,255
+                     ,t.max_trans
+                    )                       AS max_trans
+              -- Storage Clause
+            , t.initial_extent
+            , t.next_extent
+            , t.min_extents
+            , DECODE(
+                      t.max_extents
+                     ,2147483645,'unlimited'
+                     ,           t.max_extents
+                    )                       AS max_extents
+            , t.pct_increase
+            , NVL(t.freelists,1)
+            , NVL(t.freelist_groups,1)
+            , 'N/A'                         AS buffer_pool
+            , DECODE(
+                      t.logging
+                     ,'NO','NOLOGGING'
+                     ,     'LOGGING'
+                    )                       AS logging
+            , LOWER(t.tablespace_name)      AS tablespace_name
+            , s.blocks - NVL(t.empty_blocks,0)
+       FROM
+              ${view}_tables    t
+            , ${view}_segments  s
+       WHERE
+                  t.table_name   = UPPER('$name')
+              AND t.table_name   = s.segment_name
+      ";
+  }
+  else                   # We're Oracle8i or newer
+  {
+    $stmt =
       "
        SELECT
               -- Table Properties
@@ -2199,7 +3062,7 @@ sub _create_table
                       t.monitoring
                      ,'NO','NOMONITORING'
                      ,     'MONITORING'
-                    )
+                    )                       AS monitoring
             , 'N/A'                         AS table_name
               -- Parallel Clause
             , LTRIM(t.degree)
@@ -2257,6 +3120,7 @@ sub _create_table
                   t.table_name   = UPPER('$name')
               AND t.table_name   = s.segment_name
       ";
+  }
 
   if ( $view eq 'DBA' )
   {
@@ -2482,10 +3346,19 @@ sub _create_table_text
             _index_columns( '      ', $owner, $index, $view, );
   }
 
-  $sql .= ")\n" .
-          "ORGANIZATION        $organization\n" .
-          "$monitoring\n" .
-          "PARALLEL\n" .
+  $sql .= ")\n";
+
+  $sql .= "ORGANIZATION        $organization\n"    if $oracle_major > 7;
+
+    if (
+            $oracle_major > 8
+         or ( $oracle_major == 8 and $oracle_minor > 0 )
+       )
+    {
+      $sql .= "$monitoring\n";
+    }
+
+  $sql .= "PARALLEL\n" .
           "(\n" .
           "  DEGREE            $degree\n" .
           "  INSTANCES         $instances\n" .
@@ -2523,7 +3396,84 @@ sub _create_tablespace
       unless $view eq 'DBA';
 
   my $sql;
-  my $stmt =
+  my $stmt;
+
+  if ( $oracle_major == 7 )
+  {
+    $stmt =
+      "
+       SELECT
+              initial_extent
+            , next_extent
+            , min_extents
+            , DECODE(
+                      max_extents
+                     ,2147483645,'unlimited'
+                     ,null,DECODE(
+                                   $block_size
+                                  , 1,  57
+                                  , 2, 121
+                                  , 4, 249
+                                  , 8, 505
+                                  ,16,1017
+                                  ,32,2041
+                                  ,'???'
+                                 )
+                     ,max_extents
+                    )                       AS max_extents
+            , pct_increase
+            , 0                             AS min_extlen
+            , contents
+            , 'N/A'                         AS logging
+            , 'N/A'                         AS extent_management
+            , 'N/A'                         AS allocation_type
+       FROM
+              dba_tablespaces
+       WHERE
+              tablespace_name = UPPER( ? )
+      ";
+  }
+  elsif ( $oracle_major == 8 and $oracle_minor == 0 )
+  {
+    $stmt =
+      "
+       SELECT
+              initial_extent
+            , next_extent
+            , min_extents
+            , DECODE(
+                      max_extents
+                     ,2147483645,'unlimited'
+                     ,null,DECODE(
+                                   $block_size
+                                  , 2,121
+                                  , 4,'250  -- ???'
+                                  , 8,505
+                                  ,16,'1010  -- ???'
+                                  ,32,'2020  -- ???'
+                                  ,'???'
+                                 )
+                     ,max_extents
+                    )                       AS max_extents
+            , pct_increase
+            , min_extlen
+            , contents
+            , DECODE(
+                      logging 
+                     ,'NO','NOLOGGING'
+                     ,     'LOGGING'
+                    )                       AS logging
+            , 'N/A'                         AS extent_management
+            , 'N/A'                         AS allocation_type
+       FROM
+              dba_tablespaces
+       WHERE
+              tablespace_name = UPPER( ? )
+      ";
+  }
+  else             # We're newer than Oracle 8.0
+  {
+    $stmt =
       "
        SELECT
               initial_extent
@@ -2558,6 +3508,7 @@ sub _create_tablespace
        WHERE
               tablespace_name = UPPER( ? )
       ";
+  }
 
   $sth = $dbh->prepare( $stmt );
   $sth->execute( $name );
@@ -2582,7 +3533,28 @@ sub _create_tablespace
           "CREATE TABLESPACE \L$name\n" .
           "DATAFILE\n";
 
-  $stmt =
+  if ( $oracle_major == 7 )
+  {
+    $stmt =
+      "
+       SELECT
+              file_name
+            , bytes
+            , 'N/A'                                 AS autoextensible
+            , 'N/A'                                 AS maxbytes
+            , 'N/A'                                 AS increment_by
+       FROM
+              dba_data_files
+       WHERE
+              tablespace_name = UPPER( ? )
+       ORDER
+          BY
+              file_name
+      ";
+  }
+  else             # We're newer than Oracle7
+  {
+    $stmt =
       "
        SELECT
               file_name
@@ -2598,7 +3570,11 @@ sub _create_tablespace
               dba_data_files
        WHERE
               tablespace_name = UPPER( ? )
+       ORDER
+          BY
+              file_name
       ";
+  }
 
   $sth = $dbh->prepare( $stmt );
   $sth->execute( $name );
@@ -2615,16 +3591,20 @@ sub _create_tablespace
          $increment_by,
        ) = @$row;
 
-    $sql .= "$comma '$file_name' SIZE $bytes REUSE\n" .
-            "       AUTOEXTEND ";
+    $sql .= "$comma '$file_name' SIZE $bytes REUSE\n";
 
-    if ( $autoextensible eq 'YES' )
+    if ( $oracle_major > 7 )
     {
-      $sql .= "ON NEXT $increment_by MAXSIZE $maxbytes\n";
-    }
-    else
-    {
-      $sql .= "OFF\n";
+      $sql .= "       AUTOEXTEND ";
+
+      if ( $autoextensible eq 'YES' )
+      {
+        $sql .= "ON NEXT $increment_by MAXSIZE $maxbytes\n";
+      }
+      else
+      {
+        $sql .= "OFF\n";
+      }
     }
 
     $comma = ' ,';
@@ -2643,7 +3623,7 @@ sub _create_tablespace
       $sql .= "UNIFORM SIZE $next\n";
     }
   }
-  else  # It's Dictionary Managed
+  else  # It's Dictionary Managed, Oracle8.0 or Oracle7
   {
     $sql .= "DEFAULT STORAGE\n" .
             "(\n" .
@@ -2660,11 +3640,18 @@ sub _create_tablespace
       $sql .= "MINUMUM EXTENT      $min_extlen\n";
     }
 
-    $sql .= "EXTENT MANAGEMENT DICTIONARY\n";
+    if (
+            $oracle_major > 8
+         or ( $oracle_major == 8 and $oracle_minor > 0 )
+       )
+    {
+      $sql .= "EXTENT MANAGEMENT DICTIONARY\n";
+    }
   }
 
-  $sql .= "$logging\n" .
-          ";\n\n";
+  $sql .= "$logging\n"    if $oracle_major > 7; 
+  $sql .= ";\n\n";
+
   return $sql;
 }
 
@@ -3026,6 +4013,36 @@ sub _drop_database_link
          "DROP$public DATABASE LINK \L$name ;\n\n" ;
 }
 
+# sub _drop_materialized_view_log
+#
+# Returns DDL to drop the named materialized view
+# by calling _drop_mview_log (which is shared with
+# _drop_snapshot_log)
+#
+sub _drop_materialized_view_log
+{
+  my ( $schema, $name, $type ) = @_;
+
+  _drop_mview_log( $schema, $name, 'MATERIALIZED VIEW' );
+}
+
+# sub _drop_mview_log
+#
+# Returns DDL to drop the named database link in the form of:
+#
+#     DROP MATERIALIZED VIEW LOG ON [schema.]<name>
+#     or
+#     DROP SNAPSHOT LOG ON [schema.]<name>
+#
+sub _drop_mview_log
+{
+  my ( $schema, $name, $type ) = @_;
+
+  return "PROMPT " .
+         "DROP $type LOG ON \L$schema$name  \n\n" .
+         "DROP $type LOG ON \L$schema$name ;\n\n" ;
+}
+
 # sub _drop_object
 # 
 # Returns generic DDL to drop the named object in the form of:
@@ -3071,6 +4088,19 @@ sub _drop_schema_object
   return "PROMPT " .
          "DROP \U$type \L$schema$name  \n\n" .
          "DROP \U$type \L$schema$name ;\n\n";
+}
+
+# sub _drop_snapshot_log
+#
+# Returns DDL to drop the named snapshot log
+# by calling _drop_mview_log (which is shared with
+# _drop_materialized_view_log)
+#
+sub _drop_snapshot_log
+{
+  my ( $schema, $name, $type ) = @_;
+
+  _drop_mview_log( $schema, $name, 'SNAPSHOT' );
 }
 
 # sub _drop_synonym
@@ -3154,26 +4184,12 @@ sub _drop_user
 sub _generate_heading
 {
   my ( $module, $action, $type, $list ) = @_;
-  my $host;
-  my $instance;
-
-  $sth = $dbh->prepare(
-      "
-       SELECT
-              host_name
-            , instance_name
-       FROM
-              v\$instance
-      ");
-
-  $sth->execute;
-  ( $host, $instance ) = $sth->fetchrow_array;
 
   $ddl =  "REM This DDL was reverse engineered\n" .
           "REM by the Perl module $module\n" .
           "REM\n" .
           "REM at:   $host\n" .
-          "REM from: $instance\n" .
+          "REM from: $instance, an Oracle Release $oracle_release instance\n" .
           "REM\n" .
           "REM on:   " . scalar ( localtime ) . "\n" .
           "REM\n" .
@@ -3214,6 +4230,152 @@ sub _generate_heading
 
   $ddl .= "\n";
 };
+
+# sub _get_oracle_release
+#
+# Determines Oracle Release number
+#
+sub _get_oracle_release
+{
+  $sth = $dbh->prepare(
+      "
+       SELECT
+              host_name
+            , instance_name
+            , version
+       FROM
+              v\$instance
+      ");
+
+  $sth->execute;
+  ( $host, $instance, $oracle_release ) = $sth->fetchrow_array;
+
+  $oracle_release =~ /(\d+)\.(\d+)/;
+  $oracle_major   = $1 || 8;
+  $oracle_minor   = $2 || 1;
+}
+
+# sub _granted_privs
+#
+# Returns DDL to create GRANT statements to the named grantee 
+# in the form of:
+#
+#     [GRANT <role >            TO <name> {WITH ADMIN OPTION]]
+#     [GRANT <system privilege> TO <name> {WITH ADMIN OPTION]]
+#     [GRANT <privilege> ON <object> TO <name> {WITH GRANT OPTION]]
+#
+sub _granted_privs
+{
+  my ( $name ) = @_;
+
+  my $sql;
+
+  # Add role privileges
+  my $stmt =
+      "
+       SELECT
+              granted_role
+            , DECODE(
+                      admin_option
+                     ,'YES','WITH ADMIN OPTION'
+                     ,null
+                    )                         AS admin_option
+       FROM
+              dba_role_privs
+       WHERE
+              grantee = UPPER( ? )
+       ORDER
+          BY
+              granted_role
+      ";
+
+  $sth = $dbh->prepare( $stmt );
+  $sth->execute( $name );
+  my $aref = $sth->fetchall_arrayref;
+
+  foreach my $row( @$aref )
+  {
+    $sql .= "PROMPT " .
+            "GRANT \L@$row->[0] \UTO \L$name \U@$row->[1] \n\n" .
+            "GRANT \L@$row->[0] \UTO \L$name \U@$row->[1];\n\n";
+  }
+
+  # Add system privileges
+  $stmt =
+      "
+       SELECT
+              privilege
+            , DECODE(
+                      admin_option
+                     ,'YES','WITH ADMIN OPTION'
+                     ,null
+                    )                         AS admin_option
+       FROM
+              dba_sys_privs
+       WHERE
+              grantee = UPPER( ? )
+       ORDER
+          BY
+              privilege
+      ";
+
+  $sth = $dbh->prepare( $stmt );
+  $sth->execute( $name );
+  $aref = $sth->fetchall_arrayref;
+
+  foreach my $row( @$aref )
+  {
+    $sql .= "PROMPT " .
+            "GRANT \L@$row->[0] \UTO \L$name \U@$row->[1] \n\n" .
+            "GRANT \L@$row->[0] \UTO \L$name \U@$row->[1];\n\n";
+  }
+
+  # Add object privileges
+  $stmt =
+      "
+       SELECT
+              privilege
+            , owner
+            , table_name
+            , DECODE(
+                      grantable
+                     ,'YES','WITH GRANT OPTION'
+                     ,null
+                    )                         AS grantable
+       FROM
+              dba_tab_privs
+       WHERE
+              grantee = UPPER( ? )
+       ORDER
+          BY
+              table_name
+            , privilege
+      ";
+
+  $sth = $dbh->prepare( $stmt );
+  $sth->execute( $name );
+  $aref = $sth->fetchall_arrayref;
+
+  foreach my $row( @$aref )
+  {
+    my (
+         $privilege,
+         $owner,
+         $table,
+         $grantable,,
+       ) = @$row;
+
+    my $schema = _set_schema( $owner );
+
+    $sql .= "PROMPT " .
+            "GRANT \L$privilege \UON \L$schema$table \UTO \L$name " .
+            "\U$grantable \n\n" .
+            "GRANT \L$privilege \UON \L$schema$table \UTO \L$name " .
+            "\U$grantable;\n\n";
+  }
+
+  return $sql;
+}
 
 #sub _index_columns
 #
@@ -3272,19 +4434,21 @@ sub _initial_next
 {
   my $blocks  = shift;
 
+  # Turn warnings off
+  $^W = 0;
+
   my $i = 0;
   my $initial;
   my $next;
 
   until ( $initial ) 
   {
-    # Turn warnings off
-    $^W = 0;
-
     $initial = ( $size_arr[$i][0] eq "UNLIMITED" ) ? $size_arr[$i][1] :
                ( $size_arr[$i][0]  > $blocks     ) ? $size_arr[$i][1] :
                                                      undef;
-    $next    = ( $size_arr[$i][0]  > $blocks     ) ? $size_arr[$i][2] :
+
+    $next    = ( $size_arr[$i][0] eq "UNLIMITED" ) ? $size_arr[$i][1] :
+               ( $size_arr[$i][0]  > $blocks     ) ? $size_arr[$i][1] :
                                                      undef;
     $i++;
   }
@@ -3358,7 +4522,49 @@ sub _range_partitions
   my ( $owner, $index, $view, $subpartitioning_type, $caller ) = @_;
 
   my $sql .= "(\n";
-  my $stmt =
+  my $stmt;
+
+  if ( $oracle_major == 8 and $oracle_minor == 0 )
+  {
+    $stmt =
+      "
+       SELECT
+              partition_name
+            , high_value
+            , 'N/A'                         AS cache
+            , 'N/A'                         AS pct_used
+            , pct_free
+            , ini_trans
+            , max_trans
+              -- Storage Clause
+            , initial_extent
+            , next_extent
+            , min_extent
+            , DECODE(
+                      max_extent
+                     ,2147483645,'unlimited'
+                     ,           max_extent
+                    )                       AS max_extents
+            , pct_increase
+            , NVL(freelists,1)
+            , NVL(freelist_groups,1)
+            , 'N/A'                         AS buffer_pool
+            , DECODE(
+                      logging 
+                     ,'NO','NOLOGGING'
+                     ,     'LOGGING'
+                    )                       AS logging
+            , tablespace_name
+            , leaf_blocks                   AS blocks
+       FROM
+              ${view}_ind_partitions
+       WHERE
+                  index_name =  UPPER( ? )
+      ";
+  }
+  else               # We're Oracle8i or newer
+  {
+    $stmt =
       "
        SELECT
               partition_name
@@ -3393,6 +4599,7 @@ sub _range_partitions
        WHERE
                   index_name =  UPPER( ? )
       ";
+  }
 
   if ( $view eq 'DBA' )
   {
@@ -3543,33 +4750,33 @@ sub _resize_index
        SELECT
               SUBSTR(segment_type,7)   -- PARTITION or SUBPARTITION
        FROM
-              ${view}_segments
+              ${view}_segments      s
        WHERE
-                  segment_name   = UPPER( ? )
-              AND partition_name = UPPER( ? )
+                  s.segment_name   = UPPER( ? )
+              AND s.partition_name = UPPER( ? )
       ";
     if ( $view eq 'DBA' )
     {
       $stmt .=
       "      
-              AND owner          = UPPER('$owner')
+              AND s.owner          = UPPER('$owner')
       ";
     }
 
     $sth = $dbh->prepare( $stmt );
-    $sth->execute( $name, $partition );
-    my $type = $sth->fetchrow_array;
+    $sth->execute( $name, $partition, $name );
+    my ( $seq_type, $partitioning_type ) = $sth->fetchrow_array;
     die "Partition \U$partition \Lof \UI\Lndex \U$name \Ldoes not exist,\n",
         "  OR it is the parent of Hash subpartition(s)\n",
         "  (i.e., it is not a segment and has no size).\n\n"
-        unless $type;
+        unless $seq_type;
 
     $sql .= _resize_index_partition(
                                      $schema,
                                      $owner,
                                      $name,
                                      $partition,
-                                     $type,
+                                     $seq_type,
                                      $view
                                    );
 
@@ -3671,14 +4878,14 @@ sub _resize_index
 
     foreach my $row ( @$aref )
     {
-      my ( $partition, $type ) = @$row;
+      my ( $partition, $seg_type ) = @$row;
 
       $sql .= _resize_index_partition(
                                        $schema,
                                        $owner,
                                        $name,
                                        $partition,
-                                       $type,
+                                       $seg_type,
                                        $view
                                      );
     }
@@ -3700,43 +4907,55 @@ sub _resize_index
 #
 sub _resize_index_partition
 {
-  my( $schema, $owner, $name, $partition, $type, $view ) = @_;
+  my(
+      $schema, $owner, $name, $partition, $seg_type, $view ) = @_;
 
   my $sql;
   my $stmt =
       "
        SELECT
-              blocks
-            , initial_extent
-            , next_extent
+              s.blocks
+            , s.initial_extent
+            , s.next_extent
+            , p.partitioning_type
        FROM
-              ${view}_segments
+              ${view}_segments      s
+            , ${view}_part_indexes  p
        WHERE
-                  segment_name   = UPPER( ? )
-              AND partition_name = UPPER( ? )
+                  s.segment_name   = UPPER( ? )
+              AND s.partition_name = UPPER( ? )
+              AND p.index_name     = UPPER( ? )
       ";
     if ( $view eq 'DBA' )
     {
       $stmt .= 
       "
-              AND owner          = UPPER('$owner')
+              AND s.owner          = UPPER('$owner')
+              AND p.owner          = UPPER('$owner')
       ";
     }
 
   $sth = $dbh->prepare( $stmt );
-  $sth->execute( $name, $partition );
-  my ( $blocks, $initial, $next ) = $sth->fetchrow_array;
+  $sth->execute( $name, $partition, $name );
+  my ( $blocks, $initial, $next, $partitioning_type ) = $sth->fetchrow_array;
 
   ( $initial, $next ) = _initial_next( $blocks ) if $attr{ resize };
 
   $sql .= "PROMPT " .
-          "ALTER INDEX \L$schema$name \UREBUILD $type \L$partition\n\n" .
-          "ALTER INDEX \L$schema$name \UREBUILD $type \L$partition\n" .
-          "STORAGE\n" .
-          "(\n" .
-          "  INITIAL  $initial\n" .
-          "  NEXT     $next\n" .
-          ") ;\n\n";
+          "ALTER INDEX \L$schema$name \UREBUILD $seg_type \L$partition\n\n" .
+          "ALTER INDEX \L$schema$name \UREBUILD $seg_type \L$partition ";
+
+  # Cannot specify storage parameters for a HASH [SUB]PARTITION
+  if ( $seg_type eq 'PARTITION' and $partitioning_type eq 'RANGE' )
+  {
+    $sql .= "\nSTORAGE\n" .
+            "(\n" .
+            "  INITIAL  $initial\n" .
+            "  NEXT     $next\n" .
+            ") ";
+  }
+
+  $sql .= ";\n\n";
 
   return $sql;
 }
@@ -3952,7 +5171,7 @@ sub _resize_table
 #
 sub _resize_table_partition
 {
-  my( $schema, $owner, $name, $partition, $type, $view ) = @_;
+  my( $schema, $owner, $name, $partition, $seg_type, $view ) = @_;
 
   my $sql;
   my $stmt =
@@ -3961,38 +5180,49 @@ sub _resize_table_partition
               s.blocks - NVL(t.empty_blocks,0)
             , s.initial_extent
             , s.next_extent
+            , p.partitioning_type
        FROM
-              ${view}_segments      s
-            , ${view}_tab_${type}s  t
+              ${view}_segments          s
+            , ${view}_tab_${seg_type}s  t
+            , ${view}_part_tables       p
        WHERE
                   s.segment_name   = UPPER( ? )
               AND s.partition_name = UPPER( ? )
               AND t.table_name     = UPPER( ? )
               AND t.partition_name = UPPER( ? )
+              AND p.table_name     = UPPER( ? )
       ";
     if ( $view eq 'DBA' )
     {
       $stmt .= 
       "
               AND s.owner          = UPPER('$owner')
+              AND p.owner          = UPPER('$owner')
               AND t.table_owner    = UPPER('$owner')
       ";
     }
 
   $sth = $dbh->prepare( $stmt );
-  $sth->execute( $name, $partition, $name, $partition );
-  my ( $blocks, $initial, $next ) = $sth->fetchrow_array;
+  $sth->execute( $name, $partition, $name, $partition, $name );
+  my ( $blocks, $initial, $next, $partitioning_type ) = $sth->fetchrow_array;
 
   ( $initial, $next ) = _initial_next( $blocks ) if $attr{ resize };
 
   $sql .= "PROMPT " .
-          "ALTER TABLE \L$schema$name \UMOVE $type \L$partition\n\n" .
-          "ALTER TABLE \L$schema$name \UMOVE $type \L$partition\n" .
-          "STORAGE\n" .
-          "(\n" .
-          "  INITIAL  $initial\n" .
-          "  NEXT     $next\n" .
-          ") ;\n\n";
+          "ALTER TABLE \L$schema$name \UMOVE $seg_type \L$partition\n\n" .
+          "ALTER TABLE \L$schema$name \UMOVE $seg_type \L$partition ";
+
+  # Cannot specify storage parameters for a HASH [SUB]PARTITION
+  if ( $seg_type eq 'PARTITION' and $partitioning_type eq 'RANGE' )
+  {
+    $sql .= "\nSTORAGE\n" .
+            "(\n" .
+            "  INITIAL  $initial\n" .
+            "  NEXT     $next\n" .
+            ") ";
+  }
+
+  $sql .= ";\n\n";
 
   return $sql;
 }
@@ -4035,12 +5265,14 @@ sub _segment_attributes
   if ( $organization eq 'HEAP' )
   {
     $sql = "${indent}$cache\n"       unless $cache eq 'N/A';
-    $sql .="${indent}PCTUSED             $pct_used\n";
+    $sql .="${indent}PCTUSED             $pct_used\n"    unless $isasnapindx;
   }
 
-  $sql .= "${indent}PCTFREE             $pct_free\n" .
-          "${indent}INITRANS            $ini_trans\n" .
-          "${indent}MAXTRANS            $max_trans\n" .
+  $sql .= "${indent}PCTFREE             $pct_free\n"     unless $isasnapindx;
+ 
+  $sql .= "${indent}INITRANS            $ini_trans\n"    unless $isasnaptabl; 
+
+  $sql .= "${indent}MAXTRANS            $max_trans\n" .
           "${indent}STORAGE\n" .
           "${indent}(\n" .
           "${indent}  INITIAL           $initial\n" .
@@ -4049,11 +5281,21 @@ sub _segment_attributes
           "${indent}  MAXEXTENTS        $max_extents\n" .
           "${indent}  PCTINCREASE       $pct_increase\n" .
           "${indent}  FREELISTS         $freelists\n" .
-          "${indent}  FREELIST GROUPS   $freelist_groups\n" .
-          "${indent}  BUFFER_POOL       $buffer_pool\n" .
-          "${indent})\n" .
-          "${indent}$logging\n" .
-          "${indent}TABLESPACE          \L$tablespace\n";
+          "${indent}  FREELIST GROUPS   $freelist_groups\n";
+
+    if (
+            $oracle_major > 8
+         or ( $oracle_major == 8 and $oracle_minor > 0 )
+       )
+    {
+      $sql .= "${indent}  BUFFER_POOL       $buffer_pool\n";
+    }
+
+  $sql .= "${indent})\n";
+
+  $sql .= "${indent}$logging\n"    if $oracle_major > 7;
+
+  $sql .= "${indent}TABLESPACE          \L$tablespace\n";
 
   return $sql;
 }
@@ -4143,7 +5385,11 @@ sub _table_columns
 {
   my ( $owner, $name, $view ) = @_;
 
-  my $stmt =
+  my $stmt;
+
+  if ( $oracle_major == 7 )
+  {
+    $stmt =
       "
        SELECT
               RPAD(LOWER(column_name),32)
@@ -4155,11 +5401,15 @@ sub _table_columns
                                            ,null,DECODE(
                                                          data_scale
                                                         ,0,'INTEGER'
-                                                        ,  'NUMBER  '
+                                                        ,  'NUMBER   '
                                                        )
-                                           ,'NUMBER  '
+                                           ,'NUMBER   '
                                           )
-                          ,'CHAR','CHAR    '
+                          ,'RAW'     ,'RAW      '
+                          ,'CHAR'    ,'CHAR     '
+                          ,'NCHAR'   ,'NCHAR    '
+                          ,'UROWID'  ,'UROWID   '
+                          ,'VARCHAR2','VARCHAR2 '
                           ,data_type
                          )
                      || DECODE(
@@ -4171,17 +5421,23 @@ sub _table_columns
                                                 ,null,null
                                                 ,'('
                                                )
-                               ,DECODE(
-                                        data_type_owner
-                                       ,null,'('
-                                       ,null         -- user defined data type
-                                      )
+                               ,'RAW'      ,'('
+                               ,'CHAR'     ,'('
+                               ,'NCHAR'    ,'('
+                               ,'UROWID'   ,'('
+                               ,'VARCHAR2' ,'('
+                               ,'NVARCHAR2','('
+                               ,null
                               )
                      || DECODE(
                                 data_type
-                               ,'CHAR'    ,data_length
-                               ,'VARCHAR2',data_length
-                               ,'NUMBER'  ,data_precision
+                               ,'RAW'      ,data_length
+                               ,'CHAR'     ,data_length
+                               ,'NCHAR'    ,data_length
+                               ,'UROWID'   ,data_length
+                               ,'VARCHAR2' ,data_length
+                               ,'NVARCHAR2',data_length
+                               ,'NUMBER'   ,data_precision
                                , null
                               )
                      || DECODE(
@@ -4206,11 +5462,109 @@ sub _table_columns
                                                 ,null,null
                                                 ,')'
                                                )
-                               ,DECODE(
-                                        data_type_owner
-                                       ,null,')'
-                                       ,null         -- user defined data type
-                                      )
+                               ,'RAW'      ,')'
+                               ,'CHAR'     ,')'
+                               ,'NCHAR'    ,')'
+                               ,'UROWID'   ,')'
+                               ,'VARCHAR2' ,')'
+                               ,'NVARCHAR2',')'
+                               ,null
+                              )
+                   ,33
+                  )
+           || DECODE(
+                      nullable
+                     ,'N','NOT NULL'
+                     ,     null
+                    )
+       FROM
+              ${view}_tab_columns
+       WHERE
+                  table_name = UPPER( ? )
+      ";
+  }
+  else                  # We're newer than Oracle7
+  {
+    $stmt =
+      "
+       SELECT
+              RPAD(LOWER(column_name),32)
+           || RPAD(
+                   DECODE(
+                           data_type
+                          ,'NUMBER',DECODE(
+                                            data_precision
+                                           ,null,DECODE(
+                                                         data_scale
+                                                        ,0,'INTEGER'
+                                                        ,  'NUMBER   '
+                                                       )
+                                           ,'NUMBER   '
+                                          )
+                          ,'RAW'     ,'RAW      '
+                          ,'CHAR'    ,'CHAR     '
+                          ,'NCHAR'   ,'NCHAR    '
+                          ,'UROWID'  ,'UROWID   '
+                          ,'VARCHAR2','VARCHAR2 '
+                          ,data_type
+                         )
+                     || DECODE(
+                                data_type
+                               ,'DATE',null
+                               ,'LONG',null
+                               ,'NUMBER',DECODE(
+                                                 data_precision
+                                                ,null,null
+                                                ,'('
+                                               )
+                               ,'RAW'      ,'('
+                               ,'CHAR'     ,'('
+                               ,'NCHAR'    ,'('
+                               ,'UROWID'   ,'('
+                               ,'VARCHAR2' ,'('
+                               ,'NVARCHAR2','('
+                               ,null
+                              )
+                     || DECODE(
+                                data_type
+                               ,'RAW'      ,data_length
+                               ,'CHAR'     ,data_length
+                               ,'NCHAR'    ,data_length
+                               ,'UROWID'   ,data_length
+                               ,'VARCHAR2' ,data_length
+                               ,'NVARCHAR2',data_length
+                               ,'NUMBER'   ,data_precision
+                               , null
+                              )
+                     || DECODE(
+                                data_type
+                               ,'NUMBER',DECODE(
+                                 data_precision
+                                ,null,null
+                                ,DECODE(
+                                         data_scale
+                                        ,null,null
+                                        ,0   ,null
+                                        ,',' || data_scale
+                                       )
+                                    )
+                              )
+                     || DECODE(
+                                data_type
+                               ,'DATE',null
+                               ,'LONG',null
+                               ,'NUMBER',DECODE(
+                                                 data_precision
+                                                ,null,null
+                                                ,')'
+                                               )
+                               ,'RAW'      ,')'
+                               ,'CHAR'     ,')'
+                               ,'NCHAR'    ,')'
+                               ,'UROWID'   ,')'
+                               ,'VARCHAR2' ,')'
+                               ,'NVARCHAR2',')'
+                               ,null
                               )
                    ,32
                   )
@@ -4224,6 +5578,7 @@ sub _table_columns
        WHERE
                   table_name = UPPER( ? )
       ";
+  }
 
   if ( $view eq 'DBA' )
   {
@@ -4258,13 +5613,127 @@ sub _table_columns
 
 __END__
 
+# $Log: Oracle.pm,v $
+# Revision 1.26  2000/12/29 23:18:13  rvsutherland
+# Added DROP/CREATE SNAPSHOT LOG
+# Added DROP/CREATE MATERIALIZED VIEW LOG
+#
+# Revision 1.25  2000/12/28 21:51:56  rvsutherland
+# Retrofitted Oracle 7.3 and 8.0 for:
+#     CREATE TABLE
+#     CREATE INDEX
+#     CREATE TABLESPACE
+# Added support in CREATE TABLE for these additional data types
+#     RAW
+#     NCHAR
+#     UROWID
+#     NVARCHAR2
+# Corrected RESIZE method to not include STORAGE clause for Hash [SUB]PARTITIONs
+# Corrected NEXT (extent) if last tier had been reached (was null)
+#
+# Revision 1.24  2000/12/09 17:40:14  rvsutherland
+# Additional tuning refinements.
+# Minor cleanup of code.
+# VERSION changed to 0.24
+#
+# Revision 1.23  2000/12/06 00:45:30  rvsutherland
+# Switched to bind variables for performance enhancements.
+# Fixed spacing on CREATE TRIGGER (was inadvertantly adding a blank line).
+#
+# Revision 1.22  2000/12/02 14:08:45  rvsutherland
+# Updated VERSION to 0.22, and declared Beta stage reached.
+#
+# Revision 1.21  2000/11/26 20:12:15  rvsutherland
+# Added method 'exchange index'.
+#
+# Revision 1.20  2000/11/24 18:41:45  rvsutherland
+# Added method 'exchange table'
+#
+# Revision 1.19  2000/11/19 20:11:24  rvsutherland
+# Fixed resize method to handle subpartitions.
+# Modified CHECK CONSTRAINTS -- was adding white space.
+#
+# Revision 1.18  2000/11/16 09:14:38  rvsutherland
+# Added DROP CONSTRAINT
+# Corrected CREATE TABLE for partitions (didn't like CACHE/NOCACHE)
+#
+# Revision 1.17  2000/11/11 00:20:42  rvsutherland
+# Moved _create_comments from _create_table_family to _create_table
+#
+# Revision 1.16  2000/11/05 18:50:00  rvsutherland
+# Added CREATE SEQUENCE.
+# Added CREATE SYNONYM.
+#
+# Revision 1.15  2000/11/05 03:48:41  rvsutherland
+# We've been having fun today!
+# Added CREATE FUNCTION
+# Added CREATE PACKAGE
+# Added CREATE PROCEDURE
+# Added CREATE ROLE
+# Added CREATE TABLESPACE
+# Added CREATE TYPE
+# Added CREATE VIEW
+#
+# Revision 1.14  2000/11/03 02:49:56  rvsutherland
+# Added correct file -- 1.13 did not contain all of the changes it claimed.
+# Version 0.07 now up to date.
+#
+# Revision 1.13  2000/11/03 02:33:23  rvsutherland  
+# Added COMMENT ON Tables and Columns  
+# Added CREATE TRIGGER  
+# Added ALTER TABLE ADD CONSTRAINT   
+# Added object type "table family" which creates all of the above 
+#   plus the table plus its indexes 
+#
+# Revision 1.12  2000/10/31 09:27:50  rvsutherland 
+# Added CREATE TRIGGER. 
+# This probably needs a LOT more testing. 
+#
+# Revision 1.11  2000/10/29 17:13:20  rvsutherland
+# Added CREATE USER.
+# Did the laundry, cleaned the kitchen.
+#
+# Revision 1.10  2000/10/28 20:24:31  rvsutherland
+# Added DESCRIPTION and SYNOPSIS to pod.
+# Modified Header to omit Schema for objects without such a beast.
+#
+# Revision 1.9  2000/10/28 18:11:25  rvsutherland
+# Added inadvertantly missing sub _drop_object.
+# Corrected bug in CREATE TABLE for IOT tables.
+#
+# Revision 1.8  2000/10/28 11:55:14  rvsutherland
+# Added CREATE INDEX for partitioned indexes.
+#
+# Revision 1.7  2000/10/25 01:12:16  rvsutherland
+# Added CREATE INDEX for non-partitioned tables.
+#
+# Revision 1.6  2000/10/24 16:53:14  rvsutherland
+# Added IOT partitioned tables.
+#
+# Revision 1.5  2000/10/24 13:57:40  rvsutherland
+# Added HASH partitioning (w/o subpartitioning).
+# Added IOT non-partitioned tables.
+#
+# Revision 1.4  2000/10/21 11:04:06  rvsutherland
+# Expanded header, added missing ORDER BY's, miscellaneous fussing.
+#
+# Revision 1.3  2000/10/21 00:17:37  rvsutherland
+# Added RANGE and RANGE/HASH partitioning to CREATE TABLE functionality.
+#
+# Revision 1.2  2000/10/18 22:35:09  rvsutherland
+# Added CREATE TABLE functionality for non-partitioned tables.
+#
+# Revision 1.1  2000/10/18 00:00:39  rvsutherland
+# Initial revision
+#
+
 =head1 NAME
 
 DDL::Oracle - a DDL generator for Oracle databases
 
 =head1 VERSION
 
-VERSION = 0.24
+VERSION = 0.27
 
 =head1 SYNOPSIS
 
@@ -4291,9 +5760,9 @@ VERSION = 0.24
  my $sth = $dbh->prepare(
         "SELECT
                 owner
-              , name
+              , table_name
          FROM
-                user_tables
+                dba_tables
          WHERE
                 tablespace_name = 'MY_TBLSP'    -- your mileage may vary
         "
@@ -4381,6 +5850,15 @@ several session level options.  These are:
 
                          V$INSTANCE
                          V$PARAMETER
+
+                     And, in order to generate CREATE SNAPSHOT LOG
+                     statements, you will also need to create a PUBLIC
+                     SYNONYM for DBA_SNAPSHOT_LOG_FILTER_COLS.  In
+                     order for non-DBA users to do the same, you will
+                     need to grant SELECT on this view to them (e.g.,
+                     to PUBLIC).  Why Oracle Corp. feels this view is
+                     of no interest to non-replication users is a
+                     mystery to the author.
 
       schema  Defines whether and what to use as the schema for DDL
               on objects which use this syntax.  "1" means use the

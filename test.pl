@@ -11,5 +11,5 @@ END {print " 1..........not ok\n" unless $loaded;}
 use DBI;
 use DDL::Oracle;
 $loaded = 1;
-print " 1..........ok\n";
+print "1..........ok\n";
 

@@ -1,4 +1,4 @@
-# $Id: Oracle.pm,v 1.34 2001/02/11 16:27:43 rvsutherland Exp $ 
+# $Id: Oracle.pm,v 1.35 2001/02/18 16:28:03 rvsutherland Exp $ 
 #
 # Copyright (c) 2000, 2001 Richard Sutherland - United States of America
 #
@@ -9,7 +9,7 @@ require 5.004;
 
 BEGIN
 {
-  $DDL::Oracle::VERSION = "1.01"; # Also update version in pod text below!
+  $DDL::Oracle::VERSION = "1.02"; # Also update version in pod text below!
 }
 
 package DDL::Oracle;
@@ -1082,8 +1082,8 @@ sub _create_index
     $stmt =
       "
        SELECT
-              LTRIM(i.degree)
-            , LTRIM(i.instances)
+              'N/A'                         AS degree
+            , 'N/A'                         AS instances
             , 0                             AS compressed
               -- Physical Properties
             , 'INDEX'                       AS organization
@@ -1270,11 +1270,14 @@ sub _create_index
     qq!INDEXTYPE IS "$dom_owner"."$dom_name"\nPARAMETERS ('$dom_param') ;\n\n!;
   }
 
-  $sql .= "PARALLEL\n" .
-          "(\n" .
-          "  DEGREE            $degree\n" .
-          "  INSTANCES         $instances\n" .
-          ")\n";
+  if ( $oracle_major > 7 )
+  {
+    $sql .= "PARALLEL\n" .
+            "(\n" .
+            "  DEGREE            $degree\n" .
+            "  INSTANCES         $instances\n" .
+            ")\n";
+  }
 
   if ( $partitioned eq 'YES' )
   {
@@ -3353,7 +3356,7 @@ sub _create_table
                      ,2147483645,'unlimited'
                      ,           t.max_extents
                     )                       AS max_extents
-            , t.pct_increase
+            , NVL(t.pct_increase,0)
             , NVL(t.freelists,1)
             , NVL(t.freelist_groups,1)
             , 'N/A'                         AS buffer_pool
@@ -3422,7 +3425,7 @@ sub _create_table
                      ,2147483645,'unlimited'
                      ,           t.max_extents
                     )                       AS max_extents
-            , t.pct_increase
+            , NVL(t.pct_increase,0)
             , NVL(t.freelists,1)
             , NVL(t.freelist_groups,1)
             , LOWER(t.buffer_pool)          AS buffer_pool
@@ -4092,7 +4095,10 @@ sub _create_trigger
             "$action" .
             "$when" .
             "\n$other" .
-            "$body/\n\n";
+            "$body" ;
+
+  $sql .= "\n"    unless $sql =~ /\Z\n/;
+  $sql .= "/\n\n";
 
 }
 
@@ -4314,6 +4320,7 @@ sub _display_source
     $sql .= "@$row->[0]";
   }
 
+  $sql .= "\n"    unless $sql =~ /\Z\n/;
   $sql .= "/\n\n";
 
   return $sql;
@@ -6174,7 +6181,7 @@ DDL::Oracle - a DDL generator for Oracle databases
 
 =head1 VERSION
 
-VERSION = 1.01
+VERSION = 1.02
 
 =head1 SYNOPSIS
 
@@ -6353,6 +6360,15 @@ The 'type' defined in the 'new' method is limited to 'function', 'package',
 'procedure', 'trigger' and 'view'.
 
 =head1 BUGS
+
+The generated DDL contains the Schema and Object Name in lower case.  In the
+case of triggers, this will cause a problem if the "... ON <schema>.<table>"
+clause is quoted.  For example, a trigger on table MY_TABLE in schema ME
+written as '...BEFORE INSERT ON "ME"."MY_TABLE"...' will generate the DDL as
+
+   '... BEFORE INSERT ON "me"."my_table"...'
+
+There are no plans to change this.
 
 =head1 FILES
 

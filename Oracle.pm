@@ -1,4 +1,4 @@
-# $Id: Oracle.pm,v 1.44 2001/04/28 13:52:25 rvsutherland Exp $ 
+# $Id: Oracle.pm,v 1.47 2001/05/21 21:29:26 rvsutherland Exp $ 
 #
 # Copyright (c) 2000, 2001 Richard Sutherland - United States of America
 #
@@ -9,7 +9,7 @@ require 5.004;
 
 BEGIN
 {
-  $DDL::Oracle::VERSION = "1.09"; # Also update version in pod text below!
+  $DDL::Oracle::VERSION = "1.10"; # Also update version in pod text below!
 }
 
 package DDL::Oracle;
@@ -2260,13 +2260,15 @@ sub _create_partitioned_index
                       )                     AS blocks
        FROM
               ${view}_part_indexes  i
+            , ${view}_indexes       n
             , ${view}_tablespaces   s
             , ${view}_part_tables   t
        WHERE
                   -- def_tablspace is sometimes NULL in PART_INDEXES,
                   -- we'll have to go over to the table for the defaults
                   i.index_name      = UPPER( ? )
-              AND t.table_name      = i.table_name
+              AND n.index_name      = UPPER( ? )
+              AND t.table_name      = n.table_name
               AND s.tablespace_name = t.def_tablespace_name
       ";
   }
@@ -4158,10 +4160,8 @@ sub _create_schema
     $sql .= _create_sequence( $schema, $owner, @$row->[0], $view );
   }
 
-  $schema =~ s|\.||;
-
   $sql .= "PROMPT Recompile schema \U$owner\n\n" .
-          "BEGIN dbms_utility.compile_schema('\U$schema') ; END ;\n/\n\n"
+          "BEGIN dbms_utility.compile_schema('\U$owner') ; END ;\n/\n\n"
       unless $schema eq 'PUBLIC';
 
   return $sql;
@@ -5463,7 +5463,6 @@ sub _create_trigger
             , table_name
             , base_object_type
             , referencing_names
-            , description
             , DECODE(
                       when_clause
                      ,null,null
@@ -5488,7 +5487,6 @@ sub _create_trigger
               -- Only table triggers before 8i
             , 'TABLE'                           AS base_object_type
             , referencing_names
-            , description
             , DECODE(
                       when_clause
                      ,null,null
@@ -5525,13 +5523,11 @@ sub _create_trigger
        $table,
        $base_type,
        $ref_names,
-       $description,
        $when,
        $body,
      ) = @row;
 
   my ( $trg_type ) = $trigger_type =~ /(BEFORE|AFTER|INSTEAD OF)/;
-  my ( $columns )  = $description  =~ /$trg_type $event(.*) ON /i;
   my $schema2 = _set_schema( $table_owner );
   my $object = ( $base_type eq 'TABLE'  ) ? $schema2 . $table   :
                ( $base_type eq 'SCHEMA' ) ? $schema  . 'SCHEMA' : $base_type;
@@ -5543,10 +5539,41 @@ sub _create_trigger
   # Body sometimes ends in a null
   $body =~ s/\c@//g;
 
+  my $columns;
+  if ( $event =~ /UPDATE/ )
+  {
+    $stmt =
+      "
+       SELECT
+              LOWER(column_name)
+       FROM
+              ${view}_trigger_cols
+       WHERE
+                  trigger_name = UPPER( ? )
+              AND column_list  = 'YES'
+      ";
+
+    if ( $view eq 'DBA' )
+    {
+      $stmt .=
+      "
+              AND table_owner  = UPPER('$owner')
+      ";
+    }
+
+    $sth = $dbh->prepare( $stmt );
+    $sth->execute( $name );
+
+    my (@columns) = map { $_->[0] } @{ $sth->fetchall_arrayref };
+
+    $columns = "\nOF\n    " . join ("\n  , ", @columns) . "\n"
+  }
+
+
   my $sql = "PROMPT " .
             "CREATE OR REPLACE TRIGGER \L$schema$name\n\n" .
             "CREATE OR REPLACE TRIGGER \L$schema$name\n" .
-            "$trg_type $event\U$columns ON \L$object\n";
+            "$trg_type $event ${columns}ON \L$object\n";
 
   $sql .= "$ref_names\n"      if $base_type =~ /TABLE|VIEW/;
   $sql .= "FOR EACH ROW\n"    if $trigger_type =~ /EACH ROW/;
@@ -5673,6 +5700,9 @@ sub _create_user
 # Returns DDL to create the named view in the form of:
 #
 #     CREATE OR REPLACE VIEW [schema.]<name>
+#     (
+#       <column aliases>
+#     )
 #     AS
 #     <query>
 # 
@@ -5706,9 +5736,41 @@ sub _create_view
   my ( $text ) = $sth->fetchrow_array;
   die "\nView \U$name \Ldoes not exist.\n\n" unless $text;
 
+  $stmt =
+      "
+       SELECT
+              LOWER(column_name)
+       FROM
+              ${view}_tab_columns
+       WHERE
+                  table_name = UPPER( ? )
+      ";
+ 
+  if ( $view eq 'DBA' )
+  {
+    $stmt .=
+      "
+              AND owner      = UPPER('$owner')
+      ";
+  }
+ 
+  $stmt .= 
+      "
+       ORDER
+          BY
+              column_id
+      ";
+ 
+  $sth = $dbh->prepare( $stmt );
+  $sth->execute( $name );
+  my (@columns) = map { $_->[0] } @{ $sth->fetchall_arrayref };
+
   return "PROMPT " .
          "CREATE OR REPLACE VIEW \L$schema$name\n\n" .
          "CREATE OR REPLACE VIEW \L$schema$name\n" .
+         "(\n    " .
+         join ("\n  , ", @columns) .
+         "\n)\n" .
          "AS\n" .
          "$text" .
          ";\n\n";
@@ -5771,7 +5833,15 @@ sub _display_source
       # source.text already includes <TYPE> <name> 
       # We want to insert the schema right before the name
 
-      @$row->[0] =~ s/$type\s+\S+/$type \L$schema$name/i;
+#      @$row->[0] =~ s/$type\s+\S+/$type \L$schema$name/i;
+#     The following line was submitted by Sandor Toth, to fix the condition
+#     where parameters immediately followed the name, as in
+#        CREATE OR REPLACE PROCEDURE foo( var1 IN VARCHAR2)
+#                                       ^
+#                                       |
+#                                observe, no space between 'foo' and '('
+
+      @$row->[0] =~ s/($type)\s+($name)\s*(.*)$/$1 \L$schema$2 $3/i;
     }
 
     $sql .= "@$row->[0]";
@@ -5943,7 +6013,7 @@ sub _drop_synonym
   {
       return "PROMPT " .
              "DROP SYNONYM  \L$schema$name  \n\n" .
-             "DROP SYNONYM  \L$schema$name  \n\n";
+             "DROP SYNONYM  \L$schema$name ;\n\n";
   }
 }
 
@@ -7905,11 +7975,8 @@ sub _table_columns
                               )
                    ,33
                   )
-           || DECODE(
-                      nullable
-                     ,'N','NOT NULL'
-                     ,     null
-                    )
+            , nullable
+            , data_default
        FROM
               ${view}_tab_columns
        WHERE
@@ -8001,11 +8068,8 @@ sub _table_columns
                               )
                    ,32
                   )
-           || DECODE(
-                      nullable
-                     ,'N','NOT NULL'
-                     ,     null
-                    )
+            , nullable
+            , data_default
        FROM
               ${view}_tab_columns
        WHERE
@@ -8029,6 +8093,9 @@ sub _table_columns
              column_id
       ";
 
+  $dbh->{ LongReadLen } = 1024;    # Allows Default to be 1K
+  $dbh->{ LongTruncOk } = 1;
+
   $sth = $dbh->prepare( $stmt );
   $sth->execute( $name );
   my $aref = $sth->fetchall_arrayref;
@@ -8036,7 +8103,15 @@ sub _table_columns
   my @cols;
   foreach my $row ( @$aref )
   {
-    push @cols, $row->[0];
+    my ( $column, $nullable, $default ) = @$row;
+
+    # Knock off any trailing newlines
+    $default =~ s| *\n*\Z||;
+
+    $column .= "DEFAULT $default "   if $default;
+    $column .= 'NOT NULL'            if $nullable eq 'N';
+
+    push @cols, $column;
   }
 
   return join ( "\n  , ", @cols ) . "\n";
@@ -8054,7 +8129,7 @@ DDL::Oracle - a DDL generator for Oracle databases
 
 =head1 VERSION
 
-VERSION = 1.09
+VERSION = 1.10
 
 =head1 SYNOPSIS
 

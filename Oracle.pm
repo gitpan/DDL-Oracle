@@ -1,4 +1,4 @@
-# $Id: Oracle.pm,v 1.33 2001/01/27 16:25:48 rvsutherland Exp $ 
+# $Id: Oracle.pm,v 1.34 2001/02/11 16:27:43 rvsutherland Exp $ 
 #
 # Copyright (c) 2000, 2001 Richard Sutherland - United States of America
 #
@@ -9,7 +9,7 @@ require 5.004;
 
 BEGIN
 {
-  $DDL::Oracle::VERSION = "1.00"; # Also update version in pod text below!
+  $DDL::Oracle::VERSION = "1.01"; # Also update version in pod text below!
 }
 
 package DDL::Oracle;
@@ -402,6 +402,8 @@ sub _create_comments
 
   foreach my $row ( @$aref )
   {
+    @$row->[0] =~ s/'/''/g;
+
     $sql .= "PROMPT " .
             "COMMENT ON TABLE \L$schema$name \UIS \E'@$row->[0]'  \n\n" .
             "COMMENT ON TABLE \L$schema$name \UIS \E'@$row->[0]' ;\n\n";
@@ -433,6 +435,8 @@ sub _create_comments
 
   foreach my $row ( @$aref )
   {
+    @$row->[1] =~ s/'/''/g;
+
     $sql .= "PROMPT " .
             "COMMENT ON COLUMN \L$schema$name.@$row->[0] " . 
               "IS '@$row->[1]'  \n\n" .
@@ -562,6 +566,11 @@ sub _create_constraint
 
     $sql .= "REFERENCES \L$schema$table_name\n" .
             _constraint_columns( $r_owner, $r_cons_name, $view );
+
+    if ( $delete_rule eq 'CASCADE' )
+    {
+      $sql .= "ON DELETE CASCADE\n";
+    }
   }
 
   if ( $oracle_major < 8 )
@@ -926,10 +935,12 @@ sub _create_function
 #
 # Returns DDL to create the named index and its partition(s) in the form of:
 #
-#     CREATE INDEX [schema.]<name> ON [schema.]<table>
+#     CREATE INDEX [schema1.]<name> ON [schema2.]<table>
 #     (
 #       <column list>
 #     )
+#     INDEXTYPE IS <value>  -- for domain indexes
+#     PARAMETERS   <value>  -- for domain indexes
 #     [NO]MONIOTORING
 #     PARALLEL
 #     (
@@ -961,12 +972,14 @@ sub _create_index
        SELECT
               'N/A'                           AS partitioned
             , table_name
+            , table_owner
             , DECODE(
                       uniqueness
                      ,'UNIQUE',' UNIQUE'
                      ,null
                     )
             , null                            AS bitmap
+            , null                            AS domain
        FROM
               ${view}_indexes
        WHERE
@@ -980,6 +993,7 @@ sub _create_index
        SELECT
               partitioned
             , table_name
+            , table_owner
             , DECODE(
                       uniqueness
                      ,'UNIQUE',' UNIQUE'
@@ -988,6 +1002,11 @@ sub _create_index
             , DECODE(
                       index_type
                      ,'BITMAP',' BITMAP'
+                     ,null
+                    )
+            , DECODE(
+                      index_type
+                     ,'DOMAIN','DOMAIN'
                      ,null
                     )
        FROM
@@ -1013,9 +1032,50 @@ sub _create_index
   my ( 
        $partitioned,
        $table,
+       $table_owner,
        $unique,
-       $bitmap 
+       $bitmap,
+       $domain, 
      ) = @row;
+
+  my (
+       $dom_owner,
+       $dom_name,
+       $dom_param
+     );
+
+  if ( $domain eq 'DOMAIN')
+  {
+     $stmt =
+      "
+       SELECT
+              ityp_owner
+            , ityp_name
+            , parameters
+       FROM
+              ${view}_indexes
+       WHERE
+                  index_name = UPPER( ? )
+      ";
+
+    if ( $view eq 'DBA' )
+    {
+      $stmt .=
+        "
+              AND owner      = UPPER('$owner')
+        ";
+    }
+
+    $sth = $dbh->prepare( $stmt );
+    $sth->execute( $name );
+    my @row = $sth->fetchrow_array;
+
+    (
+      $dom_owner,
+      $dom_name,
+      $dom_param
+    ) = @row;
+  }
 
   if ( $oracle_major == 7 )
   {
@@ -1197,15 +1257,24 @@ sub _create_index
   my $instances  = shift @row;
   my $compressed = shift @row;
 
+  my $schema2 = _set_schema( $table_owner );
+
   $sql = "PROMPT " .
-         "CREATE$unique$bitmap INDEX \L$schema$name \UON \L$schema$table\n\n" .
-         "CREATE$unique$bitmap INDEX \L$schema$name \UON \L$schema$table\n" .
-         _index_columns( '', $owner, $name, $view, ) .
-         "PARALLEL\n" .
-         "(\n" .
-         "  DEGREE            $degree\n" .
-         "  INSTANCES         $instances\n" .
-         ")\n";
+         "CREATE$unique$bitmap INDEX \L$schema$name \UON \L$schema2$table\n\n" .
+         "CREATE$unique$bitmap INDEX \L$schema$name \UON \L$schema2$table\n" .
+         _index_columns( '', $owner, $name, $view, );
+
+  if ( $domain eq 'DOMAIN' )
+  {
+    return $sql .
+    qq!INDEXTYPE IS "$dom_owner"."$dom_name"\nPARAMETERS ('$dom_param') ;\n\n!;
+  }
+
+  $sql .= "PARALLEL\n" .
+          "(\n" .
+          "  DEGREE            $degree\n" .
+          "  INSTANCES         $instances\n" .
+          ")\n";
 
   if ( $partitioned eq 'YES' )
   {
@@ -3223,7 +3292,7 @@ sub _create_table
                      ,2147483645,'unlimited'
                      ,           t.max_extents
                     )                       AS max_extents
-            , t.pct_increase
+            , NVL(t.pct_increase,0)
             , NVL(t.freelists,1)
             , NVL(t.freelist_groups,1)
             , 'N/A'                         AS buffer_pool
@@ -4239,7 +4308,7 @@ sub _display_source
       # source.text already includes <TYPE> <name> 
       # We want to insert the schema right before the name
 
-      @$row->[0] =~ s/$type\s+/$type \L$schema/;
+      @$row->[0] =~ s/$type\s+\S+/$type \L$schema$name/;
     }
 
     $sql .= "@$row->[0]";
@@ -4524,19 +4593,51 @@ sub _get_oracle_release
   $sth = $dbh->prepare(
       "
        SELECT
-              host_name
-            , instance_name
-            , version
+              banner
        FROM
-              v\$instance
+              v\$version
+       WHERE
+              banner LIKE 'Oracle%'
       ");
 
   $sth->execute;
-  ( $host, $instance, $oracle_release ) = $sth->fetchrow_array;
+  ( $oracle_release ) = $sth->fetchrow_array;
 
-  $oracle_release =~ /(\d+)\.(\d+)/;
-  $oracle_major   = $1;
-  $oracle_minor   = $2;
+  $oracle_release =~ /((\d+)\.(\d+)\S+)/;
+  $oracle_release = $1;
+  $oracle_major   = $2;
+  $oracle_minor   = $3;
+
+  $sth = $dbh->prepare(
+      "
+       SELECT
+              LOWER(name)
+       FROM
+              v\$database
+      ");
+
+  $sth->execute;
+  ( $instance ) = $sth->fetchrow_array;
+
+  $host = `hostname`;
+  chomp( $host );
+
+#  $sth = $dbh->prepare(
+#      "
+#       SELECT
+#              host_name
+#            , instance_name
+#            , version
+#       FROM
+#              v\$instance
+#      ");
+#
+#  $sth->execute;
+#  ( $host, $instance, $oracle_release ) = $sth->fetchrow_array;
+#
+#  $oracle_release =~ /(\d+)\.(\d+)/;
+#  $oracle_major   = $1;
+#  $oracle_minor   = $2;
 }
 
 # sub _granted_privs
@@ -6073,7 +6174,7 @@ DDL::Oracle - a DDL generator for Oracle databases
 
 =head1 VERSION
 
-VERSION = 1.00
+VERSION = 1.01
 
 =head1 SYNOPSIS
 
@@ -6165,7 +6266,8 @@ several session level options.  These are:
                      on the following (in addition to the DBA or USER
                      views):
 
-                         V$INSTANCE
+                         V$VERSION
+                         V$DATABASE
                          V$PARAMETER
 
                      And, in order to generate CREATE SNAPSHOT LOG

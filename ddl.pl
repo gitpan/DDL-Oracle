@@ -1,6 +1,6 @@
 #! /usr/bin/perl -w
 
-# $Id: ddl.pl,v 1.5 2000/12/09 17:55:20 rvsutherland Exp $
+# $Id: Ddl.pl,v 1.6 2001/01/06 16:21:15 rvsutherland Exp $
 
 use strict;
 
@@ -68,17 +68,12 @@ elsif ( $action eq "create" ){
 elsif ( $action eq "resize" ){
     $sql = $obj->resize;
 }
+elsif ( $action eq "compile" ){
+    $sql = $obj->compile;
+}
 else{
     die "\nDon't know how to '$action'.\n";
 } ;
 
 print $sql;
-
-# $Log: Ddl.pl,v $
-# Revision 1.5  2000/12/09 17:55:20  rvsutherland
-# Re-added after CVS bug fixed.
-#
-# Revision 1.3  2000/11/11 07:48:59  rvsutherland
-# Added CVS tags
-#
 

@@ -1,11 +1,10 @@
 #! /usr/bin/perl -w
 
-# $Id: defrag.pl,v 1.13 2001/01/01 12:59:52 rvsutherland Exp $
+# $Id: defrag.pl,v 1.15 2001/01/01 22:43:21 rvsutherland Exp $
 #
 # Copyright (c) 2000 Richard Sutherland - United States of America
 #
 # See COPYRIGHT section in pod text below for usage and distribution rights.
-#
 
 use Cwd;
 use DBI;
@@ -558,7 +557,7 @@ $create_ndx_ddl .= group_header( 10 )    unless $header10++;
 
 $create_ndx_ddl .= $obj->create    if @$aref;
 
-foreach $row( @$aref )
+foreach $row ( @$aref )
 {
   my ( $owner, $index, $table, $analyzed ) = @$row;
 
@@ -850,90 +849,26 @@ eval { system ("mknod $pipefile p") };
 if ( $create_temp_ddl )
 {
   $prttn_exp_par   = "$expdir/$prefix${tblsp}_prttn_exp.par";
-  $prttn_exp_text  = "log          = $prttn_exp_log\n" .
-                     "file         = $pipefile\n" .
-                     "rows         = y\n" .
-                     "grants       = y\n";
-
-  # My linux Oracle 8.1.6 has a bug, so
-  $prttn_exp_text .= "direct       = y\n"    unless $OSNAME eq 'linux';
-
-  $prttn_exp_text .= "buffer       = 65535\n" .
-                     "indexes      = n\n" .
-                     "compress     = n\n" .
-                     "triggers     = y\n" .
-                     "statistics   = none\n" .
-                     "constraints  = n\n" .
-                     "recordlength = 65535\n" .
-                     "tables       = (\n" .
-                     "                   " .
-                     join ( "\n                 , ", @export_temps ) .
-                     "\n               )\n\n";
-
+  $prttn_exp_text  = export_par_text( $prttn_exp_log, \@export_temps);
   print "Partition Export parfile: $prttn_exp_par\n";
   print "Partition Export logfile: $prttn_exp_log\n";
   write_file( $prttn_exp_par, $prttn_exp_text, '#' );
 
   $prttn_imp_par  = "$expdir/$prefix${tblsp}_prttn_imp.par";
-  $prttn_imp_text = "log          = $prttn_imp_log\n" .
-                    "file         = $pipefile\n" .
-                    "rows         = y\n" .
-                    "commit       = y\n" .
-                    "ignore       = y\n" .
-                    "buffer       = 65535\n" .
-                    "analyze      = n\n" .
-                    "recordlength = 65535\n" .
-                    "full         = y\n\n" .
-                    "#tables       = (\n" .
-                    "#                   " .
-                    join ( "\n#                 , ", @export_temps ) .
-                    "\n#               )\n\n";
-
+  $prttn_imp_text = import_par_text( $prttn_imp_log, \@export_temps );
   print "Partition Import parfile: $prttn_imp_par\n";
   print "Partition Import logfile: $prttn_imp_log\n\n";
   write_file( $prttn_imp_par, $prttn_imp_text, '#' );
 }
 
 my $exp_par   = "$expdir/$prefix${tblsp}_exp.par";
-my $exp_text  = "log          = $exp_log\n" .
-                "file         = $pipefile\n" .
-                "rows         = y\n" .
-                "grants       = y\n";
-
-  # My linux Oracle 8.1.6 has a bug, so
-   $exp_text .= "direct       = y\n"    unless $OSNAME eq 'linux';
-
-   $exp_text .= "buffer       = 65535\n" .
-                "indexes      = n\n" .
-                "compress     = n\n" .
-                "triggers     = y\n" .
-                "statistics   = none\n" .
-                "constraints  = n\n" .
-                "recordlength = 65535\n" .
-                "tables       = (\n" .
-                "                   " .
-                join ( "\n                 , ", @export_objects ) .
-                "\n               )\n\n";
-
+my $exp_text  = export_par_text( $exp_log, \@export_objects );
 print "Table Export parfile    : $exp_par\n";
 print "Table Export logfile    : $exp_log\n";
 write_file( $exp_par, $exp_text, '#' );
 
 my $imp_par  = "$expdir/$prefix${tblsp}_imp.par";
-my $imp_text = "log          = $imp_log\n" .
-               "file         = $pipefile\n" .
-               "rows         = y\n" .
-               "commit       = y\n" .
-               "ignore       = y\n" .
-               "buffer       = 65535\n" .
-               "analyze      = n\n" .
-               "recordlength = 65535\n" .
-               "full         = y\n\n" .
-               "#tables       = (\n" .
-               "#                   " .
-               join ( "\n#                 , ", @export_objects ) .
-               "\n#               )\n\n";
-
+my $imp_text = import_par_text( $imp_log, \@export_objects );
 print "Table Import parfile    : $imp_par\n";
 print "Table Import logfile    : $imp_log\n\n";
 write_file( $imp_par, $imp_text, '#' );
@@ -958,7 +893,8 @@ if ( $create_temp_ddl )
     "# Step $i -- Export the partitions in Tablespace $tblsp\n\n" .
     "nohup cat $pipefile | gzip -c \\\n" .
     "        > $gzip &\n\n" .
-    "exp / parfile = $prttn_exp_par\n\n";
+    "exp / parfile = $prttn_exp_par\n" .
+    check_exp_log( $script, $prttn_exp_log );
   create_shell( $script, $text );
 
   $script = $shell . ++$i;
@@ -969,7 +905,8 @@ if ( $create_temp_ddl )
     "sqlplus -s / << EOF\n\n" .
     "   SPOOL $add_temp_log\n\n" .
     "   @ $add_temp_sql\n\n" .
-    "EOF\n\n";
+    "EOF\n" .
+    check_sql_log( $script, $add_temp_log );
   create_shell( $script, $text );
 }
 
@@ -978,7 +915,8 @@ $text =
   "# Step $i -- Export the tables in Tablespace $tblsp\n\n" .
   "nohup cat $pipefile | gzip -c \\\n" .
   "        > $gzip &\n\n" .
-  "exp / parfile = $exp_par\n\n";
+  "exp / parfile = $exp_par\n" .
+  check_exp_log( $script, $exp_log );
 create_shell( $script, $text );
 
 $script = $shell . ++$i;
@@ -988,7 +926,8 @@ $text =
   "sqlplus -s / << EOF\n\n" .
   "   SPOOL $drop_all_log\n\n" .
   "   @ $drop_all_sql\n\n" .
-  "EOF\n\n";
+  "EOF\n" .
+  check_sql_log( $script, $drop_all_log );
 create_shell( $script, $text );
 
 $script = $shell . ++$i;
@@ -998,7 +937,8 @@ $text =
   "sqlplus -s / << EOF\n\n" .
   "   SPOOL $add_tbl_log\n\n" .
   "   @ $add_tbl_sql\n\n" .
-  "EOF\n\n";
+  "EOF\n" .
+  check_sql_log( $script, $add_tbl_log );
 create_shell( $script, $text );
 
 $script = $shell . ++$i;
@@ -1006,7 +946,8 @@ $text =
   "# Step $i -- Import the tables back into Tablespace $tblsp\n\n" .
   "nohup gunzip -c $gzip \\\n" .
   "              > $pipefile &\n\n" .
-  "imp / parfile = $imp_par\n\n";
+  "imp / parfile = $imp_par\n" .
+  check_imp_log( $script, $imp_log );
 create_shell( $script, $text );
 
 $script = $shell . ++$i;
@@ -1017,8 +958,41 @@ $text =
   "sqlplus -s / << EOF\n\n" .
   "   SPOOL $add_ndx_log\n\n" .
   "   @ $add_ndx_sql\n\n" .
-  "EOF\n\n";
+  "EOF\n" .
+  check_sql_log( $script, $add_ndx_log );
 create_shell( $script, $text );
+
+$text = "echo $shell is being executed by $user\n" .
+        "echo on \` date \`\n\n";
+
+foreach my $j ( 1 .. $i )
+{
+  $text .= "$shell$j\n\n" .
+           "RC=\$?\n\n" .
+           "if [ \${RC} -gt 0 ]\n" .
+           "then\n\n" .
+           "   echo\n" .
+           "   echo\n" .
+           "   echo '*** ERROR'\n" .
+           "   echo $shell$j failed\n" .
+           "   echo on \` date \`\n" .
+           "   echo\n" .
+           "   exit \${RC}\n\n" .
+           "fi\n\n";
+}
+
+$text .= "echo And so did $shell\n" .
+         "echo\n" .
+         "echo YAHOO!!\n" .
+         "echo\n" .
+         "exit 0\n\n";
+
+print "\nAnd if you want a driver script for all of the above, it is:\n\n",
+      "   $shell\n\n\n";
+open SHELL, ">$shell"     or die "Can't open $shell: $!\n";
+write_header( \*SHELL, $shell, '# ' );
+print SHELL $text . "#  --- END OF FILE ---\n\n";
+close SHELL                  or die "Can't close $shell: $!\n";
 
 if ( $create_temp_ddl )
 {
@@ -1036,7 +1010,8 @@ if ( $create_temp_ddl )
     "sqlplus -s / << EOF\n\n" .
     "   SPOOL $drop_temp_log\n\n" .
     "   @ $drop_temp_sql\n\n" .
-    "EOF\n\n";
+    "EOF\n" .
+    check_sql_log( $script, $drop_temp_log );
   create_shell( $script, $text );
 
   $script = $shell . ++$i;
@@ -1052,16 +1027,17 @@ if ( $create_temp_ddl )
     "echo need be re-imported.\n" .
     "echo The error to be ignored is:\n" .
     "echo\n" .
-    "echo \"   IMP-00057: Warning: Dump file may not contain data of all partitions...\"\n" .
+    "echo \"  IMP-00057: Warning: Dump file may not contain data of all partitions...\"\n" .
     "echo\n" .
     "echo \"************ END OF NOTICE ************\"\n\n" .
     "nohup gunzip -c $gzip \\\n" .
     "              > $pipefile &\n\n" .
-    "imp / parfile = $prttn_imp_par\n\n";
+    "imp / parfile = $prttn_imp_par\n" .
+    check_imp_log( $script, $prttn_imp_log );
   create_shell( $script, $text );
 }
 
-my @shells = glob( "$sqldir/$prefix$tblsp.sh?" );
+my @shells = glob( "$sqldir/$prefix$tblsp.sh*" );
 chmod( 0754, @shells ) == @shells or die "\nCan't chmod some shells: $!\n";
 
 print "\n$0 completed successfully\non ", scalar localtime,"\n\n";
@@ -1069,6 +1045,102 @@ print "\n$0 completed successfully\non ", scalar localtime,"\n\n";
 exit 0;
 
 #################### Subroutines (alphabetically) ######################
+
+# sub check
+#
+# returns text for a shell script to check its SQL spool file for errors
+#
+sub check
+{
+  my ($shell, $log ) = @_;
+
+  return
+"then
+
+   echo
+   echo '*** ERRORS during'
+   echo $shell
+   echo
+   echo CHECK LOG $log
+   echo
+   exit 1
+
+else
+
+   echo
+   echo $shell
+   echo Completed successfully without errors.
+   echo on \` date \`
+   echo
+
+fi
+
+";
+
+}
+
+# sub check_exp_log
+#
+# returns text for a shell script to check its exp log file for errors
+#
+sub check_exp_log
+{
+  my ( $shell, $log ) = @_;
+
+  return
+"
+cat $log 
+
+EXP=\` grep -c ^EXP- $log \`
+ORA=\` grep -c ^ORA- $log \`
+
+if [ \${ORA} -gt 0 -o \${EXP} -gt 0 ]
+" . 
+check( @_ );
+}
+
+# sub check_imp_log
+#
+# returns text for a shell script to check its imp log file for errors
+#
+sub check_imp_log
+{
+  my ( $shell, $log ) = @_;
+
+  # Check log for errors, but ignore:
+  #   IMP-00057 -- Not all partitions imported (we didn't export them all)
+  #   IMP-00041 -- Store PL/SQL compilation errors (not our fault)
+  return
+"
+cat $log 
+
+IMP=\` grep -v ^IMP-00057 $log | \\
+      grep -v ^IMP-00041 | \\
+      grep -c ^IMP- \`
+ORA=\` grep -c ^ORA- $log \`
+
+if [ \${ORA} -gt 0 -o \${IMP} -gt 0 ]
+" . 
+check( @_ );
+}
+
+# sub check_sql_log
+#
+# returns text for a shell script to check its SQL spool file for errors
+#
+sub check_sql_log
+{
+  my ( $shell, $log ) = @_;
+
+  return
+"
+ORA=\` grep -c ^ORA- $log \`
+
+if [ \${ORA} -gt 0 ]
+" . 
+check( @_ );
+
+}
 
 # sub connect_to_oracle
 #
@@ -1133,7 +1205,7 @@ sub create_shell
 #
 sub drop_perf_temps
 {
-  foreach my $table( @perf_tables )
+  foreach my $table ( @perf_tables )
   {
     $stmt =
      "
@@ -1226,6 +1298,37 @@ sub escaped_dollar_signs
   }
 
   return $str;
+}
+
+# sub export_par_text
+#
+# Returns the text for the parfile of an export
+#
+sub export_par_text
+{
+  my ( $log, $table_aref ) = @_;
+
+  my $text = "log          = $log\n" .
+             "file         = $pipefile\n" .
+             "rows         = y\n" .
+             "grants       = y\n";
+
+  # My linux Oracle 8.1.6 has a bug, so
+  $text   .= "direct       = y\n"    unless $OSNAME eq 'linux';
+
+  $text   .= "buffer       = 65535\n" .
+             "indexes      = n\n" .
+             "compress     = n\n" .
+             "triggers     = y\n" .
+             "statistics   = none\n" .
+             "constraints  = n\n" .
+             "recordlength = 65535\n" .
+             "tables       = (\n" .
+             "                   " .
+             join ( "\n                 , ", @$table_aref ) .
+             "\n               )\n\n";
+
+  return $text
 }
 
 # sub get_args
@@ -1439,6 +1542,29 @@ sub group_header
          'REM ' . '#' x 60 . "\n\n";
 }
 
+# sub import_par_text
+#
+# Returns the text for the parfile of an import
+#
+sub import_par_text
+{
+  my ( $log, $table_aref ) = @_;
+
+  return            "log          = $log\n" .
+                    "file         = $pipefile\n" .
+                    "rows         = y\n" .
+                    "commit       = y\n" .
+                    "ignore       = y\n" .
+                    "buffer       = 65535\n" .
+                    "analyze      = n\n" .
+                    "recordlength = 65535\n" .
+                    "full         = y\n\n" .
+                    "#tables       = (\n" .
+                    "#                   " .
+                    join ( "\n#                 , ", @$table_aref ) .
+                    "\n#               )\n\n";
+}
+
 # sub index_and_exchange
 #
 # Generate the DDL to:
@@ -1499,7 +1625,7 @@ sub index_and_exchange
   $sth->execute( $owner, $table, $owner, $table );
   $aref = $sth->fetchall_arrayref;
 
-  foreach $row( @$aref )
+  foreach $row ( @$aref )
   {
     my $index = @$row->[0];
 
@@ -1610,7 +1736,7 @@ sub initialize_perf_temps
   # overhead
 
   TABLE:
-    foreach my $table( @perf_tables )
+    foreach my $table ( @perf_tables )
     {
       next TABLE unless $table =~ /^DBA/;
 
@@ -2379,8 +2505,6 @@ sub write_header
 }
 
 __END__
-
-########################################################################
 
 =head1 NAME
 

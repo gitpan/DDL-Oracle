@@ -1,4 +1,4 @@
-# $Id: Oracle.pm,v 1.28 2001/01/01 13:01:12 rvsutherland Exp $ 
+# $Id: Oracle.pm,v 1.30 2001/01/06 16:24:37 rvsutherland Exp $ 
 #
 # Copyright (c) 2000 Richard Sutherland - United States of America
 #
@@ -9,7 +9,7 @@ require 5.004;
 
 BEGIN
 {
-  $DDL::Oracle::VERSION = "0.28"; # Also update version in pod text below!
+  $DDL::Oracle::VERSION = "0.30"; # Also update version in pod text below!
 }
 
 package DDL::Oracle;
@@ -33,66 +33,75 @@ my @size_arr;
 
 my %attr;
 
+my %compile = 
+(
+  'function'              => \&_compile,
+  'package'               => \&_compile_package,
+  'procedure'             => \&_compile,
+  'trigger'               => \&_compile,
+  'view'                  => \&_compile,
+);
+
 my %create = 
 (
-  constraint             => \&_create_constraint,
- 'database link'         => \&_create_db_link,
- 'exchange index'        => \&_create_exchange_index,
- 'exchange table'        => \&_create_exchange_table,
-  function               => \&_create_function,
-  index                  => \&_create_index,
- 'materialized view'     => \&_create_materialized_view,
- 'materialized view log' => \&_create_materialized_view_log,
-  package                => \&_create_package,
-  procedure              => \&_create_procedure,
-  profile                => \&_create_profile,
-  role                   => \&_create_role,
- 'rollback segment'      => \&_create_rollback_segment,
-  sequence               => \&_create_sequence,
-  snapshot               => \&_create_snapshot,
- 'snapshot log'          => \&_create_snapshot_log,
-  synonym                => \&_create_synonym,
-  table                  => \&_create_table,
- 'table family'          => \&_create_table_family,
-  tablespace             => \&_create_tablespace,
-  trigger                => \&_create_trigger,
-  type                   => \&_create_type,
-  user                   => \&_create_user,
-  view                   => \&_create_view,
+  'constraint'            => \&_create_constraint,
+  'database link'         => \&_create_db_link,
+  'exchange index'        => \&_create_exchange_index,
+  'exchange table'        => \&_create_exchange_table,
+  'function'              => \&_create_function,
+  'index'                 => \&_create_index,
+  'materialized view'     => \&_create_materialized_view,
+  'materialized view log' => \&_create_materialized_view_log,
+  'package'               => \&_create_package,
+  'procedure'             => \&_create_procedure,
+  'profile'               => \&_create_profile,
+  'role'                  => \&_create_role,
+  'rollback segment'      => \&_create_rollback_segment,
+  'sequence'              => \&_create_sequence,
+  'snapshot'              => \&_create_snapshot,
+  'snapshot log'          => \&_create_snapshot_log,
+  'synonym'               => \&_create_synonym,
+  'table'                 => \&_create_table,
+  'table family'          => \&_create_table_family,
+  'tablespace'            => \&_create_tablespace,
+  'trigger'               => \&_create_trigger,
+  'type'                  => \&_create_type,
+  'user'                  => \&_create_user,
+  'view'                  => \&_create_view,
 );
 
 my %drop = 
 (
-  constraint             => \&_drop_constraint,
- 'database link'         => \&_drop_database_link,
-  dimension              => \&_drop_schema_object,
-  directory              => \&_drop_object,
-  function               => \&_drop_schema_object,
-  index                  => \&_drop_schema_object,
-  library                => \&_drop_object,
- 'materialized view'     => \&_drop_schema_object,
- 'materialized view log' => \&_drop_materialized_view_log,
-  package                => \&_drop_schema_object,
-  procedure              => \&_drop_schema_object,
-  profile                => \&_drop_profile,
-  role                   => \&_drop_object,
- 'rollback segment'      => \&_drop_object,
-  sequence               => \&_drop_schema_object,
- 'snapshot'              => \&_drop_schema_object,
- 'snapshot log'          => \&_drop_snapshot_log,
-  synonym                => \&_drop_synonym,
-  table                  => \&_drop_table,
-  tablespace             => \&_drop_tablespace,
-  trigger                => \&_drop_schema_object,
-  type                   => \&_drop_schema_object,
-  user                   => \&_drop_user,
-  view                   => \&_drop_schema_object,
+  'constraint'            => \&_drop_constraint,
+  'database link'         => \&_drop_database_link,
+  'dimension'             => \&_drop_schema_object,
+  'directory'             => \&_drop_object,
+  'function'              => \&_drop_schema_object,
+  'index'                 => \&_drop_schema_object,
+  'library'               => \&_drop_object,
+  'materialized view'     => \&_drop_schema_object,
+  'materialized view log' => \&_drop_materialized_view_log,
+  'package'               => \&_drop_schema_object,
+  'procedure'             => \&_drop_schema_object,
+  'profile'               => \&_drop_profile,
+  'role'                  => \&_drop_object,
+  'rollback segment'      => \&_drop_object,
+  'sequence'              => \&_drop_schema_object,
+  'snapshot'              => \&_drop_schema_object,
+  'snapshot log'          => \&_drop_snapshot_log,
+  'synonym'               => \&_drop_synonym,
+  'table'                 => \&_drop_table,
+  'tablespace'            => \&_drop_tablespace,
+  'trigger'               => \&_drop_schema_object,
+  'type'                  => \&_drop_schema_object,
+  'user'                  => \&_drop_user,
+  'view'                  => \&_drop_schema_object,
 );
 
 my %resize =
 (
-  index                  => \&_resize_index,
-  table                  => \&_resize_table,
+  'index'                 => \&_resize_index,
+  'table'                 => \&_resize_table,
 );
 
 ############################# Class Methods ############################
@@ -104,13 +113,13 @@ sub configure
   # Turn warnings off
   $^W = 0;
 
-  $dbh             = $args{ dbh };
-  $attr{ dbh2 }    = $args{ dbh2 };
-  $attr{ view }    = ( "\U$args{ view  }" eq 'USER' ) ? 'USER' : 'DBA';
-  $attr{ view2 }   = ( "\U$args{ view2 }" eq 'USER' ) ? 'USER' : 'DBA';
-  $attr{ schema  } = (  exists $args{ schema  }  ) ? $args{ schema  } : 1;
-  $attr{ schema2 } = (  exists $args{ schema2 }  ) ? $args{ schema2 } : 1;
-  $attr{ resize  } = (  exists $args{ resize  }  ) ? $args{ resize  } : 1;
+  $dbh               = $args{ 'dbh'  };
+  $attr{ 'dbh2' }    = $args{ 'dbh2' };
+  $attr{ 'view' }    = ( "\U$args{ 'view'  }" eq 'USER' ) ? 'USER' : 'DBA';
+  $attr{ 'view2' }   = ( "\U$args{ 'view2' }" eq 'USER' ) ? 'USER' : 'DBA';
+  $attr{ 'schema'  } = (  exists $args{ 'schema'  }  ) ? $args{ 'schema'  } : 1;
+  $attr{ 'schema2' } = (  exists $args{ 'schema2' }  ) ? $args{ 'schema2' } : 1;
+  $attr{ 'resize'  } = (  exists $args{ 'resize'  }  ) ? $args{ 'resize'  } : 1;
 
   _set_sizing();
   _get_oracle_release();
@@ -133,6 +142,34 @@ sub new
 }
 
 ########################### Instance Methods ###########################
+
+sub compile
+{
+  my $self = shift;
+  my $type = lc( $self->{ type } );
+
+  die "\nObject type '$type' is invalid.\n\n" unless $create{ $type };
+
+  my $list  = $self->{ list };
+  my $class = ref( $self );
+  _generate_heading( $class, 'COMPILE', $type, $list );
+
+  foreach my $row ( @$list )
+  {
+    my ( $owner, $name ) = @$row;
+    my $schema = _set_schema( $owner );
+
+    $ddl .= $compile{ $type }->( 
+                                 $schema, 
+                                 $owner, 
+                                 $name, 
+                                 $attr{ view }, 
+                                 $type,
+                               ); 
+  }
+
+  return $ddl;
+}
 
 sub create
 {
@@ -201,6 +238,94 @@ sub resize
 }
 
 ############################ Private Methods ###########################
+
+# sub _compile
+#
+# Returns DDL to compile the named object in the form of:
+#
+#     ALTER <type> [schema.]<name> COMPILE [PACKAGE|BODY]
+# 
+sub _compile
+{
+  my ( $schema, $owner, $name, $view, $type ) = @_;
+
+  $type = uc( $type );
+  my $type1 = ( $type eq 'PACKAGE BODY' ) ? 'PACKAGE' : $type;
+  my $type2 = ( $type eq 'PACKAGE BODY' ) ? ' BODY'    :
+              ( $type eq 'PACKAGE'      ) ? ' PACKAGE' : undef;
+
+  my $stmt =
+      "
+       SELECT
+              'Standing tall with my boots on!'
+       FROM
+              ${view}_objects
+       WHERE
+                  object_name = UPPER( ? )
+              AND object_type = ?
+      ";
+
+  if ( $view eq 'DBA' )
+  {
+    $stmt .=
+        "
+              AND owner       = UPPER('$owner')
+        ";
+  }
+
+  $sth = $dbh->prepare( $stmt );
+  $sth->execute( $name, $type );
+  my @row = $sth->fetchrow_array;
+  die "\u\L$type \U$name \Ldoes not exist.\n\n" unless @row;
+
+  return "PROMPT " .
+         "ALTER $type1 \L$schema$name \UCOMPILE$type2  \n\n" .
+         "ALTER $type1 \L$schema$name \UCOMPILE$type2 ;\n\n";
+}
+
+# sub _compile_package
+#
+# Returns DDL to compile the named object in the form of:
+#
+#     ALTER <type> [schema.]<name> COMPILE [PACKAGE|BODY]
+# 
+sub _compile_package
+{
+  my ( $schema, $owner, $name, $view, $type ) = @_;
+
+  my $sql;
+  my $stmt =
+      "
+       SELECT
+              'Standing around with only my socks on!'
+       FROM
+              ${view}_objects
+       WHERE
+                  object_name = UPPER( ? )
+              AND object_type = ?
+      ";
+
+  if ( $view eq 'DBA' )
+  {
+    $stmt .=
+        "
+              AND owner       = UPPER('$owner')
+        ";
+  }
+
+  $sth = $dbh->prepare( $stmt );
+  $sth->execute( $name, 'PACKAGE' );
+  my @row = $sth->fetchrow_array;
+  die "Package \U$name \Ldoes not exist.\n\n" unless @row;
+
+  $sql = _compile( @_ );
+
+  $sth->execute( $name, 'PACKAGE BODY' );
+  @row  = $sth->fetchrow_array;
+  $sql .= _compile( $schema, $owner, $name, $view, 'PACKAGE BODY' )    if @row;
+
+  return $sql;
+}
 
 #sub _constraint_columns
 #
@@ -275,7 +400,7 @@ sub _create_comments
   $sth->execute( $name );
   my $aref = $sth->fetchall_arrayref;
 
-  foreach my $row( @$aref )
+  foreach my $row ( @$aref )
   {
     $sql .= "PROMPT " .
             "COMMENT ON TABLE \L$schema$name \UIS \E'@$row->[0]'  \n\n" .
@@ -306,7 +431,7 @@ sub _create_comments
   $sth->execute( $name );
   $aref = $sth->fetchall_arrayref;
 
-  foreach my $row( @$aref )
+  foreach my $row ( @$aref )
   {
     $sql .= "PROMPT " .
             "COMMENT ON COLUMN \L$schema$name.@$row->[0] " . 
@@ -330,7 +455,11 @@ sub _create_constraint
   my ( $schema, $owner, $name, $view ) = @_;
 
   my $sql;
-  my $stmt =
+  my $stmt;
+
+  if ( $oracle_major == 7 )
+  {
+     $stmt =
       "
        SELECT
               table_name
@@ -339,6 +468,34 @@ sub _create_constraint
             , r_owner
             , r_constraint_name
             , delete_rule
+            , DECODE(
+                      status
+                     ,'ENABLED','ENABLE'
+                     ,          'DISABLE'
+                    )                          as enagle
+       FROM
+              ${view}_constraints cn
+       WHERE
+                  owner           = UPPER( ? )
+              AND constraint_name = UPPER( ? )
+      ";
+  }
+  else
+  {
+     $stmt =
+      "
+       SELECT
+              table_name
+            , constraint_type
+            , search_condition
+            , r_owner
+            , r_constraint_name
+            , delete_rule
+            , DECODE(
+                      status
+                     ,'ENABLED','ENABLE'
+                     ,          'DISABLE'
+                    )                          as enagle
             , deferrable
             , deferred
        FROM
@@ -347,6 +504,7 @@ sub _create_constraint
                   owner           = UPPER( ? )
               AND constraint_name = UPPER( ? )
       ";
+  }
 
   $dbh->{ LongReadLen } = 8192;    # Allows SEARCH_CONDITION length of 8K
   $dbh->{ LongTruncOk } = 1;
@@ -362,6 +520,7 @@ sub _create_constraint
       $r_owner,
       $r_cons_name,
       $delete_rule,
+      $enable,
       $deferrable,
       $deferred,
      ) = @row;
@@ -405,12 +564,27 @@ sub _create_constraint
             _constraint_columns( $r_owner, $r_cons_name, $view );
   }
 
-  $sql .= "$deferrable\n" .
-          "INITIALLY $deferred\n" .
-          "NOVALIDATE\n" .
-          ";\n\n";
+  if ( $oracle_major < 8 )
+  {
+    $sql .= "$enable\n";
+  }
+  else
+  {
+    $sql .= "$deferrable\n" .
+            "INITIALLY $deferred\n";
 
-  return $sql;
+    if ( $enable eq 'ENABLE' )
+    {
+      $sql .= "ENABLE NOVALIDATE\n";
+    }
+    else
+    {
+      $sql .= "DISABLE\n";
+    }
+  }
+
+  return $sql .
+         ";\n\n";
 }
 
 # sub _create_db_link
@@ -648,8 +822,6 @@ sub _create_exchange_table
        FROM
               ${view}_segments
        WHERE
---                  segment_name   = UPPER( ? )
---              AND partition_name = UPPER( ? )
                   segment_name   = UPPER( '$name' )
               AND partition_name = UPPER( ? )
       ";
@@ -663,7 +835,6 @@ sub _create_exchange_table
   }
 
   $sth = $dbh->prepare( $stmt );
-#  $sth->execute( $name, $partition );
   $sth->execute( $partition );
   my @row = $sth->fetchrow_array;
   die "Partition \U$partition \Lof \ETable \U$name \Ldoes not exist,\n"
@@ -2445,7 +2616,7 @@ sub _create_mview_index
   my @lines_out;
 
   LINE:
-    foreach my $line( @lines_in )
+    foreach my $line ( @lines_in )
     {
       # Ignore everything before the INITRANS clause.
       # This includes REMs, CREATE INDEX, columns, etc.
@@ -2572,7 +2743,7 @@ sub _create_mview_log
     my $comma  = '   ';
     $sql .= "\n(\n";
 
-    foreach my $row( @$aref )
+    foreach my $row ( @$aref )
     {
       $sql .= "$comma \L$row->[0]\n";
       $comma = '  ,'
@@ -3308,7 +3479,7 @@ sub _create_table_text
        $blocks,
      ) = @row;
 
-  ( $initial, $next ) = _initial_next( $blocks ) if $attr{ resize };
+  ( $initial, $next ) = _initial_next( $blocks ) if $attr{ 'resize' };
 
   my $sql  =
           "PROMPT " .
@@ -3840,7 +4011,7 @@ sub _create_user
   $sth->execute( $name );
   my $aref = $sth->fetchall_arrayref;
 
-  foreach my $row( @$aref )
+  foreach my $row ( @$aref )
   {
     $sql .= "   QUOTA  @$row->[0]  ON \L@$row->[1]\n";
   }
@@ -4251,8 +4422,8 @@ sub _get_oracle_release
   ( $host, $instance, $oracle_release ) = $sth->fetchrow_array;
 
   $oracle_release =~ /(\d+)\.(\d+)/;
-  $oracle_major   = $1 || 8;
-  $oracle_minor   = $2 || 1;
+  $oracle_major   = $1;
+  $oracle_minor   = $2;
 }
 
 # sub _granted_privs
@@ -4293,7 +4464,7 @@ sub _granted_privs
   $sth->execute( $name );
   my $aref = $sth->fetchall_arrayref;
 
-  foreach my $row( @$aref )
+  foreach my $row ( @$aref )
   {
     $sql .= "PROMPT " .
             "GRANT \L@$row->[0] \UTO \L$name \U@$row->[1] \n\n" .
@@ -4323,7 +4494,7 @@ sub _granted_privs
   $sth->execute( $name );
   $aref = $sth->fetchall_arrayref;
 
-  foreach my $row( @$aref )
+  foreach my $row ( @$aref )
   {
     $sql .= "PROMPT " .
             "GRANT \L@$row->[0] \UTO \L$name \U@$row->[1] \n\n" .
@@ -4356,7 +4527,7 @@ sub _granted_privs
   $sth->execute( $name );
   $aref = $sth->fetchall_arrayref;
 
-  foreach my $row( @$aref )
+  foreach my $row ( @$aref )
   {
     my (
          $privilege,
@@ -4832,7 +5003,7 @@ sub _resize_index
     $sth->execute( $name );
     my ( $blocks, $initial, $next ) = $sth->fetchrow_array;
 
-    ( $initial, $next ) = _initial_next( $blocks ) if $attr{ resize };
+    ( $initial, $next ) = _initial_next( $blocks ) if $attr{ 'resize' };
 
     $sql .= "PROMPT " .
             "ALTER INDEX \L$schema$name \UREBUILD\n\n" .
@@ -4939,7 +5110,7 @@ sub _resize_index_partition
   $sth->execute( $name, $partition, $name );
   my ( $blocks, $initial, $next, $partitioning_type ) = $sth->fetchrow_array;
 
-  ( $initial, $next ) = _initial_next( $blocks ) if $attr{ resize };
+  ( $initial, $next ) = _initial_next( $blocks ) if $attr{ 'resize' };
 
   $sql .= "PROMPT " .
           "ALTER INDEX \L$schema$name \UREBUILD $seg_type \L$partition\n\n" .
@@ -5096,7 +5267,7 @@ sub _resize_table
     $sth->execute( $name );
     my ( $blocks, $initial, $next ) = $sth->fetchrow_array;
 
-    ( $initial, $next ) = _initial_next( $blocks ) if $attr{ resize };
+    ( $initial, $next ) = _initial_next( $blocks ) if $attr{ 'resize' };
 
     $sql .= "PROMPT " .
             "ALTER TABLE \L$schema$name \UMOVE\n\n" .
@@ -5206,7 +5377,7 @@ sub _resize_table_partition
   $sth->execute( $name, $partition, $name, $partition, $name );
   my ( $blocks, $initial, $next, $partitioning_type ) = $sth->fetchrow_array;
 
-  ( $initial, $next ) = _initial_next( $blocks ) if $attr{ resize };
+  ( $initial, $next ) = _initial_next( $blocks ) if $attr{ 'resize' };
 
   $sql .= "PROMPT " .
           "ALTER TABLE \L$schema$name \UMOVE $seg_type \L$partition\n\n" .
@@ -5260,7 +5431,7 @@ sub _segment_attributes
        $blocks,
      ) = @$arrayref;
 
-  ( $initial, $next ) = _initial_next( $blocks ) if $attr{ resize };
+  ( $initial, $next ) = _initial_next( $blocks ) if $attr{ 'resize' };
 
   if ( $organization eq 'HEAP' )
   {
@@ -5336,7 +5507,7 @@ sub _set_sizing
   $sth->execute;
   $block_size = $sth->fetchrow_array / 1024;
 
-  if ( $attr{ resize } == 1 )
+  if ( $attr{ 'resize' } == 1 )
   {
     # Create default array
     for my $i ( 0 .. 4 )
@@ -5348,10 +5519,10 @@ sub _set_sizing
     # Force upper limit bound
     $size_arr[$#size_arr][0] = 'UNLIMITED';
   }
-  elsif ( $attr{ resize } )
+  elsif ( $attr{ 'resize' } )
   {
     # parse user supplied string into @size_arr
-    my $remainder = $attr{ resize };
+    my $remainder = $attr{ 'resize' };
     while ( $remainder ) 
     {
       ( my ($limit,$initial,$next),$remainder ) = split /:/, $remainder, 4;
@@ -5619,7 +5790,7 @@ DDL::Oracle - a DDL generator for Oracle databases
 
 =head1 VERSION
 
-VERSION = 0.28
+VERSION = 0.30
 
 =head1 SYNOPSIS
 
@@ -5678,10 +5849,10 @@ to the provided standard or to a user defined standard.
 We originally wrote a script to defrag tablespaces, but as DBA's 
 we regularly find a need for the DDL of a single object or a list 
 of objects (such as all of the indexes for a certain table).  So 
-we are in the process of taking all of the DDL statement creation 
-logic out of defrag.pl, and putting it into the general purpose 
-DDL::Oracle module, then expanding that to include tablespaces, 
-users, roles, and all other dictionary objects.
+we took all of the DDL statement creation logic out of defrag.pl, 
+and put it into the general purpose DDL::Oracle module, then 
+expanded that to include tablespaces, users, roles, and all other 
+dictionary objects.
 
 Oracle tablespaces tend to become fragmented (now THAT's an 
 understatement).  Even when object sizing standards are adopted, 
@@ -5690,35 +5861,12 @@ you get a high degree of compliance, objects turn out to be a
 different size than originally thought/planned -- small tables 
 grow to become large (i.e., hundreds of extents), what was thought 
 would be a large table ends up having only a few rows, etc.  So 
-the main driver for DDL::Oracle is the object management needs of 
+the main driver for DDL::Oracle was the object management needs of 
 Oracle DBA's.  The "resize" method generates DDL for a list of 
 tables or indexes.  For partitioned objects, the "appropriate" 
 size of EACH partition is calculated and supplied in the generated 
 DDL.  The original defrag.pl will be rewritten to use DDL::Oracle, 
 and supplied with its distribution.
-
-Other uses.
-
-A hole in Oracle's Designer/2000 case tool is the DDL for changes 
-to a table's structure.  It produces reports of tables that change, 
-and handles adding columns if they are added to the end of the table. 
-Our data model czar has a penchant for adding columns in the MIDDLE 
-of the table (imagine that!).  This requires moving the data from the 
-old table to the new structure.  Designer/2000 supplies no assistance 
-for this situation.  DDL::Oracle will.
-
-Our user management mainly consists of creating a new user with the 
-identical privileges of an existing user, so a "copy_user.pl" wrapper 
-will supply this functionality.
-
-What if you have to create a copy of an instance for some reason -- a QA 
-database, or a new host?  Oracle's export utility can move the instance 
-objects if the new database exists, but it won't create the tablespaces 
-and their datafiles.  Our data warehouse databases have dozens of 
-tablespaces and hundreds of data files.  How do you create the DDL for 
-that?  DDL::Oracle will have this capability.
-
-DBA's, what are your suggestions?
 
 =head2 Initialization and Constructor 
 
@@ -5800,6 +5948,12 @@ partitioned, then a statement for each partition is generated.
 
 To generate DDL for a single partition of an index or table, define the 'name'
 as a colon delimited field (e.g., 'name:partition'). 
+
+compile
+
+The B<compile> method generates the DDL to compile the list of Oracle objects.
+The 'type' defined in the 'new' method is limited to 'function', 'package',
+'procedure', 'trigger' and 'view'.
 
 =head1 BUGS
 

@@ -1,6 +1,6 @@
 #! /usr/bin/perl -w
 
-# $Id: defrag.pl,v 1.16 2001/01/14 16:47:55 rvsutherland Exp $
+# $Id: defrag.pl,v 1.17 2001/01/27 16:23:25 rvsutherland Exp $
 #
 # Copyright (c) 2000, 2001 Richard Sutherland - United States of America
 #
@@ -911,12 +911,27 @@ if ( $create_temp_ddl )
 }
 
 $script = $shell . ++$i;
-$text =
-  "# Step $i -- Export the tables in Tablespace $tblsp\n\n" .
+$text = "# Step $i -- Export the tables in Tablespace $tblsp\n\n";
+if ( @export_objects )
+{
+  $text .=
   "nohup cat $pipefile | gzip -c \\\n" .
   "        > $gzip &\n\n" .
   "exp / parfile = $exp_par\n" .
   check_exp_log( $script, $exp_log );
+}
+else
+{
+  $text .=
+  "echo\n" .
+  "echo There are no Tables in tablespace $tblsp.\n" .
+  "echo Skipping Export.\n" .
+  "echo\n" .
+  "echo $shell\n" .
+  "echo completed successfully without errors.\n" .
+  "echo on \` date \`\n" .
+  "echo\n\n";
+}
 create_shell( $script, $text );
 
 $script = $shell . ++$i;
@@ -942,12 +957,27 @@ $text =
 create_shell( $script, $text );
 
 $script = $shell . ++$i;
-$text =
-  "# Step $i -- Import the tables back into Tablespace $tblsp\n\n" .
+$text = "# Step $i -- Import the tables back into Tablespace $tblsp\n\n";
+if ( @export_objects )
+{
+  $text .=
   "nohup gunzip -c $gzip \\\n" .
   "              > $pipefile &\n\n" .
   "imp / parfile = $imp_par\n" .
   check_imp_log( $script, $imp_log );
+}
+else
+{
+  $text .=
+  "echo\n" .
+  "echo There are no Tables in tablespace $tblsp.\n" .
+  "echo Skipping Import.\n" .
+  "echo\n" .
+  "echo $shell\n" .
+  "echo completed successfully without errors.\n" .
+  "echo on \` date \`\n" .
+  "echo\n\n";
+}
 create_shell( $script, $text );
 
 $script = $shell . ++$i;
@@ -1069,7 +1099,7 @@ else
 
    echo
    echo $shell
-   echo Completed successfully without errors.
+   echo completed successfully without errors.
    echo on \` date \`
    echo
 

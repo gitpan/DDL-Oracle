@@ -1,6 +1,6 @@
-# $Id: Oracle.pm,v 1.32 2001/01/14 16:44:25 rvsutherland Exp $ 
+# $Id: Oracle.pm,v 1.33 2001/01/27 16:25:48 rvsutherland Exp $ 
 #
-# Copyright (c) 2000 Richard Sutherland - United States of America
+# Copyright (c) 2000, 2001 Richard Sutherland - United States of America
 #
 # See COPYRIGHT section in pod text below for usage and distribution rights.
 #
@@ -9,7 +9,7 @@ require 5.004;
 
 BEGIN
 {
-  $DDL::Oracle::VERSION = "0.32"; # Also update version in pod text below!
+  $DDL::Oracle::VERSION = "1.00"; # Also update version in pod text below!
 }
 
 package DDL::Oracle;
@@ -1024,6 +1024,7 @@ sub _create_index
        SELECT
               LTRIM(i.degree)
             , LTRIM(i.instances)
+            , 0                             AS compressed
               -- Physical Properties
             , 'INDEX'                       AS organization
               -- Segment Attributes
@@ -1066,13 +1067,72 @@ sub _create_index
               AND s.segment_name = i.index_name
       ";
   }
-  else               # We're Oracle8 or newer
+  elsif ( $oracle_major == 8 and $oracle_minor == 0 )
   {
     $stmt =
       "
        SELECT
               LTRIM(i.degree)
             , LTRIM(i.instances)
+            , 0                             AS compressed
+              -- Physical Properties
+            , 'INDEX'                       AS organization
+              -- Segment Attributes
+            , 'N/A'                         AS cache
+            , 'N/A'                         AS pct_used
+            , i.pct_free
+            , DECODE(
+                      i.ini_trans
+                     ,0,1
+                     ,null,1
+                     ,i.ini_trans
+                    )                       AS ini_trans
+            , DECODE(
+                      i.max_trans
+                     ,0,255
+                     ,null,255
+                     ,i.max_trans
+                    )                       AS max_trans
+              -- Storage Clause
+            , i.initial_extent
+            , i.next_extent
+            , i.min_extents
+            , DECODE(
+                      i.max_extents
+                     ,2147483645,'unlimited'
+                     ,           i.max_extents
+                    )                       AS max_extents
+            , i.pct_increase
+            , NVL(i.freelists,1)
+            , NVL(i.freelist_groups,1)
+            , LOWER(i.buffer_pool)          AS buffer_pool
+            , DECODE(
+                      i.logging
+                     ,'NO','NOLOGGING'
+                     ,     'LOGGING'
+                    )                       AS logging
+            , LOWER(i.tablespace_name)      AS tablespace_name
+            , s.blocks
+       FROM
+              ${view}_indexes   i
+            , ${view}_segments  s
+       WHERE
+                  i.index_name   = UPPER( ? )
+              AND s.segment_name = i.index_name
+      ";
+  }
+  else               # We're Oracle8i or newer
+  {
+    $stmt =
+      "
+       SELECT
+              LTRIM(i.degree)
+            , LTRIM(i.instances)
+            , DECODE(
+                      i.compression
+                     ,'ENABLED',i.prefix_length
+                     ,0
+                    )                             AS compressed
               -- Physical Properties
             , 'INDEX'                       AS organization
               -- Segment Attributes
@@ -1135,6 +1195,7 @@ sub _create_index
 
   my $degree     = shift @row;
   my $instances  = shift @row;
+  my $compressed = shift @row;
 
   $sql = "PROMPT " .
          "CREATE$unique$bitmap INDEX \L$schema$name \UON \L$schema$table\n\n" .
@@ -1150,15 +1211,19 @@ sub _create_index
   {
     return _create_partitioned_index( $schema, $owner, $name, $view, $sql )
   }
+  else         # Plain ol' non-partitioned index
+  {
+    unshift @row, ( '' );        # Indent (none)
 
-  # Plain ol' non-partitioned index
+    $sql .= _segment_attributes( \@row );
 
-  unshift @row, ( '' );        # Indent (none)
+    if ( $compressed )
+    {
+      $sql .= "COMPRESS            $compressed\n";
+    }
 
-  $sql .= _segment_attributes( \@row ) .
-          ";\n\n";
-
-  return $sql;
+    return $sql .= ";\n\n";
+  }
 }
 
 # sub _create_iot
@@ -1298,6 +1363,7 @@ sub _create_partitioned_index
               i.partitioning_type
             , 'N/A'                         AS subpartitioning_type
             , i.locality
+            , 0                             AS compressed
               -- Physical Properties
             , 'INDEX'                       AS organization
               -- Segment Attributes
@@ -1400,6 +1466,11 @@ sub _create_partitioned_index
               i.partitioning_type
             , i.subpartitioning_type
             , i.locality
+            , DECODE(
+                      n.compression
+                     ,'ENABLED',n.prefix_length
+                     ,0
+                    )                             AS compressed
               -- Physical Properties
             , 'INDEX'                       AS organization
               -- Segment Attributes
@@ -1483,12 +1554,14 @@ sub _create_partitioned_index
                       )                     AS blocks
        FROM
               ${view}_part_indexes  i
+            , ${view}_indexes       n
             , ${view}_tablespaces   s
             , ${view}_part_tables   t
        WHERE
                   -- def_tablspace is sometimes NULL in PART_INDEXES,
                   -- we'll have to go over to the table for the defaults
                   i.index_name      = UPPER( ? )
+              AND n.index_name      = UPPER( ? )
               AND t.table_name      = i.table_name
               AND s.tablespace_name = t.def_tablespace_name
       ";
@@ -1499,21 +1572,28 @@ sub _create_partitioned_index
     $stmt .=
       "
               AND i.owner           = UPPER('$owner')
+              AND n.owner           = UPPER('$owner')
               AND t.owner           = UPPER('$owner')
       ";
   }
 
   $sth = $dbh->prepare( $stmt );
-  $sth->execute( $name );
+  $sth->execute( $name, $name );
   my @row = $sth->fetchrow_array;
 
   my $partitioning_type      = shift @row;
   my $subpartitioning_type   = shift @row;
   my $locality               = shift @row;
+  my $compressed             = shift @row;
 
   unshift @row, ( '' );    #indent (none)
 
   $sql .= _segment_attributes( \@row );
+
+  if ( $compressed )
+  {
+    $sql .= "COMPRESS            $compressed\n";
+  }
 
   if ( $locality eq 'GLOBAL' )
   {
@@ -4389,8 +4469,8 @@ sub _generate_heading
 {
   my ( $module, $action, $type, $list ) = @_;
 
-  $ddl =  "REM This DDL was reverse engineered\n" .
-          "REM by the Perl module $module\n" .
+  $ddl =  "REM This DDL was reverse engineered by\n" .
+          "REM Perl module $module, Version $DDL::Oracle::VERSION\n" .
           "REM\n" .
           "REM at:   $host\n" .
           "REM from: $instance, an Oracle Release $oracle_release instance\n" .
@@ -4584,20 +4664,42 @@ sub _granted_privs
 #sub _index_columns
 #
 # Returns a formatted string containing the index columns.
+# Starting with Oracle8i, columns may be DESCending.
 #
 sub _index_columns
 {
   my ( $indent, $owner, $name, $view, ) = @_;
 
-  my $stmt =
+  my $stmt;
+  if (
+          $oracle_major > 8
+       or ( $oracle_major == 8 and $oracle_minor > 0 )
+     )
+  {
+    $stmt =
       "
        SELECT
               LOWER(column_name)
+            , descend
        FROM
               ${view}_ind_columns
        WHERE
                   index_name  = UPPER( ? )
       ";
+  }
+  else
+  {
+    $stmt =
+      "
+       SELECT
+              LOWER(column_name)
+            , 'ASC'
+       FROM
+              ${view}_ind_columns
+       WHERE
+                  index_name  = UPPER( ? )
+      ";
+  }
 
   if ( $view eq 'DBA' )
   {
@@ -4621,7 +4723,59 @@ sub _index_columns
   my @cols;
   foreach my $row ( @$aref )
   {
-    push @cols, $row->[0];
+    my ( $column, $direction ) = @$row;
+
+    if ( $column =~ /^sys_nc\d+\$$/ )
+    {
+      $stmt =
+        "
+         SELECT
+                c.default\$
+         FROM
+                sys.col\$        c           -- User needs SELECT on this
+              , ${view}_indexes  i
+              , ${view}_objects  o
+         WHERE
+                    i.index_name  = UPPER( ? )
+                AND o.object_name = i.table_name
+                AND c.obj#        = o.object_id
+                AND c.name        = UPPER( ? )
+        ";
+
+      if ( $view eq 'DBA' )
+      {
+        $stmt .=
+        "
+                AND i.owner       = UPPER('$owner')
+                AND o.owner       = i.table_owner
+        ";
+      }
+
+      $dbh->{ LongReadLen } = 1024;
+      $dbh->{ LongTruncOk } = 1;
+
+      $sth = $dbh->prepare( $stmt );
+      $sth->execute( $name, $column );
+      my ( $real_column ) = $sth->fetchrow_array;
+      # Get rid of double quotes
+      $real_column =~ s|\"||g;
+
+      if ( $direction eq 'DESC' )
+      {
+        push @cols, "\L$real_column" . 
+                    '  ' . 
+                    ' ' x ( 30 - length( $real_column ) ) .
+                    "DESC";
+      }
+      else   # Must be a function-based index
+      {
+        push @cols, $real_column;
+      }
+    }
+    else
+    {
+      push @cols, $column;
+    }
   }
 
   return "${indent}(\n$indent    " .
@@ -5244,23 +5398,33 @@ sub _resize_table
                                    );
 
     # Rebuild this partition on all LOCAL indexes
-    $stmt =
+    if ( $view eq 'DBA' )
+    {
+      $stmt = 
         "
          SELECT
                 owner
               , index_name
          FROM
-                ${view}_part_indexes
+                dba_part_indexes
+         WHERE
+                    table_name = UPPER( ? )
+                AND owner      = UPPER('$owner')
+                AND locality   = 'LOCAL'
+        ";
+    }
+    else        # We're a mortal USER
+    {
+      $stmt = 
+        "
+         SELECT
+                '$owner'
+              , index_name
+         FROM
+                user_part_indexes
          WHERE
                     table_name = UPPER( ? )
                 AND locality   = 'LOCAL'
-        ";
-  
-    if ( $view eq 'DBA' )
-    {
-      $stmt .= 
-        "
-                AND owner      = UPPER('$owner')
         ";
     }
   
@@ -5397,22 +5561,31 @@ sub _resize_table
     }
 
     # Rebuild all indexes (partitioned or not)
-    $stmt =
+    if ( $view eq 'DBA' )
+    {
+      $stmt = 
         "
          SELECT
                 owner
               , index_name
          FROM
-                ${view}_indexes
+                dba_part_indexes
          WHERE
                     table_name = UPPER( ? )
-        ";
-  
-    if ( $view eq 'DBA' )
-    {
-      $stmt .= 
-        "
                 AND owner      = UPPER('$owner')
+        ";
+    }
+    else        # We're a mortal USER
+    {
+      $stmt = 
+        "
+         SELECT
+                '$owner'
+              , index_name
+         FROM
+                user_part_indexes
+         WHERE
+                    table_name = UPPER( ? )
         ";
     }
   
@@ -5434,7 +5607,6 @@ sub _resize_table
     }
   }
 
-#here
   return $sql;
 }
 
@@ -5901,7 +6073,7 @@ DDL::Oracle - a DDL generator for Oracle databases
 
 =head1 VERSION
 
-VERSION = 0.32
+VERSION = 1.00
 
 =head1 SYNOPSIS
 
@@ -6005,6 +6177,12 @@ several session level options.  These are:
                      of no interest to non-replication users is a
                      mystery to the author.
 
+                     And, in order to generate CREATE INDEX statements
+                     for indexes which have DESCending column(s) and/or
+                     include FUNCTION based column(s), you must have
+                     select privileges on SYS.COL$, wherein the real
+                     name of the column or function definition is held.
+
       schema  Defines whether and what to use as the schema for DDL
               on objects which use this syntax.  "1" means use the
               owner of the object as the schema; "0" or "" means
@@ -6089,7 +6267,7 @@ The 'type' defined in the 'new' method is limited to 'function', 'package',
 
 =head1 COPYRIGHT
 
-Copyright (c) 2000, Richard V. Sutherland.  All rights reserved.
+Copyright (c) 2000, 2001 Richard V. Sutherland.  All rights reserved.
 This module is free software.  It may be used, redistributed,
 and/or modified under the same terms as Perl itself.  See:
 

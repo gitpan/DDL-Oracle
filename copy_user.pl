@@ -1,6 +1,6 @@
 #! /usr/bin/perl -w
 
-# $Id: copy_user.pl,v 1.5 2001/01/14 16:47:55 rvsutherland Exp $
+# $Id: copy_user.pl,v 1.6 2001/01/27 16:21:44 rvsutherland Exp $
 
 use strict;
 
@@ -82,6 +82,10 @@ foreach $new_user( @users )
 }
 
 print $ddl;
+
+=head1 NAME
+
+copy_user.pl - Creates DDL to CREATE USER(s) with permissions of a named user
 
 =head1 AUTHOR
 

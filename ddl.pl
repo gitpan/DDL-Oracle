@@ -1,6 +1,6 @@
 #! /usr/bin/perl -w
 
-# $Id: ddl.pl,v 1.8 2001/01/14 16:47:55 rvsutherland Exp $
+# $Id: ddl.pl,v 1.9 2001/01/27 16:21:44 rvsutherland Exp $
 
 use strict;
 
@@ -76,6 +76,10 @@ else{
 } ;
 
 print $sql;
+
+=head1 NAME
+
+ddl.pl - Calls DDL::Oracle for the DDL of a specified object.
 
 =head1 AUTHOR
 

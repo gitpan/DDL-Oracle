@@ -1,6 +1,6 @@
 #! /usr/bin/perl -w
 
-# $Id: query.pl,v 1.2 2001/01/14 16:47:55 rvsutherland Exp $
+# $Id: query.pl,v 1.3 2001/01/27 16:21:44 rvsutherland Exp $
 
 use strict;
 
@@ -79,6 +79,10 @@ else{
 } ;
 
 print $sql;
+
+=head1 NAME
+
+query.pl - Generates DDL for a specified list of objects.
 
 =head1 DESCRIPTION
 

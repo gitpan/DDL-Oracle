@@ -1,6 +1,6 @@
 #! /usr/bin/perl -w
 
-# $Id: defrag.pl,v 1.7 2000/12/02 14:06:20 rvsutherland Exp $
+# $Id: defrag.pl,v 1.8 2000/12/06 00:43:45 rvsutherland Exp $
 #
 # Copyright (c) 2000 Richard Sutherland - United States of America
 #
@@ -170,7 +170,21 @@ initialize_queries();
 #                   d) Import the data back into the partitions.
 #
 
-$sth = $dbh->prepare( $exchange_query );
+$stmt =
+      "
+       SELECT
+              owner
+            , segment_name
+            , partition_name
+            , segment_type
+       FROM
+              THE_PARTITIONS
+       ORDER
+          BY
+              1, 2, 3
+      ";
+
+$sth = $dbh->prepare( $stmt );
 $sth->execute;
 $aref = $sth->fetchall_arrayref;
 
@@ -253,12 +267,12 @@ $stmt =
               c.owner
             , c.constraint_name
        FROM
-              dba_constraints  c
-            , dba_constraints  r
+              THE_CONSTRAINTS  c
+            , THE_CONSTRAINTS  r
        WHERE
-                  c.constraint_type      = 'R'
-              AND c.r_owner              = r.owner
-              AND c.r_constraint_name    = r.constraint_name
+                  c.constraint_type   = 'R'
+              AND c.r_owner           = r.owner
+              AND c.r_constraint_name = r.constraint_name
               AND (
                       r.owner
                     , r.table_name
@@ -268,17 +282,23 @@ $stmt =
                               , table_name
                          FROM
                               (
-                                $table_query
-                                UNION ALL
-                                $iot_query
+                                SELECT
+                                       owner
+                                     , table_name
+                                FROM
+                                       THE_TABLES
                                 UNION ALL
                                 SELECT
                                        owner
                                      , table_name
                                 FROM
-                                     (
-                                       $index_query
-                                     )
+                                       THE_IOTs
+                                UNION ALL
+                                SELECT
+                                       owner
+                                     , table_name
+                                FROM
+                                       THE_INDEXES
                               )
                        )
        ORDER
@@ -313,9 +333,17 @@ $stmt =
             , table_name
        FROM
             (
-              $table_query
+              SELECT
+                     owner
+                   , table_name
+              FROM
+                     THE_TABLES
               UNION ALL
-              $iot_query
+              SELECT
+                     owner
+                   , table_name
+              FROM
+                     THE_IOTs
             )
        ORDER
           BY
@@ -357,9 +385,9 @@ $stmt =
               owner
             , constraint_name
        FROM
-              dba_constraints
+              THE_CONSTRAINTS
        WHERE
-                  constraint_type     IN ('P','U','C')
+                  constraint_type IN ('P','U','C')
               AND (
                       owner
                     , table_name
@@ -373,14 +401,20 @@ $stmt =
                                        owner
                                      , table_name
                                 FROM
-                                     (
-                                       $index_query
-                                     )
+                                       THE_INDEXES
                                 MINUS
                                 (
-                                  $table_query
+                                  SELECT
+                                         owner
+                                       , table_name
+                                  FROM
+                                         THE_TABLES
                                   UNION ALL
-                                  $iot_query
+                                  SELECT
+                                         owner
+                                       , table_name
+                                  FROM
+                                         THE_IOTs
                                 )
                               )
                        )
@@ -417,27 +451,33 @@ $stmt =
               owner
             , index_name
        FROM 
-            (
-              $index_query
-            ) i
+              THE_INDEXES i
        WHERE
-             NOT EXISTS   (
-                            SELECT
-                                   null
-                            FROM
-                                   dba_constraints
-                            WHERE
-                                       owner           = i.owner
-                                   AND constraint_name = i.index_name
-                          )
-             AND (
-                     owner
-                   , table_name
-                 ) NOT IN (
-                            $table_query
-                            UNION ALL
-                            $iot_query
-                          )
+              NOT EXISTS   (
+                             SELECT
+                                    null
+                             FROM
+                                    THE_CONSTRAINTS
+                             WHERE
+                                        owner           = i.owner
+                                    AND constraint_name = i.index_name
+                           )
+              AND (
+                      owner
+                    , table_name
+                  ) NOT IN (
+                             SELECT
+                                    owner
+                                  , table_name
+                             FROM
+                                    THE_TABLES
+                             UNION ALL
+                             SELECT
+                                    owner
+                                  , table_name
+                             FROM
+                                    THE_IOTs
+                           )
        ORDER
           BY
               1, 2
@@ -465,9 +505,7 @@ $stmt =
               owner
             , index_name
        FROM 
-            (
-              $index_query
-            )
+              THE_INDEXES
        ORDER
           BY
               1, 2
@@ -507,15 +545,17 @@ $stmt =
                       owner
                     , table_name
                   ) IN (
-                         $table_query
+                         SELECT
+                                owner
+                              , table_name
+                         FROM
+                                THE_TABLES
                          UNION ALL
                          SELECT
                                 owner
                               , table_name
                          FROM
-                              (
-                                $index_query
-                              )
+                                THE_INDEXES
                        )
        ORDER
           BY
@@ -573,7 +613,11 @@ $stmt =
                       owner
                     , table_name
                   ) IN (
-                         $iot_query
+                         SELECT
+                                owner
+                              , table_name
+                         FROM
+                                THE_IOTs
                        )
        ORDER
           BY
@@ -621,39 +665,40 @@ $create_ndx_ddl .= group_header( 13 ) .
                    $obj->create          if @$fk_aref;
 
 #
-# Step 10 - REBUILD all UNUSABLE indexes/index [sub]partitions.  Most likely,
-#           these are non-partitioned or Global partitioned indexes on THE
+# Step 10 - REBUILD all UNUSABLE indexes/index [sub]partitions. These are
+#           the non-partitioned or Global partitioned indexes on THE
 #           PARTITIONS.
 #
 
 $stmt =
       "
-       SELECT
+       SELECT 
               owner
             , index_name
        FROM
               dba_indexes
        WHERE
-                  status = 'UNUSABLE'
-       UNION ALL
-       SELECT
-              index_owner
-            , index_name || ':' || partition_name
+              (
+                  owner
+                , table_name
+              ) IN (
+                     SELECT
+                            owner
+                          , segment_name
+                     FROM
+                            THE_PARTITIONS
+                   )
+       MINUS
+       SELECT              -- Ignore partitioned, LOCAL indexes
+              owner
+            , index_name
        FROM
-              dba_ind_partitions
+              dba_part_indexes
        WHERE
-              status = 'UNUSABLE'
-       UNION ALL
-       SELECT
-              index_owner
-            , index_name || ':' || subpartition_name
-       FROM
-              dba_ind_subpartitions
-       WHERE
-              status = 'UNUSABLE'
+              locality = 'LOCAL'
        ORDER
           BY
-              1, 2
+              1
       ";
 
 $sth = $dbh->prepare( $stmt );
@@ -715,6 +760,37 @@ foreach $row ( @$aref )
 {
   $drop_ddl .= "PROMPT ALTER TABLESPACE @$row->[0] COALESCE\n\n" .
                "ALTER TABLESPACE @$row->[0] COALESCE ;\n\n",
+}
+
+# Drop the Performance enhancing tables.
+foreach my $table ( 
+                    'DBA_SEGMENTS', 
+                    'THE_CONSTRAINTS',
+                    'THE_IOTS',
+                    'THE_INDEXES',
+                    'THE_PARTITIONS',
+                    'THE_TABLES',
+                  )
+{
+   $stmt =
+    "
+     SELECT
+            'Present, sir!'
+     FROM
+            user_tables
+     WHERE
+            table_name = ?
+    ";
+
+  $sth = $dbh->prepare( $stmt );
+  $sth->execute( $table );
+  my $cnt = $sth->fetchrow_array;
+
+  $stmt = "TRUNCATE TABLE $table";
+  $dbh->do( $stmt )                  if $cnt;
+
+  $stmt = "DROP TABLE $table";
+  $dbh->do( $stmt )                  if $cnt;
 }
 
 #
@@ -1224,28 +1300,33 @@ sub index_and_exchange
        SELECT DISTINCT
               index_name
        FROM
-              dba_segments  s
-            , dba_indexes   i
+              dba_indexes
        WHERE
-                  i.owner           = UPPER('$owner')
-              AND i.table_name      = UPPER('$table')
-              AND s.owner           = i.owner
-              AND s.segment_name    = i.index_name
-              AND s.segment_type LIKE 'INDEX%PARTITION'
-              AND NOT EXISTS (
-                               SELECT
-                                      null
-                               FROM
-                                      dba_part_indexes
-                               WHERE
-                                          owner      = i.owner
-                                      AND index_name = i.index_name
-                                      AND locality   = 'GLOBAL'
-                             )
+                  owner      = ?
+              AND table_name = ?
+       MINUS
+       SELECT                     -- Ignore GLOBAL indexes
+              index_name
+       FROM
+              dba_part_indexes
+       WHERE
+                  owner      = ?
+              AND table_name = ?
+              AND locality   = 'GLOBAL'
+       MINUS
+       SELECT                     -- Ignore non-partitioned indexes
+              segment_name
+       FROM
+              dba_segments
+       WHERE
+              segment_type   = 'INDEX'
+       ORDER
+          BY
+              1
       ";
 
   $sth = $dbh->prepare( $stmt );
-  $sth->execute;
+  $sth->execute( $owner, $table, $owner, $table );
   $aref = $sth->fetchall_arrayref;
 
   foreach $row( @$aref )
@@ -1277,15 +1358,15 @@ sub index_and_exchange
        SELECT
               constraint_name
        FROM
-              dba_constraints
+              THE_CONSTRAINTS
        WHERE
-                  owner      = UPPER('$owner')
-              AND table_name = UPPER('$table')
+                  owner           = ?
+              AND table_name      = ?
               AND constraint_type = 'P'
       ";
 
   $sth = $dbh->prepare( $stmt );
-  $sth->execute;
+  $sth->execute( $owner, $table );
   my @row = $sth->fetchrow_array;
 
   if ( @row )
@@ -1324,18 +1405,88 @@ sub index_and_exchange
 
 # sub initialize_queries
 #
-# Initializes the 3 driving queries used to
-# retrieve object names involved in the defrag.
+# Initializes the driving queries used to retrieve object names involved in
+# the defrag.  Because these are UNIONed and MINUSed, at times, store the
+# the results in in-memory temporary tables for efficiency reasons.
 #
 sub initialize_queries
 {
+  # Drop the Performance enhancing tables -- they shouldn't be here,
+  # but who knows, maybe we crashed last time (how rude!)
+  foreach my $table ( 
+                      'DBA_SEGMENTS', 
+                      'THE_CONSTRAINTS',
+                      'THE_IOTS',
+                      'THE_INDEXES',
+                      'THE_PARTITIONS',
+                      'THE_TABLES',
+                    )
+  {
+     $stmt =
+      "
+       SELECT
+              'Present, sir!'
+       FROM
+              user_tables
+       WHERE
+              table_name = ?
+      ";
+
+    $sth = $dbh->prepare( $stmt );
+    $sth->execute( $table );
+    my $cnt = $sth->fetchrow_array;
+
+    $stmt = "DROP TABLE $table";
+    $dbh->do( $stmt )                  if $cnt;
+  }
+
+  # Dictionary view DBA_SEGMENTS is queried repeatedly by us (defrag.pl) as
+  # well as by DDL::Oracle.  It's a fairly complex view taking 3 to 10 seconds
+  # for each query on a large database (e.g., 50,000 segments).  Let's get our
+  # own, more efficient copy of this data and avoid this overhead
+  $stmt =
+      "
+       CREATE GLOBAL TEMPORARY TABLE dba_segments
+       ON COMMIT PRESERVE ROWS
+       AS
+       SELECT
+              *
+       FROM
+              dba_segments
+      ";
+
+  $dbh->do( $stmt );
+
+  # This query produces a list of THE CONSTRAINTS, sans search_condition
+  # which is needed for creating Check Constraints
+  $stmt =
+      "
+       CREATE GLOBAL TEMPORARY TABLE the_constraints
+       ON COMMIT PRESERVE ROWS
+       AS
+       SELECT
+              owner
+            , constraint_name
+            , constraint_type
+            , table_name
+            , r_owner
+            , r_constraint_name
+       FROM
+              dba_constraints
+      ";
+
+  $dbh->do( $stmt );
+
   # This query produces a list of THE PARTITIONS, which are the partitions
   # in THE TABLESPACE belonging to tables which have at least one partition
   # in some other tablespace.  These will be the target of ALTER TABLE
   # EXCHANGE [SUB]PARTITION statements with "temp" tables.
   #
-  $exchange_query =
+  $stmt =
       "
+       CREATE GLOBAL TEMPORARY TABLE the_partitions
+       ON COMMIT PRESERVE ROWS
+       AS
        SELECT
               owner
             , segment_name
@@ -1357,10 +1508,9 @@ sub initialize_queries
                                   AND owner            = s.owner
                                   AND segment_name     = s.segment_name
                          )
-       ORDER
-          BY
-              1, 2, 3
       ";
+
+  $dbh->do( $stmt );
 
   # This query produces a list of THE INDEXES (and their tables) -- those
   # non-partitioned indexes which reside in THE TABLESPACE, plus indexes 
@@ -1368,8 +1518,11 @@ sub initialize_queries
   # on tables other than the tables of THE PARTITIONS but may me on THE
   # TABLES.
   #
-  $index_query =
+  $stmt =
       "
+       CREATE GLOBAL TEMPORARY TABLE the_indexes
+       ON COMMIT PRESERVE ROWS
+       AS
        SELECT
               owner
             , index_name
@@ -1421,21 +1574,21 @@ sub initialize_queries
                                owner
                              , segment_name
                         FROM
-                             (
-                               $exchange_query
-                             )
+                               THE_PARTITIONS
                       )
-       ORDER
-          BY
-              1, 2, 3
       ";
 
-  # This query produces a list of THE IOTS -- non-partition index organized
+  $dbh->do( $stmt );
+
+  # This query produces a list of THE IOTs -- non-partition index organized
   # tables which reside in THE TABLESPACE or partitioned index organized
   # tables which have at least one partition in THE TABLESPACE.
   # 
-  $iot_query =
+  $stmt =
       "
+       CREATE GLOBAL TEMPORARY TABLE the_IOTs
+       ON COMMIT PRESERVE ROWS
+       AS
        SELECT
               owner
             , table_name
@@ -1470,12 +1623,17 @@ sub initialize_queries
               AND i.table_name      = p.index_name
       ";
 
+  $dbh->do( $stmt );
+
   # This query produces a list of THE TABLES -- non-partitioned tables which
   # reside in THE TABLESPACE or partitioned tables which have at least one
   # partition in THE TABLESPACE.
   #
-  $table_query =
+  $stmt =
       "
+       CREATE GLOBAL TEMPORARY TABLE the_tables
+       ON COMMIT PRESERVE ROWS
+       AS
        SELECT
               owner
             , table_name
@@ -1529,6 +1687,8 @@ sub initialize_queries
                                       AND tablespace_name <> '$tblsp'
                              )
       ";
+
+  $dbh->do( $stmt );
 }
 
 # sub move
@@ -1869,6 +2029,15 @@ sub write_header
 }
 
 # $Log: defrag.pl,v $
+# Revision 1.8  2000/12/06 00:43:45  rvsutherland
+# Significant performance improvements.
+# No, make that MAJOR gains (i.e., orders of magnitude for large databases).
+# To wit:
+#   Replaced convoluted Dictionary views with 8i Temporary Tables
+#   Widely (but not entirely) switched to bind variables (was interpolated,
+#     causing reparsing in most cases).
+# Also fixed error on REBUILD of Global and non-partitioned indexes.
+#
 # Revision 1.7  2000/12/02 14:06:20  rvsutherland
 # Completed 'exchange' method for handling partitions,
 # including REBUILD of UNUSABLE indexes.

@@ -1,4 +1,4 @@
-# $Id: Oracle.pm,v 1.22 2000/12/02 14:08:45 rvsutherland Exp $ 
+# $Id: Oracle.pm,v 1.23 2000/12/06 00:45:30 rvsutherland Exp $ 
 #
 # Copyright (c) 2000 Richard Sutherland - United States of America
 #
@@ -9,7 +9,7 @@ require 5.004;
 
 BEGIN
 {
-  $DDL::Oracle::VERSION = "0.22"; # Also update version in pod text below!
+  $DDL::Oracle::VERSION = "0.23"; # Also update version in pod text below!
 }
 
 package DDL::Oracle;
@@ -206,15 +206,15 @@ sub _constraint_columns
        FROM
               ${view}_cons_columns
        WHERE
-                  owner            = UPPER('$owner')
-              AND constraint_name  = UPPER('$name')
+                  owner            = UPPER( ? )
+              AND constraint_name  = UPPER( ? )
        ORDER
           BY
              position
       ";
 
   $sth = $dbh->prepare( $stmt );
-  $sth->execute;
+  $sth->execute( $owner, $name );
   my $aref = $sth->fetchall_arrayref;
 
   my @cols;
@@ -248,7 +248,7 @@ sub _create_comments
        FROM
               ${view}_tab_comments
        WHERE
-                  table_name    = UPPER('$name')
+                  table_name    = UPPER( ? )
               AND comments IS NOT null
       ";
 
@@ -261,7 +261,7 @@ sub _create_comments
   }
 
   $sth = $dbh->prepare( $stmt );
-  $sth->execute;
+  $sth->execute( $name );
   my $aref = $sth->fetchall_arrayref;
 
   foreach my $row( @$aref )
@@ -279,7 +279,7 @@ sub _create_comments
        FROM
               ${view}_col_comments
        WHERE
-                  table_name    = UPPER('$name')
+                  table_name    = UPPER( ? )
               AND comments IS NOT null
       ";
 
@@ -292,7 +292,7 @@ sub _create_comments
   }
 
   $sth = $dbh->prepare( $stmt );
-  $sth->execute;
+  $sth->execute( $name );
   $aref = $sth->fetchall_arrayref;
 
   foreach my $row( @$aref )
@@ -333,15 +333,15 @@ sub _create_constraint
        FROM
               ${view}_constraints cn
        WHERE
-                  owner           = UPPER('$owner')
-              AND constraint_name = UPPER('$name')
+                  owner           = UPPER( ? )
+              AND constraint_name = UPPER( ? )
       ";
 
   $dbh->{ LongReadLen } = 8192;    # Allows SEARCH_CONDITION length of 8K
   $dbh->{ LongTruncOk } = 1;
 
   $sth = $dbh->prepare( $stmt );
-  $sth->execute;
+  $sth->execute( $owner, $name );
   my @row = $sth->fetchrow_array;
 
   my (
@@ -382,12 +382,12 @@ sub _create_constraint
          FROM
                 ${view}_constraints
          WHERE
-                    constraint_name  = UPPER('$r_cons_name')
-                AND owner            = UPPER('$r_owner')
+                    constraint_name  = UPPER( ? )
+                AND owner            = UPPER( ? )
         ";
 
     $sth = $dbh->prepare( $stmt );
-    $sth->execute;
+    $sth->execute( $r_cons_name, $r_owner );
     my ( $table_name ) = $sth->fetchrow_array;
 
     $sql .= "REFERENCES \L$schema$table_name\n" .
@@ -494,8 +494,8 @@ sub _create_exchange_index
        FROM
               ${view}_segments
        WHERE
-                  segment_name   = UPPER('$name')
-              AND partition_name = UPPER('$partition')
+                  segment_name   = UPPER( ? )
+              AND partition_name = UPPER( ? )
       ";
 
   if ( $view eq 'DBA' )
@@ -507,7 +507,7 @@ sub _create_exchange_index
   }
 
   $sth = $dbh->prepare( $stmt );
-  $sth->execute;
+  $sth->execute( $name, $partition );
   my @row = $sth->fetchrow_array;
   die "Partition \U$partition \Lof \EIndex \U$name \Ldoes not exist,\n"
     unless @row;
@@ -575,8 +575,8 @@ sub _create_exchange_index
               ${view}_indexes       i
             , ${view}_ind_${type}s  p
        WHERE
-                  p.index_name   = UPPER('$name')
-              AND p.${type}_name = UPPER('$partition')
+                  p.index_name   = UPPER( ? )
+              AND p.${type}_name = UPPER( ? )
               AND i.index_name   = p.index_name
       ";
 
@@ -590,7 +590,7 @@ sub _create_exchange_index
   }
 
   $sth = $dbh->prepare( $stmt );
-  $sth->execute;
+  $sth->execute( $name, $partition );
   @row = $sth->fetchrow_array;
 
   my $degree     = shift @row;
@@ -637,8 +637,8 @@ sub _create_exchange_table
        FROM
               ${view}_segments
        WHERE
-                  segment_name   = UPPER('$name')
-              AND partition_name = UPPER('$partition')
+                  segment_name   = UPPER( ? )
+              AND partition_name = UPPER( ? )
       ";
 
   if ( $view eq 'DBA' )
@@ -650,7 +650,7 @@ sub _create_exchange_table
   }
 
   $sth = $dbh->prepare( $stmt );
-  $sth->execute;
+  $sth->execute( $name, $partition );
   my @row = $sth->fetchrow_array;
   die "Partition \U$partition \Lof \ETable \U$name \Ldoes not exist,\n"
     unless @row;
@@ -765,14 +765,14 @@ sub _granted_privs
        FROM
               dba_role_privs
        WHERE
-              grantee = UPPER('$name')
+              grantee = UPPER( ? )
        ORDER
           BY
               granted_role
       ";
 
   $sth = $dbh->prepare( $stmt );
-  $sth->execute;
+  $sth->execute( $name );
   my $aref = $sth->fetchall_arrayref;
 
   foreach my $row( @$aref )
@@ -795,14 +795,14 @@ sub _granted_privs
        FROM
               dba_sys_privs
        WHERE
-              grantee = UPPER('$name')
+              grantee = UPPER( ? )
        ORDER
           BY
               privilege
       ";
 
   $sth = $dbh->prepare( $stmt );
-  $sth->execute;
+  $sth->execute( $name );
   $aref = $sth->fetchall_arrayref;
 
   foreach my $row( @$aref )
@@ -827,7 +827,7 @@ sub _granted_privs
        FROM
               dba_tab_privs
        WHERE
-              grantee = UPPER('$name')
+              grantee = UPPER( ? )
        ORDER
           BY
               table_name
@@ -835,7 +835,7 @@ sub _granted_privs
       ";
 
   $sth = $dbh->prepare( $stmt );
-  $sth->execute;
+  $sth->execute( $name );
   $aref = $sth->fetchall_arrayref;
 
   foreach my $row( @$aref )
@@ -907,7 +907,7 @@ sub _create_index
        FROM
               ${view}_indexes
        WHERE
-                  index_name = UPPER('$name')
+                  index_name = UPPER( ? )
       ";
 
   if ( $view eq 'DBA' )
@@ -919,7 +919,7 @@ sub _create_index
   }
 
   $sth = $dbh->prepare( $stmt );
-  $sth->execute;
+  $sth->execute( $name );
   my @row = $sth->fetchrow_array;
   die "Index \U$name \Ldoes not exist.\n\n" unless @row;
 
@@ -977,7 +977,7 @@ sub _create_index
               ${view}_indexes   i
             , ${view}_segments  s
        WHERE
-                  i.index_name   = UPPER('$name')
+                  i.index_name   = UPPER( ? )
               AND s.segment_name = i.index_name
       ";
 
@@ -991,7 +991,7 @@ sub _create_index
   }
 
   $sth = $dbh->prepare( $stmt );
-  $sth->execute;
+  $sth->execute( $name );
   @row = $sth->fetchrow_array;
 
   my $degree     = shift @row;
@@ -1044,7 +1044,7 @@ sub _create_iot
        FROM
               ${view}_all_tables
        WHERE
-                  table_name = UPPER('$name')
+                  table_name = UPPER( ? )
       ";
 
   if ( $view eq 'DBA' )
@@ -1056,7 +1056,7 @@ sub _create_iot
   }
 
   my $sth = $dbh->prepare( $stmt );
-  $sth->execute;
+  $sth->execute( $name );
   my (
        $monitoring,
        $logging,
@@ -1243,7 +1243,7 @@ sub _create_partitioned_index
        WHERE
                   -- def_tablspace is sometimes NULL in PART_INDEXES,
                   -- we'll have to go over to the table for the defaults
-                  i.index_name      = UPPER('$name')
+                  i.index_name      = UPPER( ? )
               AND t.table_name      = i.table_name
               AND s.tablespace_name = t.def_tablespace_name
       ";
@@ -1258,7 +1258,7 @@ sub _create_partitioned_index
   }
 
   $sth = $dbh->prepare( $stmt );
-  $sth->execute;
+  $sth->execute( $name );
   my @row = $sth->fetchrow_array;
 
   my $partitioning_type      = shift @row;
@@ -1405,7 +1405,7 @@ sub _create_partitioned_iot
        FROM
               ${view}_part_indexes
        WHERE
-                  table_name = UPPER('$name')
+                  table_name = UPPER( ? )
       ";
 
   if ( $view eq 'DBA' )
@@ -1417,7 +1417,7 @@ sub _create_partitioned_iot
   }
 
   my $sth = $dbh->prepare( $stmt );
-  $sth->execute;
+  $sth->execute( $name );
   my ( $index ) = $sth->fetchrow_array;
 
   $sql .= "PARTITION BY RANGE\n" .  # Only RANGE allowed on IOT's
@@ -1550,7 +1550,7 @@ sub _create_partitioned_table
        FROM
               ${view}_part_tables
        WHERE
-                  table_name = UPPER('$name')
+                  table_name = UPPER( ? )
       ";
 
   if ( $view eq 'DBA' )
@@ -1562,7 +1562,7 @@ sub _create_partitioned_table
   }
 
   my $sth = $dbh->prepare( $stmt );
-  $sth->execute;
+  $sth->execute( $name );
   my (
        $partitioning_type,
        $partition_count,
@@ -1622,7 +1622,7 @@ sub _create_partitioned_table
        FROM
               ${view}_tab_partitions
        WHERE
-                  table_name =  UPPER('$name')
+                  table_name =  UPPER( ? )
       ";
 
     if ( $view eq 'DBA' )
@@ -1644,7 +1644,7 @@ sub _create_partitioned_table
     $dbh->{ LongTruncOk } = 1;
 
     $sth = $dbh->prepare( $stmt );
-    $sth->execute;
+    $sth->execute( $name );
     my $aref = $sth->fetchall_arrayref;
 
     my $comma = '    ';
@@ -1675,7 +1675,7 @@ sub _create_partitioned_table
            FROM
                   ${view}_tab_subpartitions
            WHERE
-                      table_name     =  UPPER('$name')
+                      table_name     =  UPPER( ? )
                   AND partition_name = '$partition'
           ";
 
@@ -1695,7 +1695,7 @@ sub _create_partitioned_table
           ";
 
         $sth = $dbh->prepare( $stmt );
-        $sth->execute;
+        $sth->execute( $name );
         my $aref = $sth->fetchall_arrayref;
 
         $sql .= "        (\n            ";
@@ -1724,7 +1724,7 @@ sub _create_partitioned_table
        FROM
               ${view}_tab_partitions
        WHERE
-                  table_name =  UPPER('$name')
+                  table_name =  UPPER( ? )
       ";
 
     if ( $view eq 'DBA' )
@@ -1743,7 +1743,7 @@ sub _create_partitioned_table
       ";
 
     $sth = $dbh->prepare( $stmt );
-    $sth->execute;
+    $sth->execute( $name );
     my $aref = $sth->fetchall_arrayref;
 
     my @cols;
@@ -1790,14 +1790,14 @@ sub _create_profile
        FROM
               dba_profiles
        WHERE
-              profile = UPPER('$name')
+              profile = UPPER( ? )
        ORDER
           BY
               resource_type
             , resource_name
       ");
 
-  $sth->execute;
+  $sth->execute( $name );
   my $aref = $sth->fetchall_arrayref;
   die "\nProfile '\U$name' \Ldoes not exist.\n\n" unless @$aref;
 
@@ -1848,12 +1848,12 @@ sub _create_role
               dba_roles   r
             , sys.user\$  u
        WHERE
-                  r.role = UPPER('$name')
-              AND u.name = UPPER('$name')
+                  r.role = UPPER( ? )
+              AND u.name = UPPER( ? )
       ";
 
   $sth = $dbh->prepare( $stmt );
-  $sth->execute;
+  $sth->execute( $name, $name );
   my @row = $sth->fetchrow_array;
   die "\nRole \U$name \Ldoes not exist.\n\n" unless @row;
 
@@ -1905,11 +1905,11 @@ sub _create_rollback_segment
               dba_rollback_segs    r
             , ${view}_tablespaces  t
        WHERE
-                  r.segment_name    = UPPER('$name')
+                  r.segment_name    = UPPER( ? )
               AND t.tablespace_name = r.tablespace_name
       ");
 
-  $sth->execute;
+  $sth->execute( $name );
   my @row = $sth->fetchrow_array;
   die "\nRollback Segment '\U$name' \Ldoes not exist.\n\n" unless @row;
 
@@ -2026,7 +2026,7 @@ sub _create_sequence
        FROM
               ${view}_sequences
        WHERE
-                  sequence_name  = UPPER('$name')
+                  sequence_name  = UPPER( ? )
       ";
 
   if ( $view eq 'DBA' )
@@ -2037,7 +2037,7 @@ sub _create_sequence
         "; }
 
   $sth = $dbh->prepare( $stmt );
-  $sth->execute;
+  $sth->execute( $name );
   my @row = $sth->fetchrow_array;
   die "\nSequence \U$name \Ldoes not exist.\n\n" unless @row;
 
@@ -2083,7 +2083,7 @@ sub _create_synonym
        FROM
               ${view}_synonyms
        WHERE
-                  synonym_name = UPPER('$name')
+                  synonym_name = UPPER( ? )
       ";
 
   if ( $view eq 'DBA' )
@@ -2095,7 +2095,7 @@ sub _create_synonym
   }
 
   $sth = $dbh->prepare( $stmt );
-  $sth->execute;
+  $sth->execute( $name );
   my @row = $sth->fetchrow_array;
   die "Synonym \U$name \Ldoes not exist.\n\n" unless @row;
 
@@ -2155,7 +2155,7 @@ sub _create_table
        FROM
               ${view}_tables
        WHERE
-                  table_name = UPPER('$name')
+                  table_name = UPPER( ? )
       ";
 
   if ( $view eq 'DBA' )
@@ -2167,7 +2167,7 @@ sub _create_table
   }
 
   $sth = $dbh->prepare( $stmt );
-  $sth->execute;
+  $sth->execute( $name );
   my @row = $sth->fetchrow_array;
   die "Table \U$name \Ldoes not exist.\n\n" unless @row;
 
@@ -2291,7 +2291,7 @@ sub _create_table_family
        FROM
               ${view}_indexes
        WHERE
-                  table_name = UPPER('$name')
+                  table_name = UPPER( ? )
       ";
 
   if ( $view eq 'DBA' )
@@ -2310,7 +2310,7 @@ sub _create_table_family
       ";
 
   $sth = $dbh->prepare( $stmt );
-  $sth->execute;
+  $sth->execute( $name );
   my $aref = $sth->fetchall_arrayref;
 
   foreach my $row ( @$aref )
@@ -2328,8 +2328,8 @@ sub _create_table_family
        FROM
               ${view}_constraints cn
        WHERE
-                  owner            = UPPER('$owner')
-              AND table_name       = UPPER('$name')
+                  owner            = UPPER( ? )
+              AND table_name       = UPPER( ? )
               AND constraint_type IN('P','U','R','C')
        ORDER
           BY
@@ -2347,7 +2347,7 @@ sub _create_table_family
   $dbh->{ LongTruncOk } = 1;
 
   $sth = $dbh->prepare( $stmt );
-  $sth->execute;
+  $sth->execute( $owner, $name );
   $aref = $sth->fetchall_arrayref;
 
   foreach my $row ( @$aref )
@@ -2373,7 +2373,7 @@ sub _create_table_family
        FROM
               ${view}_triggers
        WHERE
-                  table_name = UPPER('$name')
+                  table_name = UPPER( ? )
       ";
 
   if ( $view eq 'DBA' )
@@ -2392,7 +2392,7 @@ sub _create_table_family
       ";
 
   $sth = $dbh->prepare( $stmt );
-  $sth->execute;
+  $sth->execute( $name );
   $aref = $sth->fetchall_arrayref;
 
   foreach my $row ( @$aref )
@@ -2462,7 +2462,7 @@ sub _create_table_text
          FROM
                 ${view}_constraints
          WHERE
-                    table_name      = UPPER('$name')
+                    table_name      = UPPER( ? )
                 AND constraint_type = 'P'
         ";
 
@@ -2475,7 +2475,7 @@ sub _create_table_text
     }
 
     $sth = $dbh->prepare( $stmt );
-    $sth->execute;
+    $sth->execute( $name );
     my ( $index ) = $sth->fetchrow_array;
 
     $sql .= "  , CONSTRAINT \L$index \UPRIMARY KEY\n" .
@@ -2556,11 +2556,11 @@ sub _create_tablespace
        FROM
               dba_tablespaces
        WHERE
-              tablespace_name = UPPER('$name')
+              tablespace_name = UPPER( ? )
       ";
 
   $sth = $dbh->prepare( $stmt );
-  $sth->execute;
+  $sth->execute( $name );
   my @row = $sth->fetchrow_array;
   die "Tablespace \U$name \Ldoes not exist.\n\n" unless @row;
 
@@ -2597,11 +2597,11 @@ sub _create_tablespace
        FROM
               dba_data_files
        WHERE
-              tablespace_name = UPPER('$name')
+              tablespace_name = UPPER( ? )
       ";
 
   $sth = $dbh->prepare( $stmt );
-  $sth->execute;
+  $sth->execute( $name );
   my $aref = $sth->fetchall_arrayref;
 
   my $comma = '  ';
@@ -2697,7 +2697,7 @@ sub _create_trigger
        FROM
               ${view}_triggers
        WHERE
-                  trigger_name = UPPER('$name')
+                  trigger_name = UPPER( ? )
       ";
 
   if ( $view eq 'DBA' )
@@ -2712,7 +2712,7 @@ sub _create_trigger
   $dbh->{ LongTruncOk } = 1;
 
   $sth = $dbh->prepare( $stmt );
-  $sth->execute;
+  $sth->execute( $name );
   my @row = $sth->fetchrow_array;
   die "\nTrigger \U$schema$name \Ldoes not exist.\n\n" unless @row;
 
@@ -2737,10 +2737,11 @@ sub _create_trigger
   $offset = index( $description, "\n" );
   my $object  = substr( $description, 0, $offset );
 
-  my $action = $event . $object;
+  chomp( my $action = $event . $object );
 
   # the rest must be the FOR EACH ROW, if it's there
   my $other = uc( substr( $description, $offset + 1 ) );
+  $other =~ s/\n\n+/\n\n/g;
 
   # body seems to end in a null character
   $body =~ s/\c@//g;
@@ -2748,9 +2749,9 @@ sub _create_trigger
   my $sql = "PROMPT " .
             "CREATE OR REPLACE TRIGGER \L$schema$name\n\n" .
             "CREATE OR REPLACE TRIGGER \L$schema$name\n" .
-            "$action\n" .
+            "$action" .
             "$when" .
-            "$other\n" .
+            "\n$other" .
             "$body/\n\n";
 
 }
@@ -2806,11 +2807,11 @@ sub _create_user
        FROM
               dba_users
        WHERE
-              username = UPPER('$name')
+              username = UPPER( ? )
       ";
 
   $sth = $dbh->prepare( $stmt );
-  $sth->execute;
+  $sth->execute( $name );
   my @row = $sth->fetchrow_array;
   die "\nUser \U$name \Ldoes not exist.\n\n" unless @row;
 
@@ -2842,14 +2843,14 @@ sub _create_user
        FROM
               dba_ts_quotas
        WHERE
-              username = UPPER('$name')
+              username = UPPER( ? )
        ORDER
           BY
               tablespace_name
       ";
 
   $sth = $dbh->prepare( $stmt );
-  $sth->execute;
+  $sth->execute( $name );
   my $aref = $sth->fetchall_arrayref;
 
   foreach my $row( @$aref )
@@ -2883,7 +2884,7 @@ sub _create_view
        FROM
               ${view}_views
        WHERE
-                  view_name = UPPER('$name')
+                  view_name = UPPER( ? )
       ";
 
   if ( $view eq 'DBA' )
@@ -2898,7 +2899,7 @@ sub _create_view
   $dbh->{ LongTruncOk } = 1;
 
   $sth = $dbh->prepare( $stmt );
-  $sth->execute;
+  $sth->execute( $name );
   my ( $text ) = $sth->fetchrow_array;
   die "\nView \U$name \Ldoes not exist.\n\n" unless $text;
 
@@ -2932,7 +2933,7 @@ sub _display_source
               ${view}_source
        WHERE
                   type = '$type'
-              AND name = UPPER('$name')
+              AND name = UPPER( ? )
       ";
 
   if ( $view eq 'DBA' )
@@ -2951,7 +2952,7 @@ sub _display_source
       ";
 
   $sth = $dbh->prepare( $stmt );
-  $sth->execute;
+  $sth->execute( $name );
   my $aref = $sth->fetchall_arrayref;
   die "\n\u\L$type \U$name \Ldoes not exist.\n\n" unless @$aref;
 
@@ -2995,12 +2996,12 @@ sub _drop_constraint
        FROM
               ${view}_constraints
        WHERE
-                  owner           = UPPER('$owner')
-              AND constraint_name = UPPER('$name')
+                  owner           = UPPER( ? )
+              AND constraint_name = UPPER( ? )
       ";
 
   $sth = $dbh->prepare( $stmt );
-  $sth->execute;
+  $sth->execute( $owner, $name );
   my ( $table_name ) = $sth->fetchrow_array;
 
   return "PROMPT " .
@@ -3229,7 +3230,7 @@ sub _index_columns
        FROM
               ${view}_ind_columns
        WHERE
-                  index_name  = UPPER('$name')
+                  index_name  = UPPER( ? )
       ";
 
   if ( $view eq 'DBA' )
@@ -3248,7 +3249,7 @@ sub _index_columns
       ";
 
   $sth = $dbh->prepare( $stmt );
-  $sth->execute;
+  $sth->execute( $name );
   my $aref = $sth->fetchall_arrayref;
 
   my @cols;
@@ -3307,7 +3308,7 @@ sub _key_columns
        FROM
               ${view}_${table}_key_columns
        WHERE
-                  name           = UPPER('$name')
+                  name           = UPPER( ? )
               AND object_type LIKE UPPER('$object_type%')
       ";
 
@@ -3327,7 +3328,7 @@ sub _key_columns
       ";
 
   $sth = $dbh->prepare( $stmt );
-  $sth->execute;
+  $sth->execute( $name );
   my $aref = $sth->fetchall_arrayref;
 
   my @cols;
@@ -3390,7 +3391,7 @@ sub _range_partitions
        FROM
               ${view}_ind_partitions
        WHERE
-                  index_name =  UPPER('$index')
+                  index_name =  UPPER( ? )
       ";
 
   if ( $view eq 'DBA' )
@@ -3412,7 +3413,7 @@ sub _range_partitions
   $dbh->{ LongTruncOk } = 1;
 
   $sth = $dbh->prepare( $stmt );
-  $sth->execute;
+  $sth->execute( $index );
   my $aref = $sth->fetchall_arrayref;
 
   my $comma = '    ';
@@ -3450,7 +3451,7 @@ sub _range_partitions
          FROM
                 ${view}_ind_subpartitions
          WHERE
-                    index_name     =  UPPER('$index')
+                    index_name     =  UPPER( ? )
                 AND partition_name = '$partition'
         ";
 
@@ -3470,7 +3471,7 @@ sub _range_partitions
         ";
 
       $sth = $dbh->prepare( $stmt );
-      $sth->execute;
+      $sth->execute( $index );
       my $aref = $sth->fetchall_arrayref;
 
       $sql .= "        (\n            ";
@@ -3519,16 +3520,19 @@ sub _resize_index
        FROM
               ${view}_indexes
        WHERE
-                  index_name = UPPER('$name')
+                  index_name = UPPER( ? )
       ";
 
   if ( $view eq 'DBA' )
   {
-    $stmt .= "AND owner      = UPPER('$owner')";
+    $stmt .= 
+      "
+              AND owner      = UPPER('$owner')
+      ";
   }
 
   $sth = $dbh->prepare( $stmt );
-  $sth->execute;
+  $sth->execute( $name );
   $cnt = $sth->fetchrow_array;
   die "Index \U$name \Ldoes not exist.\n\n" unless $cnt;
 
@@ -3541,8 +3545,8 @@ sub _resize_index
        FROM
               ${view}_segments
        WHERE
-                  segment_name   = UPPER('$name')
-              AND partition_name = UPPER('$partition')
+                  segment_name   = UPPER( ? )
+              AND partition_name = UPPER( ? )
       ";
     if ( $view eq 'DBA' )
     {
@@ -3553,7 +3557,7 @@ sub _resize_index
     }
 
     $sth = $dbh->prepare( $stmt );
-    $sth->execute;
+    $sth->execute( $name, $partition );
     my $type = $sth->fetchrow_array;
     die "Partition \U$partition \Lof \UI\Lndex \U$name \Ldoes not exist,\n",
         "  OR it is the parent of Hash subpartition(s)\n",
@@ -3581,7 +3585,7 @@ sub _resize_index
        FROM
               ${view}_indexes
        WHERE
-                  index_name = UPPER('$name')
+                  index_name = UPPER( ? )
       ";
 
   if ( $view eq 'DBA' )
@@ -3593,7 +3597,7 @@ sub _resize_index
   }
 
   $sth = $dbh->prepare( $stmt );
-  $sth->execute;
+  $sth->execute( $name );
   my $partitioned = $sth->fetchrow_array;
 
   if ( $partitioned eq 'NO' )
@@ -3607,7 +3611,7 @@ sub _resize_index
          FROM
                 ${view}_segments s
          WHERE
-                    s.segment_name = UPPER('$name')
+                    s.segment_name = UPPER( ? )
                 AND s.segment_type = 'INDEX'
         ";
     if ( $view eq 'DBA' )
@@ -3618,7 +3622,7 @@ sub _resize_index
         ";
     }
     $sth = $dbh->prepare( $stmt );
-    $sth->execute;
+    $sth->execute( $name );
     my ( $blocks, $initial, $next ) = $sth->fetchrow_array;
 
     ( $initial, $next ) = _initial_next( $blocks ) if $attr{ resize };
@@ -3646,7 +3650,7 @@ sub _resize_index
        FROM
               ${view}_segments
        WHERE
-                  segment_name = UPPER('$name')
+                  segment_name = UPPER( ? )
       ";
     if ( $view eq 'DBA' )
     {
@@ -3662,7 +3666,7 @@ sub _resize_index
       ";
 
     $sth = $dbh->prepare( $stmt );
-    $sth->execute;
+    $sth->execute( $name );
     my $aref = $sth->fetchall_arrayref;
 
     foreach my $row ( @$aref )
@@ -3708,8 +3712,8 @@ sub _resize_index_partition
        FROM
               ${view}_segments
        WHERE
-                  segment_name   = UPPER('$name')
-              AND partition_name = UPPER('$partition')
+                  segment_name   = UPPER( ? )
+              AND partition_name = UPPER( ? )
       ";
     if ( $view eq 'DBA' )
     {
@@ -3720,7 +3724,7 @@ sub _resize_index_partition
     }
 
   $sth = $dbh->prepare( $stmt );
-  $sth->execute;
+  $sth->execute( $name, $partition );
   my ( $blocks, $initial, $next ) = $sth->fetchrow_array;
 
   ( $initial, $next ) = _initial_next( $blocks ) if $attr{ resize };
@@ -3763,17 +3767,19 @@ sub _resize_table
        FROM
               ${view}_tables
        WHERE
-                  table_name = UPPER('$name')
+                  table_name = UPPER( ? )
       ";
 
   if ( $view eq 'DBA' )
   {
     $stmt .= 
-      "       AND owner      = UPPER('$owner')";
+      "
+              AND owner      = UPPER('$owner')
+      ";
   }
 
   $sth = $dbh->prepare( $stmt );
-  $sth->execute;
+  $sth->execute( $name );
   $cnt = $sth->fetchrow_array;
   die "Table \U$name \Ldoes not exist.\n\n" unless $cnt;
 
@@ -3786,17 +3792,19 @@ sub _resize_table
        FROM
               ${view}_segments
        WHERE
-                  segment_name   = UPPER('$name')
-              AND partition_name = UPPER('$partition')
+                  segment_name   = UPPER( ? )
+              AND partition_name = UPPER( ? )
       ";
     if ( $view eq 'DBA' )
     {
       $stmt .=
-      "       AND owner          = UPPER('$owner')";
+      "
+              AND owner          = UPPER('$owner')
+      ";
     }
 
     $sth = $dbh->prepare( $stmt );
-    $sth->execute;
+    $sth->execute( $name, $ partition );
     my $type = $sth->fetchrow_array;
     die "Partition \U$partition \Lof \UT\Lable \U$name \Ldoes not exist,\n",
         "  OR it is the parent of Hash subpartition(s)\n",
@@ -3825,16 +3833,20 @@ sub _resize_table
        FROM
               ${view}_tables
        WHERE
-                  table_name = UPPER('$name')
+                  table_name = UPPER( ? )
       ";
 
   if ( $view eq 'DBA' )
   {
-    $stmt .= "AND owner      = UPPER('$owner')";
+    $stmt .=
+      "
+              AND owner      = UPPER('$owner')
+      ";
+
   }
 
   $sth = $dbh->prepare( $stmt );
-  $sth->execute;
+  $sth->execute( $name );
   my $partitioned = $sth->fetchrow_array;
 
   if ( $partitioned eq 'NO' )
@@ -3849,7 +3861,7 @@ sub _resize_table
               ${view}_segments s
             , ${view}_tables   t
        WHERE
-                  s.segment_name = UPPER('$name')
+                  s.segment_name = UPPER( ? )
               AND s.segment_type = 'TABLE'
               AND t.table_name   = s.segment_name
       ";
@@ -3862,7 +3874,7 @@ sub _resize_table
       ";
     }
     $sth = $dbh->prepare( $stmt );
-    $sth->execute;
+    $sth->execute( $name );
     my ( $blocks, $initial, $next ) = $sth->fetchrow_array;
 
     ( $initial, $next ) = _initial_next( $blocks ) if $attr{ resize };
@@ -3890,7 +3902,7 @@ sub _resize_table
        FROM
               ${view}_segments
        WHERE
-                  segment_name = UPPER('$name')
+                  segment_name = UPPER( ? )
       ";
     if ( $view eq 'DBA' )
     {
@@ -3906,7 +3918,7 @@ sub _resize_table
       ";
 
     $sth = $dbh->prepare( $stmt );
-    $sth->execute;
+    $sth->execute( $name );
     my $aref = $sth->fetchall_arrayref;
 
     foreach my $row ( @$aref )
@@ -3953,10 +3965,10 @@ sub _resize_table_partition
               ${view}_segments      s
             , ${view}_tab_${type}s  t
        WHERE
-                  s.segment_name   = UPPER('$name')
-              AND s.partition_name = UPPER('$partition')
-              AND t.table_name     = UPPER('$name')
-              AND t.partition_name = UPPER('$partition')
+                  s.segment_name   = UPPER( ? )
+              AND s.partition_name = UPPER( ? )
+              AND t.table_name     = UPPER( ? )
+              AND t.partition_name = UPPER( ? )
       ";
     if ( $view eq 'DBA' )
     {
@@ -3968,7 +3980,7 @@ sub _resize_table_partition
     }
 
   $sth = $dbh->prepare( $stmt );
-  $sth->execute;
+  $sth->execute( $name, $partition, $name, $partition );
   my ( $blocks, $initial, $next ) = $sth->fetchrow_array;
 
   ( $initial, $next ) = _initial_next( $blocks ) if $attr{ resize };
@@ -4210,12 +4222,16 @@ sub _table_columns
        FROM
               ${view}_tab_columns
        WHERE
-                  table_name = UPPER('$name')
+                  table_name = UPPER( ? )
       ";
 
   if ( $view eq 'DBA' )
   {
-    $stmt .= "AND owner      = UPPER('$owner')";
+    $stmt .=
+      "
+              AND owner      = UPPER('$owner')
+      ";
+
   }
 
   $stmt .= 
@@ -4226,7 +4242,7 @@ sub _table_columns
       ";
 
   $sth = $dbh->prepare( $stmt );
-  $sth->execute;
+  $sth->execute( $name );
   my $aref = $sth->fetchall_arrayref;
 
   my @cols;
@@ -4243,6 +4259,10 @@ sub _table_columns
 __END__
 
 # $Log: Oracle.pm,v $
+# Revision 1.23  2000/12/06 00:45:30  rvsutherland
+# Switched to bind variables for performance enhancements.
+# Fixed spacing on CREATE TRIGGER (was inadvertantly adding a blank line).
+#
 # Revision 1.22  2000/12/02 14:08:45  rvsutherland
 # Updated VERSION to 0.22, and declared Beta stage reached.
 #
@@ -4336,7 +4356,7 @@ DDL::Oracle - a DDL generator for Oracle databases
 
 =head1 VERSION
 
-VERSION = 0.22
+VERSION = 0.23
 
 =head1 SYNOPSIS
 
@@ -4370,6 +4390,7 @@ VERSION = 0.22
                 tablespace_name = 'MY_TBLSP'    -- your mileage may vary
         "
      );
+
  $sth->execute;
  my $list = $sth->fetchall_arrayref;
 

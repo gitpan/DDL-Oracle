@@ -1,6 +1,6 @@
 #! /usr/bin/perl -w
 
-# $Id: Ddl.pl,v 1.11 2001/03/20 01:49:51 rvsutherland Exp $
+# $Id: ddl.pl,v 1.12 2001/03/31 18:27:42 rvsutherland Exp $
 
 use strict;
 
@@ -45,7 +45,11 @@ die "\nYou must specify an Owner.\n" unless $owner;
 
 print STDERR "Enter Name           : ";
 chomp( my $name = <STDIN> );
-die "\nYou must specify an object.\n" unless $name;
+die "\nYou must specify an object.\n"
+   unless (
+                $name
+             or "\U$type" eq 'COMPONENTS'
+          );
 
 print STDERR "\n";
 

@@ -1,6 +1,6 @@
 #! /usr/bin/perl -w
 
-# $Id: query.pl,v 1.3 2001/01/27 16:21:44 rvsutherland Exp $
+# $Id: query.pl,v 1.4 2001/03/31 18:28:34 rvsutherland Exp $
 
 use strict;
 
@@ -73,6 +73,9 @@ elsif ( $action eq "resize" ){
 }
 elsif ( $action eq "compile" ){
     $sql = $obj->compile;
+}
+elsif ( $action eq "show_space" ){
+    $sql = $obj->show_space;
 }
 else{
     die "\nDon't know how to '$action'.\n";

@@ -1,4 +1,4 @@
-# $Id: Oracle.pm,v 1.40 2001/03/18 14:19:13 rvsutherland Exp $ 
+# $Id: Oracle.pm,v 1.42 2001/03/31 18:25:56 rvsutherland Exp $ 
 #
 # Copyright (c) 2000, 2001 Richard Sutherland - United States of America
 #
@@ -9,7 +9,7 @@ require 5.004;
 
 BEGIN
 {
-  $DDL::Oracle::VERSION = "1.06"; # Also update version in pod text below!
+  $DDL::Oracle::VERSION = "1.07"; # Also update version in pod text below!
 }
 
 package DDL::Oracle;
@@ -43,6 +43,8 @@ my %compile =
 
 my %create = 
 (
+  'comments'              => \&_create_comments,
+  'components'            => \&_create_components,
   'constraint'            => \&_create_constraint,
   'database link'         => \&_create_db_link,
   'exchange index'        => \&_create_exchange_index,
@@ -484,6 +486,196 @@ sub _create_comments
   return $sql;
 }
 
+# sub _create_components
+#
+# Returns DDL to create ALL objects of the following object types:
+#
+#     TABLESPACE
+#     ROLLBACK SEGMENT
+#     PUBLIC DATABASE LINK (syntax doesn't permit schema; omit private links)
+#     SYNONYM
+#     PROFILE
+#     ROLE
+#     USER
+#
+sub _create_components
+{
+  my ( undef, undef, undef, $view ) = @_;
+
+  die "\nYou must use the DBA views in order to CREATE COMPONENTS\n\n"
+      unless $view eq 'DBA';
+
+  my $sql;
+  my $stmt;
+  my $aref;
+  my $row;
+
+  # Get tablespaces
+  $stmt =
+      "
+       SELECT
+              tablespace_name
+       FROM
+              dba_tablespaces
+       ORDER
+          BY
+              tablespace_name
+      ";
+
+  $sth = $dbh->prepare( $stmt );
+  $sth->execute;
+  $aref = $sth->fetchall_arrayref;
+
+  foreach $row ( @$aref )
+  {
+    $sql .= _create_tablespace( undef, undef, @$row->[0], $view );
+  }
+
+  # Get rollback segments
+  $stmt =
+      "
+       SELECT
+              segment_name
+       FROM
+              dba_rollback_segs
+       ORDER
+          BY
+              segment_name
+      ";
+
+  $sth = $dbh->prepare( $stmt );
+  $sth->execute;
+  $aref = $sth->fetchall_arrayref;
+
+  foreach $row ( @$aref )
+  {
+    $sql .= _create_rollback_segment( undef, undef, @$row->[0], $view );
+  }
+
+  # Get database links
+  $stmt =
+      "
+       SELECT
+              db_link
+       FROM
+              dba_db_links
+       WHERE
+              owner = 'PUBLIC'
+       ORDER
+          BY
+              db_link
+      ";
+
+  $sth = $dbh->prepare( $stmt );
+  $sth->execute;
+  $aref = $sth->fetchall_arrayref;
+
+  foreach $row ( @$aref )
+  {
+    $sql .= _create_db_link( 'PUBLIC ', 'PUBLIC', @$row->[0], $view );
+  }
+
+  # Get synonyms
+  $stmt =
+      "
+       SELECT
+              owner
+            , synonym_name
+       FROM
+              dba_synonyms
+       ORDER
+          BY
+              owner
+            , synonym_name
+      ";
+
+  $sth = $dbh->prepare( $stmt );
+  $sth->execute;
+  $aref = $sth->fetchall_arrayref;
+
+  foreach $row ( @$aref )
+  {
+    my ( $owner, $name ) = @$row;
+    my $schema = _set_schema( $owner );
+
+    $sql .= _create_synonym( $schema, $owner, $name, $view );
+  }
+
+  # Get profiles
+  $stmt =
+      "
+       SELECT DISTINCT
+              profile
+       FROM
+              dba_profiles
+       ORDER
+          BY
+              profile
+      ";
+
+  $sth = $dbh->prepare( $stmt );
+  $sth->execute;
+  $aref = $sth->fetchall_arrayref;
+
+  foreach $row ( @$aref )
+  {
+    $sql .= _create_profile( undef, undef, @$row->[0], $view );
+  }
+
+  # Get roles
+  $stmt =
+      "
+       SELECT
+              role
+       FROM
+              dba_roles
+       ORDER
+          BY
+              role
+      ";
+
+  $sth = $dbh->prepare( $stmt );
+  $sth->execute;
+  $aref = $sth->fetchall_arrayref;
+
+  foreach $row ( @$aref )
+  {
+    $sql .= _create_role( undef, undef, @$row->[0], $view );
+  }
+
+  # Get users
+  $stmt =
+      "
+       SELECT
+              username
+       FROM
+              dba_users
+       WHERE
+              username NOT IN (
+                                  'NEXT_USER'
+                                , 'PUBLIC'
+                                , 'SYS'
+                                , 'SYSTEM'
+                              )
+       ORDER
+          BY
+              username
+      ";
+
+  $sth = $dbh->prepare( $stmt );
+  $sth->execute;
+  $aref = $sth->fetchall_arrayref;
+
+  foreach $row ( @$aref )
+  {
+    $sql .= _create_user( undef, undef, @$row->[0], $view );
+  }
+
+  return $sql;
+}
+
+#     
+#
 # sub _create_constraint
 #
 # Returns DDL to create the named constraint in the form of:
@@ -612,7 +804,8 @@ sub _create_constraint
 
   if ( $oracle_major < 8 )
   {
-    $sql .= "$enable\n";
+    # Syntax for Oracle7 doesn't like the ENABLE clause
+    $sql .= "$enable\n"    unless $enable eq 'ENABLE';
   }
   else
   {
@@ -4165,6 +4358,9 @@ sub _create_trigger
                ( $base_type eq 'SCHEMA' ) ? $schema  . 'SCHEMA' : $base_type;
   $ref_names =~ s/ING (\w+) AS NEW (\w+)/ING \L$1 \UAS NEW \L$2/;
 
+  # When clause sometimes ends in a null
+  $when =~ s/\c@//g;
+
   # Body sometimes ends in a null
   $body =~ s/\c@//g;
 
@@ -4642,6 +4838,11 @@ sub _generate_heading
   if ( $action eq 'FREE SPACE' )
   {
     $ddl .= "REM Generating $action \Lreport";
+  }
+  elsif ( "\U$type" eq 'COMPONENTS' )
+  {
+    $ddl .= "REM Generating CREATE <component> statements\n\n";
+    return;
   }
   else
   {
@@ -6637,7 +6838,7 @@ DDL::Oracle - a DDL generator for Oracle databases
 
 =head1 VERSION
 
-VERSION = 1.06
+VERSION = 1.07
 
 =head1 SYNOPSIS
 

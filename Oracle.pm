@@ -1,0 +1,4182 @@
+# $Id: Oracle.pm,v 1.16 2000/11/05 18:50:00 rvsutherland Exp $ 
+#
+# Copyright (c) 2000 Richard Sutherland - United States of America
+#
+# See COPYRIGHT section in pod text below for usage and distribution rights.
+#
+
+require 5.004;
+
+BEGIN
+{
+  $DDL::Oracle::VERSION = "0.16"; # Also update version in pod text below!
+}
+
+package DDL::Oracle;
+
+use strict;
+
+my $block_size;
+my $dbh;
+my $dbh2;
+my $ddl;
+my $sth;
+
+my @size_arr;
+
+my %attr;
+
+my %create = 
+(
+  constraint             => \&_create_constraint,
+ 'database link'         => \&_create_db_link,
+  function               => \&_create_function,
+  index                  => \&_create_index,
+  package                => \&_create_package,
+  procedure              => \&_create_procedure,
+  profile                => \&_create_profile,
+  role                   => \&_create_role,
+ 'rollback segment'      => \&_create_rollback_segment,
+  sequence               => \&_create_sequence,
+  synonym                => \&_create_synonym,
+  table                  => \&_create_table,
+ 'table family'          => \&_create_table_family,
+  tablespace             => \&_create_tablespace,
+  trigger                => \&_create_trigger,
+  type                   => \&_create_type,
+  user                   => \&_create_user,
+  view                   => \&_create_view,
+);
+
+my %drop = 
+(
+ 'database link'         => \&_drop_database_link,
+  dimension              => \&_drop_schema_object,
+  directory              => \&_drop_object,
+  function               => \&_drop_schema_object,
+  index                  => \&_drop_schema_object,
+  library                => \&_drop_object,
+ 'materialized view'     => \&_drop_schema_object,
+# 'materialized view log' => \&_drop_log,
+  package                => \&_drop_schema_object,
+  procedure              => \&_drop_schema_object,
+  profile                => \&_drop_profile,
+  role                   => \&_drop_object,
+ 'rollback segment'      => \&_drop_object,
+  sequence               => \&_drop_schema_object,
+ 'snapshot'              => \&_drop_schema_object,
+# 'snapshot log'          => \&_drop_log,
+  synonym                => \&_drop_synonym,
+  table                  => \&_drop_table,
+  tablespace             => \&_drop_tablespace,
+  trigger                => \&_drop_schema_object,
+  type                   => \&_drop_schema_object,
+  user                   => \&_drop_user,
+  view                   => \&_drop_schema_object,
+);
+
+my %resize =
+(
+  index                  => \&_resize_index,
+  table                  => \&_resize_table,
+);
+
+########################################################################
+############################# Class Methods ############################
+
+sub configure
+{
+  my ( $class, %args ) = @_;
+
+  # Turn warnings off
+  $^W = 0;
+
+  $dbh             = $args{ dbh };
+  $attr{ dbh2 }    = $args{ dbh2 };
+  $attr{ view }    = ( "\U$args{ view  }" eq 'USER' ) ? 'USER' : 'DBA';
+  $attr{ view2 }   = ( "\U$args{ view2 }" eq 'USER' ) ? 'USER' : 'DBA';
+  $attr{ schema  } = (  exists $args{ schema  }  ) ? $args{ schema  } : 1;
+  $attr{ schema2 } = (  exists $args{ schema2 }  ) ? $args{ schema2 } : 1;
+  $attr{ sizing  } = (  exists $args{ resize  }  ) ? $args{ resize  } : 1;
+
+  _set_sizing();
+}
+
+sub new
+{
+  my ( $class, %args ) = @_;
+
+  my $self = {};
+
+  $self->{ type }  = $args{ type } || die
+                     "\nAttribute 'type' is required " .
+                     "in call to method 'new'.\n\n";;
+  $self->{ list }  = $args{ list } || die
+                     "\nAttribute 'list' is required " .
+                     "in call to method 'new'.\n\n";;
+
+  return bless $self, $class;
+}
+
+########################### Instance Methods ###########################
+
+sub create
+{
+  my $self = shift;
+  my $type = lc( $self->{ type } );
+
+  die "\nObject type '$type' is invalid.\n\n" unless $create{ $type };
+
+  my $list  = $self->{ list };
+  my $class = ref( $self );
+  _generate_heading( $class, 'CREATE', $type, $list );
+
+  foreach my $row ( @$list )
+  {
+    my ( $owner, $name ) = @$row;
+    my $schema = _set_schema( $owner );
+
+    $ddl .= $create{ $type }->( $schema, $owner, $name, $attr{ view } ); 
+  }
+
+  return $ddl;
+}
+
+sub drop
+{
+  my $self = shift;
+  my $type = lc( $self->{ type } );
+
+  die "\nObject type '$type' is invalid.\n\n" unless $drop{ $type };
+
+  my $list  = $self->{ list };
+  my $class = ref( $self );
+  _generate_heading( $class, 'DROP', $type, $list );
+
+  foreach my $row ( @{ $self->{ list } } )
+  {
+    my ( $owner, $name ) = @$row;
+    my $schema = _set_schema( $owner );
+
+    $ddl .= $drop{ $type }->( $schema, $name, $type ); 
+  }
+
+  return $ddl;
+}
+
+sub resize
+{
+  my $self = shift;
+  my $type = lc( $self->{ type } );
+
+  die "\nObject type '$type' is invalid.\n\n" unless $resize{ $type };
+
+  my $list  = $self->{ list };
+  my $class = ref( $self );
+  _generate_heading( $class, 'ALTER', $type, $list );
+
+  foreach my $row ( @{ $self->{ list } } )
+  {
+    # Turn warnings off
+    $^W = 0;
+
+    my ( $owner, $name ) = @$row;
+    $ddl .= $resize{ $type }->( $owner, $name, $type, $attr{ view } ); 
+  }
+
+  return $ddl;
+}
+
+############################ Private Methods ###########################
+
+#sub _constraint_columns
+#
+# Returns a formatted string containing the constraint columns.
+#
+sub _constraint_columns
+{
+  my ( $owner, $name, $view, ) = @_;
+
+  my $stmt =
+      "
+       SELECT
+              LOWER(column_name)
+       FROM
+              ${view}_cons_columns
+       WHERE
+                  owner            = UPPER('$owner')
+              AND constraint_name  = UPPER('$name')
+       ORDER
+          BY
+             position
+      ";
+
+  $sth = $dbh->prepare( $stmt );
+  $sth->execute;
+  my $aref = $sth->fetchall_arrayref;
+
+  my @cols;
+  foreach my $row ( @$aref )
+  {
+    push @cols, $row->[0];
+  }
+
+  return "(\n    " .
+         join ( "\n  , ", @cols ) .
+         "\n)\n";
+}
+
+# sub _create_comments
+#
+# Returns DDL to create the comments on the named table and its columns
+# in the form of:
+#
+#     COMMENT ON TABLE [schema.]<name> IS '<text>'
+#     COMMENT ON COLUMN [schema.]<name>.<column> IS '<text>'
+#
+sub _create_comments
+{
+  my ( $schema, $owner, $name, $view ) = @_;
+
+  my $sql;
+  my $stmt =
+      "
+       SELECT
+              comments
+       FROM
+              ${view}_tab_comments
+       WHERE
+                  table_name    = UPPER('$name')
+              AND comments IS NOT null
+      ";
+
+  if ( $view eq 'DBA' )
+  {
+    $stmt .=
+        "
+              AND owner         = UPPER('$owner')
+        ";
+  }
+
+  $sth = $dbh->prepare( $stmt );
+  $sth->execute;
+  my $aref = $sth->fetchall_arrayref;
+
+  foreach my $row( @$aref )
+  {
+    $sql .= "PROMPT " .
+            "COMMENT ON TABLE \L$schema$name \UIS \E'@$row->[0]'  \n\n" .
+            "COMMENT ON TABLE \L$schema$name \UIS \E'@$row->[0]' ;\n\n";
+  }
+
+  $stmt =
+      "
+       SELECT
+              column_name
+            , comments
+       FROM
+              ${view}_col_comments
+       WHERE
+                  table_name    = UPPER('$name')
+              AND comments IS NOT null
+      ";
+
+  if ( $view eq 'DBA' )
+  {
+    $stmt .=
+        "
+              AND owner         = UPPER('$owner')
+        ";
+  }
+
+  $sth = $dbh->prepare( $stmt );
+  $sth->execute;
+  $aref = $sth->fetchall_arrayref;
+
+  foreach my $row( @$aref )
+  {
+    $sql .= "PROMPT " .
+            "COMMENT ON COLUMN \L$schema$name.@$row->[0] " . 
+              "IS '@$row->[1]'  \n\n" .
+            "COMMENT ON COLUMN \L$schema$name.@$row->[0] " . 
+              "IS '@$row->[1]' ;\n\n";
+  }
+
+  return $sql;
+}
+
+# sub _create_constraint
+#
+# Returns DDL to create the constraint on the named table in the form of:
+#
+#     COMMENT ON TABLE [schema.]<name> IS '<text>'
+#     COMMENT ON COLUMN [schema.]<name>.<column> IS '<text>'
+#
+sub _create_constraint
+{
+  my ( $schema, $owner, $name, $view ) = @_;
+
+  my $sql;
+  my $stmt =
+      "
+       SELECT
+              table_name
+            , constraint_type
+            , search_condition
+            , r_owner
+            , r_constraint_name
+            , delete_rule
+            , deferrable
+            , deferred
+       FROM
+              ${view}_constraints cn
+       WHERE
+                  owner           = UPPER('$owner')
+              AND constraint_name = UPPER('$name')
+      ";
+
+  $dbh->{ LongReadLen } = 8192;    # Allows SEARCH_CONDITION length of 8K
+  $dbh->{ LongTruncOk } = 1;
+
+  $sth = $dbh->prepare( $stmt );
+  $sth->execute;
+  my @row = $sth->fetchrow_array;
+
+  my (
+      $table,
+      $cons_type,
+      $condition,
+      $r_owner,
+      $r_cons_name,
+      $delete_rule,
+      $deferrable,
+      $deferred,
+     ) = @row;
+
+  $sql  = "PROMPT " .
+          "ALTER TABLE \L$schema$table \UADD CONSTRAINT \L$name ";
+  $sql .= ( $cons_type eq 'P' ) ? "PRIMARY KEY\n\n" :
+          ( $cons_type eq 'U' ) ? "UNIQUE\n\n"      :
+          ( $cons_type eq 'R' ) ? "FOREIGN KEY\n\n" :
+                                  "CHECK\n\n"; 
+
+  $sql .= "ALTER TABLE \L$schema$table \UADD CONSTRAINT \L$name " ;
+  $sql .= ( $cons_type eq 'P' ) ? "PRIMARY KEY\n" :
+          ( $cons_type eq 'U' ) ? "UNIQUE\n"      :
+          ( $cons_type eq 'R' ) ? "FOREIGN KEY\n" :
+                                  "\nCHECK ( $condition )\n";
+
+  if ( $cons_type ne 'C' )
+  {
+    $sql .= _constraint_columns( $owner, $name, $view, );
+  }
+
+  if ( $cons_type eq 'R' )
+  {
+    $stmt =
+        "
+         SELECT
+                table_name
+         FROM
+                ${view}_constraints
+         WHERE
+                    constraint_name  = UPPER('$r_cons_name')
+                AND owner            = UPPER('$r_owner')
+        ";
+
+    $sth = $dbh->prepare( $stmt );
+    $sth->execute;
+    my ( $table_name ) = $sth->fetchrow_array;
+
+    $sql .= "REFERENCES \L$schema$table_name\n" .
+            _constraint_columns( $r_owner, $r_cons_name, $view );
+  }
+
+  $sql .= "$deferrable INITIALLY $deferred ;\n\n";
+
+  return $sql;
+}
+
+# sub _create_db_link
+#
+# Returns DDL to create the named database link in the form of:
+#
+#     CREATE [PUBLIC] DATABASE LINK <name>
+#     CONNECT TO <user> IDENTIFIED BY <password>
+#     USING '<connect string>'
+#
+sub _create_db_link
+{
+  my ( $schema, $owner, $name, $view ) = @_;
+
+  my $msg = "\nYou must use the DBA views in order to " .
+            "CREATE a PUBLIC DATABASE LINK\n\n";
+  if ( "\U$owner" eq 'PUBLIC' and $view ne 'DBA' )
+  {
+    die $msg;
+  }
+
+  my $sql;
+  my $stmt;
+
+  if ( $view eq 'DBA' )
+  {
+    $stmt =
+      "
+       SELECT
+              l.userid
+            , l.password
+            , l.host
+       FROM
+              sys.link\$  l
+            , sys.user\$  u
+       WHERE
+                  u.name    = UPPER('$owner')
+              AND l.owner\# = u.user\#
+              AND l.name LIKE UPPER('${name}%')
+      ";
+  }
+  else      # view is USER
+  {
+    $stmt =
+      "
+       SELECT
+              username
+            , password
+            , host
+       FROM
+              user_db_links
+       WHERE
+              db_link LIKE UPPER('${name}%')
+      ";
+  }
+
+  $sth = $dbh->prepare( $stmt );
+  $sth->execute;
+  my @row = $sth->fetchrow_array;
+  die "Database Link \U$name \Ldoes not exist.\n\n" unless @row;
+
+  my ( $user, $password, $host ) = @row;
+
+  my $is_public = ( "\U$owner" eq 'PUBLIC' ) ? ' PUBLIC' : '';
+
+  return "PROMPT " .
+         "CREATE$is_public DATABASE LINK \L$name\n\n" .
+         "CREATE$is_public DATABASE LINK \L$name\n" .
+         "CONNECT TO \L$user \UIDENTIFIED BY \L$password\n" .
+         "USING '$host'\n" .
+         ";\n\n";
+}
+
+# sub _create_function
+#
+# Returns DDL to create the named procedure in the form of:
+#
+#     CREATE OR REPLACE FUNCTION [schema.]<name>
+#     AS
+#     <source>
+# 
+# by calling _display_source
+#
+sub _create_function
+{
+  return _display_source( @_, 'FUNCTION' );
+}
+
+# sub _granted_privs
+#
+# Returns DDL to create GRANT statements to the named grantee 
+# in the form of:
+#
+#     [GRANT <role >            TO <name> {WITH ADMIN OPTION]]
+#     [GRANT <system privilege> TO <name> {WITH ADMIN OPTION]]
+#     [GRANT <privilege> ON <object> TO <name> {WITH GRANT OPTION]]
+#
+sub _granted_privs
+{
+  my ( $name ) = @_;
+
+  my $sql;
+
+  # Add role privileges
+  my $stmt =
+      "
+       SELECT
+              granted_role
+            , DECODE(
+                      admin_option
+                     ,'YES','WITH ADMIN OPTION'
+                     ,null
+                    )                         AS admin_option
+       FROM
+              dba_role_privs
+       WHERE
+              grantee = UPPER('$name')
+       ORDER
+          BY
+              granted_role
+      ";
+
+  $sth = $dbh->prepare( $stmt );
+  $sth->execute;
+  my $aref = $sth->fetchall_arrayref;
+
+  foreach my $row( @$aref )
+  {
+    $sql .= "PROMPT " .
+            "GRANT \L@$row->[0] \UTO \L$name \U@$row->[1] \n\n" .
+            "GRANT \L@$row->[0] \UTO \L$name \U@$row->[1];\n\n";
+  }
+
+  # Add system privileges
+  $stmt =
+      "
+       SELECT
+              privilege
+            , DECODE(
+                      admin_option
+                     ,'YES','WITH ADMIN OPTION'
+                     ,null
+                    )                         AS admin_option
+       FROM
+              dba_sys_privs
+       WHERE
+              grantee = UPPER('$name')
+       ORDER
+          BY
+              privilege
+      ";
+
+  $sth = $dbh->prepare( $stmt );
+  $sth->execute;
+  $aref = $sth->fetchall_arrayref;
+
+  foreach my $row( @$aref )
+  {
+    $sql .= "PROMPT " .
+            "GRANT \L@$row->[0] \UTO \L$name \U@$row->[1] \n\n" .
+            "GRANT \L@$row->[0] \UTO \L$name \U@$row->[1];\n\n";
+  }
+
+  # Add object privileges
+  $stmt =
+      "
+       SELECT
+              privilege
+            , owner
+            , table_name
+            , DECODE(
+                      grantable
+                     ,'YES','WITH GRANT OPTION'
+                     ,null
+                    )                         AS grantable
+       FROM
+              dba_tab_privs
+       WHERE
+              grantee = UPPER('$name')
+       ORDER
+          BY
+              table_name
+            , privilege
+      ";
+
+  $sth = $dbh->prepare( $stmt );
+  $sth->execute;
+  $aref = $sth->fetchall_arrayref;
+
+  foreach my $row( @$aref )
+  {
+    my (
+         $privilege,
+         $owner,
+         $table,
+         $grantable,,
+       ) = @$row;
+
+    my $schema = _set_schema( $owner );
+
+    $sql .= "PROMPT " .
+            "GRANT \L$privilege \UON \L$schema$table \UTO \L$name " .
+            "\U$grantable \n\n" .
+            "GRANT \L$privilege \UON \L$schema$table \UTO \L$name " .
+            "\U$grantable;\n\n";
+  }
+
+  return $sql;
+}
+
+# sub _create_index
+#
+# Returns DDL to create the named index and its partition(s) in the form of:
+#
+#     CREATE INDEX [schema.]<name> ON [schema.]<table>
+#     (
+#       <column list>
+#     )
+#     [NO]MONIOTORING
+#     PARALLEL
+#     (
+#       DEGREE     <value>
+#       INSTANCES  <value>
+#     )
+#     PCTFREE      <value>
+#     INITRANS     <value>
+#     MAXTRANS     <value>
+#     STORAGE
+#     (
+#       <storage clause>
+#     )
+#     [NO]LOGING
+#     TABLESPACE   <name>
+#     [<partitioning clause>]
+#
+sub _create_index
+{
+  my ( $schema, $owner, $name, $view ) = @_;
+
+  my $sql;
+  my $stmt =
+      "
+       SELECT
+              partitioned
+            , table_name
+            , DECODE(
+                      uniqueness
+                     ,'UNIQUE',' UNIQUE'
+                     ,null
+                    )
+            , DECODE(
+                      index_type
+                     ,'BITMAP',' BITMAP'
+                     ,null
+                    )
+       FROM
+              ${view}_indexes
+       WHERE
+                  index_name = UPPER('$name')
+      ";
+
+  if ( $view eq 'DBA' )
+  {
+    $stmt .=
+        "
+              AND owner      = UPPER('$owner')
+        ";
+  }
+
+  $sth = $dbh->prepare( $stmt );
+  $sth->execute;
+  my @row = $sth->fetchrow_array;
+  die "Index \U$name \Ldoes not exist.\n\n" unless @row;
+
+  my ( 
+       $partitioned,
+       $table,
+       $unique,
+       $bitmap 
+     ) = @row;
+
+  $stmt =
+      "
+       SELECT
+              LTRIM(i.degree)
+            , LTRIM(i.instances)
+              -- Physical Properties
+            , 'INDEX'                       AS organization
+              -- Segment Attributes
+            , 'N/A'                         AS cache
+            , 'N/A'                         AS pct_used
+            , i.pct_free
+            , DECODE(
+                      i.ini_trans
+                     ,0,1
+                     ,null,1
+                     ,i.ini_trans
+                    )                       AS ini_trans
+            , DECODE(
+                      i.max_trans
+                     ,0,255
+                     ,null,255
+                     ,i.max_trans
+                    )                       AS max_trans
+              -- Storage Clause
+            , i.initial_extent
+            , i.next_extent
+            , i.min_extents
+            , DECODE(
+                      i.max_extents
+                     ,2147483645,'unlimited'
+                     ,           i.max_extents
+                    )                       AS max_extents
+            , i.pct_increase
+            , NVL(i.freelists,1)
+            , NVL(i.freelist_groups,1)
+            , LOWER(i.buffer_pool)          AS buffer_pool
+            , DECODE(
+                      i.logging
+                     ,'NO','NOLOGGING'
+                     ,     'LOGGING'
+                    )                       AS logging
+            , LOWER(i.tablespace_name)      AS tablespace_name
+            , s.blocks
+       FROM
+              ${view}_indexes   i
+            , ${view}_segments  s
+       WHERE
+                  i.index_name   = UPPER('$name')
+              AND i.index_name   = s.segment_name
+      ";
+
+  if ( $view eq 'DBA' )
+  {
+    $stmt .=
+      "
+              AND i.owner        = UPPER('$owner')
+              AND s.owner        = i.owner
+      ";
+  }
+
+  $sth = $dbh->prepare( $stmt );
+  $sth->execute;
+  @row = $sth->fetchrow_array;
+
+  my $degree     = shift @row;
+  my $instances  = shift @row;
+
+  $sql = "PROMPT " .
+         "CREATE$unique$bitmap INDEX \L$schema$name \UON \L$schema$table\n\n" .
+         "CREATE$unique$bitmap INDEX \L$schema$name \UON \L$schema$table\n" .
+         _index_columns( '', $owner, $name, $view, ) .
+         "PARALLEL\n" .
+         "(\n" .
+         "  DEGREE            $degree\n" .
+         "  INSTANCES         $instances\n" .
+         ")\n";
+
+  if ( $partitioned eq 'YES' )
+  {
+    return _create_partitioned_index( $schema, $owner, $name, $view, $sql )
+  }
+
+  # Plain ol' non-partitioned index
+
+  unshift @row, ( '' );        # Indent (none)
+
+  $sql .= _segment_attributes( \@row ) .
+          ";\n\n";
+
+  return $sql;
+}
+
+# sub _create_iot
+#
+# Returns DDL to create the index organized table and its partition(s).
+# See _create_table for format.
+#
+sub _create_iot
+{
+  my ( $schema, $owner, $name, $view ) = @_;
+
+  my $stmt =
+      "
+       SELECT
+              DECODE(
+                      monitoring
+                     ,'NO','NOMONITORING'
+                     ,     'MONITORING'
+                    )                       AS monitoring
+            , logging
+            , blocks - NVL(empty_blocks,0)
+       FROM
+              ${view}_all_tables
+       WHERE
+                  table_name = UPPER('$name')
+      ";
+
+  if ( $view eq 'DBA' )
+  {
+    $stmt .=
+      "
+              AND owner      = UPPER('$owner')
+      ";
+  }
+
+  my $sth = $dbh->prepare( $stmt );
+  $sth->execute;
+  my (
+       $monitoring,
+       $logging,
+       $blocks,
+     ) = $sth->fetchrow_array;
+
+  $stmt =
+      "
+       SELECT
+              -- Table Properties
+              DECODE(
+                      '$monitoring'
+                     ,'NO','NOMONITORING'
+                     ,     'MONITORING'
+                    )
+            , 'N/A'                         AS table_name
+              -- Parallel Clause
+            , LTRIM(degree)
+            , LTRIM(instances)
+              -- Physical Properties
+            , 'INDEX'                       AS organization
+              -- Segment Attributes
+            , 'N/A'                         AS cache
+            , 'N/A'                         AS pct_used
+            , pct_free
+            , DECODE(
+                      ini_trans
+                     ,0,1
+                     ,null,1
+                     ,ini_trans
+                    )                       AS ini_trans
+            , DECODE(
+                      max_trans
+                     ,0,255
+                     ,null,255
+                     ,max_trans
+                    )                       AS max_trans
+              -- Storage Clause
+            , initial_extent
+            , next_extent
+            , min_extents
+            , DECODE(
+                      max_extents
+                     ,2147483645,'unlimited'
+                     ,           max_extents
+                    )                       AS max_extents
+            , pct_increase
+            , NVL(freelists,1)
+            , NVL(freelist_groups,1)
+            , LOWER(buffer_pool)          AS buffer_pool
+            , DECODE(
+                      '$logging'
+                     ,'NO','NOLOGGING'
+                     ,     'LOGGING'
+                    )                       AS logging
+            , LOWER(tablespace_name)      AS tablespace_name
+            , DECODE(
+                      '$blocks'
+                      ,null,GREATEST(initial_extent,next_extent) 
+                            / ($block_size * 1024)
+                      ,'0' ,GREATEST(initial_extent,next_extent)
+                            / ($block_size * 1024)
+                      ,'$blocks'
+                    )                       AS blocks
+       FROM
+              ${view}_indexes
+       WHERE
+                  table_name  = UPPER('$name')
+      ";
+
+  if ( $view eq 'DBA' )
+  {
+    $stmt .=
+      "
+              AND table_owner = UPPER('$owner')
+      ";
+  }
+
+  return _create_table_text( $stmt, $schema, $owner, $name, $view ) .
+         ";\n\n";
+}
+
+# sub _create_partitioned_index
+#
+# Creates the GLOBAL/LOCAL partition syntax part of a CREATE INDEX statement.
+#
+sub _create_partitioned_index
+{
+  my ( $schema, $owner, $name, $view, $sql ) = @_;
+
+  my $stmt =
+      "
+       SELECT
+              -- Indexes may partition only by RANDE or RANGE/HASH
+              i.partitioning_type
+            , i.subpartitioning_type
+            , i.locality
+              -- Physical Properties
+            , 'INDEX'                       AS organization
+              -- Segment Attributes
+            , 'N/A'                         AS cache
+            , 'N/A'                         AS pct_used
+            , i.def_pct_free
+            , DECODE(
+                      i.def_ini_trans
+                     ,0,1
+                     ,null,1
+                     ,i.def_ini_trans
+                    )                       AS ini_trans
+            , DECODE(
+                      i.def_max_trans
+                     ,0,255
+                     ,null,255
+                     ,i.def_max_trans
+                    )                       AS max_trans
+              -- Storage Clause
+            ,DECODE(
+                     i.def_initial_extent
+                    ,'DEFAULT',s.initial_extent
+                    ,i.def_initial_extent * $block_size * 1024
+                   )                        AS initial_extent
+            ,DECODE(
+                     i.def_next_extent
+                    ,'DEFAULT',s.next_extent
+                    ,i.def_next_extent * $block_size * 1024
+                   )                        AS next_extent
+            , DECODE(
+                      i.def_min_extents
+                     ,'DEFAULT',s.min_extents
+                     ,i.def_min_extents
+                    )                       AS min_extents
+            , DECODE(
+                      i.def_max_extents
+                     ,'DEFAULT',DECODE(
+                                        s.max_extents
+                                       ,2147483645,'unlimited'
+                                       ,s.max_extents
+                                      )
+                     ,2147483645,'unlimited'
+                     ,i.def_max_extents
+                    )                       AS max_extents
+            , DECODE(
+                      i.def_pct_increase
+                     ,'DEFAULT',s.pct_increase
+                     ,i.def_pct_increase
+                    )                       AS pct_increase
+            , DECODE(
+                      i.def_freelists
+                     ,0,1
+                     ,null,1
+                     ,i.def_freelists
+                    )                       AS freelists
+            , DECODE(
+                      i.def_freelist_groups
+                     ,0,1
+                     ,null,1
+                     ,i.def_freelist_groups
+                    )                       AS freelist_groups
+            , LOWER(i.def_buffer_pool)        AS buffer_pool
+            , DECODE(
+                      i.def_logging
+                     ,'NO','NOLOGGING'
+                     ,     'LOGGING'
+                    )                       AS logging
+            , LOWER(NVL(i.def_tablespace_name,s.tablespace_name))
+              -- Don't have default blocks, so use larger of initial/next
+            , GREATEST(
+                        DECODE(
+                                i.def_initial_extent
+                               ,'DEFAULT',s.initial_extent / $block_size / 1024
+                               ,i.def_initial_extent
+                              )
+                       ,DECODE(
+                                i.def_next_extent
+                               ,'DEFAULT',s.next_extent / $block_size / 1024
+                               ,i.def_next_extent
+                              )
+                      )                     AS blocks
+       FROM
+              ${view}_part_indexes  i
+            , ${view}_tablespaces   s
+            , ${view}_part_tables   t
+       WHERE
+                  -- def_tablspace is sometimes NULL in PART_INDEXES,
+                  -- we'll have to go over to the table for the defaults
+                  i.index_name      = UPPER('$name')
+              AND t.table_name      = i.table_name
+              AND s.tablespace_name = t.def_tablespace_name
+      ";
+
+  if ( $view eq 'DBA' )
+  {
+    $stmt .=
+      "
+              AND i.owner           = UPPER('$owner')
+              AND t.owner           = UPPER('$owner')
+      ";
+  }
+
+  $sth = $dbh->prepare( $stmt );
+  $sth->execute;
+  my @row = $sth->fetchrow_array;
+
+  my $partitioning_type      = shift @row;
+  my $subpartitioning_type   = shift @row;
+  my $locality               = shift @row;
+
+  unshift @row, ( '' );    #indent (none)
+
+  $sql .= _segment_attributes( \@row );
+
+  if ( $locality eq 'GLOBAL' )
+  {
+    $sql .= "GLOBAL PARTITION BY RANGE\n" . # Only RANGE on global indexes
+            "(\n    " .
+            _partition_key_columns( $owner, $name, 'INDEX', $view ) .
+            "\n)\n" .
+            _range_partitions($owner, $name, $view,
+                              $subpartitioning_type, 'GLOBAL' );
+  }
+  else     # Must be partitione by RANGE or RANGE/HASH
+  {
+    $sql .= "LOCAL\n";
+
+    if ( $partitioning_type eq 'RANGE' )
+    {
+      $sql .= _range_partitions( $owner, $name, $view,
+                                 $subpartitioning_type, 'LOCAL' );
+    }
+  }
+
+  return $sql;
+}
+
+# sub _create_partitioned_iot
+#
+# Returns DDL to create the partitioned index organized table 
+# and its partition(s).
+# See _create_table for format.
+#
+sub _create_partitioned_iot
+{
+  my ( $schema, $owner, $name, $view ) = @_;
+
+  my $stmt =
+      "
+       SELECT
+              -- Table Properties
+              DECODE(
+                      t.monitoring
+                     ,'NO','NOMONITORING'
+                     ,     'MONITORING'
+                    )                       AS monitoring
+            , t.table_name
+              -- Parallel Clause
+            , LTRIM(t.degree)               AS degree
+            , LTRIM(t.instances)            AS instances
+              -- Physical Properties
+            , 'INDEX'                       AS organization
+              -- Segment Attributes
+            , DECODE(
+                      LTRIM(t.cache)
+                     ,'Y','CACHE'
+                     ,    'NOCACHE'
+                    )                       AS cache
+            , 'N/A'                         AS pct_used
+            , p.def_pct_free                AS pct_free
+            , p.def_ini_trans               AS ini_trans
+            , p.def_max_trans               AS max_trans
+              -- Storage Clause
+            ,DECODE(
+                     p.def_initial_extent
+                    ,'DEFAULT',s.initial_extent
+                    ,p.def_initial_extent * $block_size * 1024
+                   )                        AS initial_extent
+            ,DECODE(
+                     p.def_next_extent
+                    ,'DEFAULT',s.next_extent
+                    ,p.def_next_extent * $block_size * 1024
+                   )                        AS next_extent
+            , DECODE(
+                      p.def_min_extents
+                     ,'DEFAULT',s.min_extents
+                     ,p.def_min_extents
+                    )                       AS min_extents
+            , DECODE(
+                      p.def_max_extents
+                     ,'DEFAULT',DECODE(
+                                        s.max_extents
+                                       ,2147483645,'unlimited'
+                                       ,s.max_extents
+                                      )
+                     ,2147483645,'unlimited'
+                     ,p.def_max_extents
+                    )                       AS max_extents
+            , DECODE(
+                      p.def_pct_increase
+                     ,'DEFAULT',s.pct_increase
+                     ,p.def_pct_increase
+                    )                       AS pct_increase
+            , DECODE(
+                      p.def_freelists
+                     ,0,1
+                     ,NVL(p.def_freelists,1)
+                    )                       AS freelists
+            , DECODE(
+                      p.def_freelist_groups
+                     ,0,1
+                     ,NVL(p.def_freelist_groups,1)
+                    )                       AS freelist_groups
+            , LOWER(p.def_buffer_pool)      AS buffer_pool
+            , DECODE(
+                      p.def_logging 
+                     ,'NO','NOLOGGING'
+                     ,     'LOGGING'
+                    )                       AS logging
+            , LOWER(p.def_tablespace_name)  AS tablespace_name
+            , t.blocks - NVL(t.empty_blocks,0)
+       FROM
+              ${view}_all_tables    t
+            , ${view}_part_indexes  p
+            , ${view}_tablespaces   s
+       WHERE
+                  t.table_name      = UPPER('$name')
+              AND p.table_name      = t.table_name
+              AND s.tablespace_name = p.def_tablespace_name
+      ";
+
+  if ( $view eq 'DBA' )
+  {
+    $stmt .=
+      "
+              AND t.owner           = UPPER('$owner')
+              AND p.owner           = t.owner 
+      ";
+  }
+
+  my $sql = _create_table_text( $stmt, $schema, $owner, $name, $view );
+
+  $stmt =
+      "
+       SELECT
+              index_name
+       FROM
+              ${view}_part_indexes
+       WHERE
+                  table_name = UPPER('$name')
+      ";
+
+  if ( $view eq 'DBA' )
+  {
+    $stmt .=
+      "
+              AND owner      = UPPER('$owner')
+      ";
+  }
+
+  my $sth = $dbh->prepare( $stmt );
+  $sth->execute;
+  my ( $index ) = $sth->fetchrow_array;
+
+  $sql .= "PARTITION BY RANGE\n" .  # Only RANGE allowed on IOT's
+          "(\n    " .
+          _partition_key_columns( $owner, $name, 'TABLE', $view ) .
+          "\n)\n" .
+          _range_partitions( $owner, $index, $view, 'NONE', 'IOT' );
+
+  return $sql;
+}
+
+# sub _create_partitioned_table
+#
+# Returns DDL to create the partitioned table and its partition(s).
+# See _create_table for format.
+#
+sub _create_partitioned_table
+{
+  my ( $schema, $owner, $name, $view ) = @_;
+
+  my $stmt =
+      "
+       SELECT
+              -- Table Properties
+              DECODE(
+                      t.monitoring
+                     ,'NO','NOMONITORING'
+                     ,     'MONITORING'
+                    )                       AS monitoring
+            , t.table_name
+              -- Parallel Clause
+            , LTRIM(t.degree)               AS degree
+            , LTRIM(t.instances)            AS instances
+              -- Physical Properties
+            , DECODE(
+                      t.iot_type
+                     ,'IOT','INDEX'
+                     ,      'HEAP'
+                    )                       AS organization
+              -- Segment Attributes
+            , DECODE(
+                      LTRIM(t.cache)
+                     ,'Y','CACHE'
+                     ,    'NOCACHE'
+                    )                       AS cache
+            , p.def_pct_used
+            , p.def_pct_free                AS pct_free
+            , p.def_ini_trans               AS ini_trans
+            , p.def_max_trans               AS max_trans
+              -- Storage Clause
+            ,DECODE(
+                     p.def_initial_extent
+                    ,'DEFAULT',s.initial_extent
+                    ,p.def_initial_extent * $block_size * 1024
+                   )                        AS initial_extent
+            ,DECODE(
+                     p.def_next_extent
+                    ,'DEFAULT',s.next_extent
+                    ,p.def_next_extent * $block_size * 1024
+                   )                        AS next_extent
+            , DECODE(
+                      p.def_min_extents
+                     ,'DEFAULT',s.min_extents
+                     ,p.def_min_extents
+                    )                       AS min_extents
+            , DECODE(
+                      p.def_max_extents
+                     ,'DEFAULT',DECODE(
+                                        s.max_extents
+                                       ,2147483645,'unlimited'
+                                       ,s.max_extents
+                                      )
+                     ,2147483645,'unlimited'
+                     ,p.def_max_extents
+                    )                       AS max_extents
+            , DECODE(
+                      p.def_pct_increase
+                     ,'DEFAULT',s.pct_increase
+                     ,p.def_pct_increase
+                    )                       AS pct_increase
+            , DECODE(
+                      p.def_freelists
+                     ,0,1
+                     ,NVL(p.def_freelists,1)
+                    )                       AS freelists
+            , DECODE(
+                      p.def_freelist_groups
+                     ,0,1
+                     ,NVL(p.def_freelist_groups,1)
+                    )                       AS freelist_groups
+            , LOWER(p.def_buffer_pool)      AS buffer_pool
+            , DECODE(
+                      p.def_logging 
+                     ,'NO','NOLOGGING'
+                     ,     'LOGGING'
+                    )                       AS logging
+            , LOWER(p.def_tablespace_name)  AS tablespace_name
+            , t.blocks - NVL(t.empty_blocks,0)
+       FROM
+              ${view}_all_tables   t
+            , ${view}_part_tables  p
+            , ${view}_tablespaces  s
+       WHERE
+                  t.table_name      = UPPER('$name')
+              AND p.table_name      = t.table_name
+              AND s.tablespace_name = p.def_tablespace_name
+      ";
+
+  if ( $view eq 'DBA' )
+  {
+    $stmt .=
+      "
+              AND t.owner           = UPPER('$owner')
+              AND p.owner           = t.owner 
+      ";
+  }
+
+  my $sql = _create_table_text( $stmt, $schema, $owner, $name, $view );
+
+  $sql =~ /ORGANIZATION\s+(\w+)/gm;
+  my $organization = $1;
+
+  $sql =~ /\s+(N?O?CACHE)/gm;
+  my $cache = $1;
+
+  $stmt =
+      "
+       SELECT
+              partitioning_type
+            , partition_count
+            , subpartitioning_type
+            , def_subpartition_count
+       FROM
+              ${view}_part_tables
+       WHERE
+                  table_name = UPPER('$name')
+      ";
+
+  if ( $view eq 'DBA' )
+  {
+    $stmt .=
+      "
+              AND owner      = UPPER('$owner')
+      ";
+  }
+
+  my $sth = $dbh->prepare( $stmt );
+  $sth->execute;
+  my (
+       $partitioning_type,
+       $partition_count,
+       $subpartitioning_type,
+       $subpartition_count
+      ) = $sth->fetchrow_array;
+
+  $sql .= "PARTITION BY $partitioning_type\n" .
+          "(\n    " .
+          _partition_key_columns( $owner, $name, 'TABLE', $view ) .
+          "\n)\n";
+
+  if ( $partitioning_type eq 'RANGE' )
+  {
+    if ( $subpartitioning_type eq 'HASH' )
+    {
+      $sql .= "SUBPARTITION BY HASH\n" .
+              "(\n    " .
+              _subpartition_key_columns( $owner, $name, 'TABLE', $view ) .
+              "\n)\n" .
+              "SUBPARTITIONS $subpartition_count" .
+              "\n";
+    }
+
+    $sql .= "(\n";
+
+    $stmt =
+      "
+       SELECT
+              partition_name
+            , high_value
+            , '$cache'
+            , pct_used
+            , pct_free
+            , ini_trans
+            , max_trans
+              -- Storage Clause
+            , initial_extent
+            , next_extent
+            , min_extent
+            , DECODE(
+                      max_extent
+                     ,2147483645,'unlimited'
+                     ,           max_extent
+                    )                       AS max_extents
+            , pct_increase
+            , NVL(freelists,1)
+            , NVL(freelist_groups,1)
+            , LOWER(buffer_pool)
+            , DECODE(
+                      logging 
+                     ,'NO','NOLOGGING'
+                     ,     'LOGGING'
+                    )                       AS logging
+            , LOWER(tablespace_name)
+            , blocks - NVL(empty_blocks,0)
+       FROM
+              ${view}_tab_partitions
+       WHERE
+                  table_name =  UPPER('$name')
+      ";
+
+    if ( $view eq 'DBA' )
+    {
+      $stmt .=
+      "
+              AND table_owner = UPPER('$owner')
+      ";
+    }
+
+    $stmt .=
+      "
+       ORDER
+          BY
+              partition_name
+      ";
+
+    $dbh->{ LongReadLen } = 8192;    # Allows HIGH_VALUE length of 8K
+    $dbh->{ LongTruncOk } = 1;
+
+    $sth = $dbh->prepare( $stmt );
+    $sth->execute;
+    my $aref = $sth->fetchall_arrayref;
+
+    my $comma = '    ';
+
+    foreach my $row ( @$aref )
+    {
+      my $partition  = shift @$row;
+      my $high_value = shift @$row;
+
+      $sql .= "${comma}PARTITION \L$partition \UVALUES LESS THAN\n" .
+              "      (\n" .
+              "        $high_value\n" .
+              "      )\n";
+
+      unshift @$row, ( '      ', $organization );
+
+      $sql .= _segment_attributes( $row );
+
+      $comma = '  , ';
+
+      if ( $subpartitioning_type eq 'HASH' )
+      {
+        $stmt =
+          "
+           SELECT
+                  subpartition_name
+                , tablespace_name
+           FROM
+                  ${view}_tab_subpartitions
+           WHERE
+                      table_name     =  UPPER('$name')
+                  AND partition_name = '$partition'
+          ";
+
+        if ( $view eq 'DBA' )
+        {
+          $stmt .=
+          "
+                  AND table_owner    = UPPER('$owner')
+          ";
+        }
+
+        $stmt .=
+          "
+           ORDER
+              BY
+                  subpartition_name
+          ";
+
+        $sth = $dbh->prepare( $stmt );
+        $sth->execute;
+        my $aref = $sth->fetchall_arrayref;
+
+        $sql .= "        (\n            ";
+
+        my @cols;
+        foreach my $row ( @$aref )
+        {
+          push @cols, "SUBPARTITION \L$row->[0] \UTABLESPACE \L$row->[1]";
+        }
+        $sql .= join ( "\n          , ", @cols );
+
+        $sql .= "\n        )\n";
+      }
+    }
+    $sql .= ");\n\n";
+  }
+  else   # It's HASH partitioning
+  {
+    $sql .= "(\n    ";
+
+    $stmt =
+      "
+       SELECT
+              partition_name
+            , tablespace_name
+       FROM
+              ${view}_tab_partitions
+       WHERE
+                  table_name =  UPPER('$name')
+      ";
+
+    if ( $view eq 'DBA' )
+    {
+      $stmt .=
+      "
+              AND table_owner= UPPER('$owner')
+      ";
+    }
+
+    $stmt .=
+      "
+       ORDER
+          BY
+              partition_name
+      ";
+
+    $sth = $dbh->prepare( $stmt );
+    $sth->execute;
+    my $aref = $sth->fetchall_arrayref;
+
+    my @cols;
+    foreach my $row ( @$aref )
+    {
+      push @cols, "PARTITION \L$row->[0] \UTABLESPACE \L$row->[1]";
+    }
+    $sql .= join ( "\n  , ", @cols );
+
+    $sql .= "\n) ;\n\n";
+  }
+
+  return $sql;
+}
+
+# sub _create_profile
+#
+# Returns DDL to create the named profile in the form of:
+#
+#     CREATE PROFILE <name>
+#     LIMIT
+#       SESSIONS_PER_USER   <value>
+#       CPU_PER_SESSION     <value>
+#       CPU_PER_CALL        <value>
+#       etc
+#
+sub _create_profile
+{
+  my ( $schema, $owner, $name, $view ) = @_;
+
+  $sth = $dbh->prepare(
+      "
+       SELECT
+              RPAD(resource_name,27)
+            , DECODE(
+                      RESOURCE_NAME
+                     ,'PASSWORD_VERIFY_FUNCTION',DECODE(
+                                                         limit
+                                                        ,'UNLIMITED','null'
+                                                        ,LOWER(limit)
+                                                       )
+                     ,                           LOWER(limit)
+                    )
+       FROM
+              dba_profiles
+       WHERE
+              profile = UPPER('$name')
+       ORDER
+          BY
+              resource_type
+            , resource_name
+      ");
+
+  $sth->execute;
+  my $aref = $sth->fetchall_arrayref;
+  die "\nProfile '\U$name' \Ldoes not exist.\n\n" unless @$aref;
+
+  my $sql = "PROMPT " .
+            "CREATE PROFILE \L$name\n\n" .
+            "CREATE PROFILE \L$name\n" .
+            "LIMIT\n";
+
+  foreach my $row ( @$aref )
+  {
+    $sql .= "   $row->[0]$row->[1]\n";
+  }
+
+  $sql .= ";\n\n";
+
+  return $sql;
+}
+
+# sub _create_role
+#
+# Returns DDL to create the named role in the form of:
+#
+#     CREATE ROLE <name> IDENTIFIED {EXTERNALLY|BY VALUES '<values>'}
+#     or
+#     CREATE ROLE <name> NOT IDENTIFIED
+# 
+sub _create_role
+{
+  my ( $schema, $owner, $name, $view ) = @_;
+
+  die "\nYou must use the DBA views in order to CREATE ROLE\n\n"
+      unless $view eq 'DBA';
+
+  my $stmt =
+      "
+       SELECT
+              DECODE(
+                      r.password_required
+                     ,'YES', DECODE(
+                                     u.password
+                                    ,'EXTERNAL','IDENTIFIED EXTERNALLY'
+                                    ,'IDENTIFIED BY VALUES ''' 
+                                      || u.password || ''''
+                                   )
+                     ,'NOT IDENTIFIED'
+                    )                         AS password
+       FROM
+              dba_roles   r
+            , sys.user\$  u
+       WHERE
+                  r.role = UPPER('$name')
+              AND u.name = UPPER('$name')
+      ";
+
+  $sth = $dbh->prepare( $stmt );
+  $sth->execute;
+  my @row = $sth->fetchrow_array;
+  die "\nRole \U$name \Ldoes not exist.\n\n" unless @row;
+
+  my ( $password ) = @row;
+
+  my $sql  =
+          "PROMPT " .
+          "CREATE ROLE \L$name\n\n" .
+          "CREATE ROLE \L$name \U$password;\n\n";
+
+  $sql .= _granted_privs( $name );
+
+  return $sql;
+}
+
+# sub _create_rollback_segment
+#
+# Returns DDL to create the named rollback segment in the form of:
+#
+#     CREATE [PUBLIC] ROLLBACK SEGMENT <name>
+#     STORAGE
+#     (
+#       storage clause
+#     )
+#     TABLESPACE tablespace
+#
+sub _create_rollback_segment
+{
+  my ( $schema, $owner, $name, $view ) = @_;
+
+  $sth = $dbh->prepare(
+      "
+       SELECT
+              DECODE(
+                      r.owner
+                     ,'PUBLIC',' PUBLIC '
+                     ,         ' '
+                    )                                  AS is_public
+            , r.tablespace_name
+            , NVL(r.initial_extent,t.initial_extent)   AS initial_extent
+            , NVL(r.next_extent,t.next_extent)         AS next_extent
+            , r.min_extents
+            , DECODE(
+                      r.max_extents
+                     ,2147483645,'unlimited'
+                     ,           r.max_extents
+                    )                                  AS max_extents
+       FROM
+              dba_rollback_segs    r
+            , ${view}_tablespaces  t
+       WHERE
+                  r.segment_name    = UPPER('$name')
+              AND t.tablespace_name = r.tablespace_name
+      ");
+
+  $sth->execute;
+  my @row = $sth->fetchrow_array;
+  die "\nRollback Segment '\U$name' \Ldoes not exist.\n\n" unless @row;
+
+  my (
+       $is_public,
+       $tablespace_name,
+       $initial_extent,
+       $next_extent,
+       $min_extents,
+       $max_extents,
+     ) = @row;
+
+  return "PROMPT " .
+         "CREATE${is_public}ROLLBACK SEGMENT \L$name\n\n" .
+         "CREATE${is_public}ROLLBACK SEGMENT \L$name\n" .
+         "STORAGE\n" .
+         "(\n" .
+         "  INITIAL      $initial_extent\n" .
+         "  NEXT         $next_extent\n" .
+         "  MINEXTENTS   $min_extents\n" .
+         "  MAXEXTENTS   $max_extents\n" .
+         ")\n" .
+         "TABLESPACE     \L$tablespace_name\n" .
+         ";\n\n" ; 
+}
+
+# sub _create_package
+#
+# Returns DDL to create the named procedure in the form of:
+#
+#     CREATE OR REPLACE PACKAGE [schema.]<name>
+#     AS
+#     <source>
+# 
+#     CREATE OR REPLACE PACKAGE BODY [schema.]<name>
+#     AS
+#     <source>
+# 
+# by calling _display_source (twice)
+#
+sub _create_package
+{
+  my $sql  = _display_source( @_, 'PACKAGE' );
+     $sql .= _display_source( @_, 'PACKAGE BODY' );
+
+  return $sql;
+}
+
+# sub _create_procedure
+#
+# Returns DDL to create the named procedure in the form of:
+#
+#     CREATE OR REPLACE PROCEDURE [schema.]<name>
+#     AS
+#     <source>
+# 
+# by calling _display_source
+#
+sub _create_procedure
+{
+  return _display_source( @_, 'PROCEDURE' );
+}
+
+# sub _create_sequence
+#
+# Returns DDL to create the named sequence in the form of:
+#
+#     CREATE SEQUENCE [schema.]<name>
+#        START WITH     <integer>
+#        INCREMENT BY   <integer>
+#        [NO]MINVALUE   <integer>
+#        [NO]MAXVALUE   <integer>
+#        [NO]CACHE      <integer>
+#        [NO]CYCLE
+#        [NO]ORDER
+# 
+sub _create_sequence
+{
+  my ( $schema, $owner, $name, $view ) = @_;
+
+  my $stmt =
+      "
+       SELECT
+              'START WITH       '
+               || LTRIM(TO_CHAR(last_number + cache_size,'fm999999999'))
+                                               AS start_with
+            , 'INCREMENT BY     '
+               || LTRIM(TO_CHAR(increment_by,'fm999999999')) AS imcrement_by
+            , DECODE(
+                      min_value
+                     ,0,'NOMINVALUE'
+                     ,'MINVALUE         ' || TO_CHAR(min_value)
+                    )                          AS min_value
+            , DECODE(
+                      TO_CHAR(max_value,'fm999999999999999999999999999')
+                     ,'999999999999999999999999999','NOMAXVALUE'
+                     ,'MAXVALUE         ' || TO_CHAR(max_value)
+                    )                          AS max_value
+            , DECODE(
+                      cache_size
+                     ,0,'NOCACHE'
+                     ,'CACHE            ' || TO_CHAR(cache_size)
+                    )                          AS cache_size
+            , DECODE(
+                      cycle_flag
+                     ,'Y','CYCLE'
+                     ,'N', 'NOCYCLE'
+                    )                          AS cycle_flag
+            , DECODE(
+                      order_flag
+                     ,'Y','ORDER'
+                     ,'N', 'NOORDER'
+                    )                          AS order_flag
+       FROM
+              ${view}_sequences
+       WHERE
+                  sequence_name  = UPPER('$name')
+      ";
+
+  if ( $view eq 'DBA' )
+  {
+    $stmt .=
+        "
+              AND sequence_owner = UPPER('$owner')
+        "; }
+
+  $sth = $dbh->prepare( $stmt );
+  $sth->execute;
+  my @row = $sth->fetchrow_array;
+  die "\nSequence \U$name \Ldoes not exist.\n\n" unless @row;
+
+  my (
+       $start_with,
+       $increment_by,
+       $min_value,
+       $max_value,
+       $cache_size,
+       $cycle_flag,
+       $order_flag,
+     ) = @row;
+
+  return "PROMPT " .
+         "CREATE SEQUENCE \L$schema$name\n\n" .
+         "CREATE SEQUENCE \L$schema$name\n" .
+         "   $start_with\n" .
+         "   $increment_by\n" .
+         "   $min_value\n" .
+         "   $max_value\n" .
+         "   $cache_size\n" .
+         "   $cycle_flag\n" .
+         "   $order_flag\n" .
+         ";\n\n";
+}
+
+# sub _create_synonym
+#
+# Returns DDL to create the named synonym in the form of:
+#
+#     CREATE [PUBLIC] SYNONYM <name> FOR [schema.]<object>[@dblink]
+#
+sub _create_synonym
+{
+  my ( $schema, $owner, $name, $view ) = @_;
+
+  my $stmt =
+      "
+       SELECT
+              table_owner
+            , table_name
+            , NVL(db_link,'NULL')
+       FROM
+              ${view}_synonyms
+       WHERE
+                  synonym_name = UPPER('$name')
+      ";
+
+  if ( $view eq 'DBA' )
+  {
+    $stmt .=
+        "
+              AND owner        = UPPER('$owner')
+        ";
+  }
+
+  $sth = $dbh->prepare( $stmt );
+  $sth->execute;
+  my @row = $sth->fetchrow_array;
+  die "Synonym \U$name \Ldoes not exist.\n\n" unless @row;
+
+  my ( $table_owner, $table_name, $db_link ) = @row;
+
+  $db_link      = ( $db_link     eq 'NULL' )   ? ''        : "\@$db_link";
+  $schema       = ( $schema      eq 'PUBLIC' ) ? ''        : $schema;
+  my $is_public = ( "\U$owner"   eq 'PUBLIC' ) ? ' PUBLIC' : '';
+  my $table_schema = _set_schema( $table_owner );
+
+  return "PROMPT " .
+         "CREATE$is_public SYNONYM \L$schema$name " .
+            "FOR \L$table_schema$table_name$db_link \n\n" .
+         "CREATE$is_public SYNONYM \L$schema$name " .
+            "FOR \L$table_schema$table_name$db_link;\n\n";
+#here
+}
+
+# sub _create_table
+#
+# Returns DDL to create the named table and its partition(s) in the form of:
+#
+#     CREATE TABLE [schema.]<name>
+#     (
+#       <column list>
+#     )
+#     ORGANIZATION {HEAP|INDEX}
+#     [NO]MONIOTORING
+#     PARALLEL 
+#     ( 
+#       DEGREE     <value> 
+#       INSTANCES  <value> 
+#     ) 
+#     [NO]CACHE 
+#     [PCTUSED]    <value>
+#     PCTFREE      <value>
+#     INITRANS     <value>
+#     MAXTRANS     <value>
+#     STORAGE
+#     (
+#       <storage clause>
+#     )
+#     [NO]LOGING
+#     TABLESPACE   <name>
+#     [<partitioning clause>]
+#
+sub _create_table
+{
+  my ( $schema, $owner, $name, $view ) = @_;
+
+  my $sql;
+  my $stmt =
+      "
+       SELECT
+              partitioned
+            , iot_type
+       FROM
+              ${view}_tables
+       WHERE
+                  table_name = UPPER('$name')
+      ";
+
+  if ( $view eq 'DBA' )
+  {
+    $stmt .=
+        "
+              AND owner      = UPPER('$owner')
+        ";
+  }
+
+  $sth = $dbh->prepare( $stmt );
+  $sth->execute;
+  my @row = $sth->fetchrow_array;
+  die "Table \U$name \Ldoes not exist.\n\n" unless @row;
+
+  my ( $partitioned, $iot_type ) = @row;
+
+  if ( $iot_type eq 'IOT' )
+  {
+    if ( $partitioned eq 'YES' )
+    {
+      return _create_partitioned_iot( $schema, $owner, $name, $view )
+    }
+    else
+    {
+      return _create_iot( $schema, $owner, $name, $view )
+    }
+  }
+  elsif ( $partitioned eq 'YES' )
+  {
+    return _create_partitioned_table( $schema, $owner, $name, $view )
+  }
+
+  # We must be a plain, vanilla, non-partitioned, relational table.
+
+  $stmt =
+      "
+       SELECT
+              -- Table Properties
+              DECODE(
+                      t.monitoring
+                     ,'NO','NOMONITORING'
+                     ,     'MONITORING'
+                    )
+            , 'N/A'                         AS table_name
+              -- Parallel Clause
+            , LTRIM(t.degree)
+            , LTRIM(t.instances)
+              -- Physical Properties
+            , DECODE(
+                      t.iot_type
+                     ,'IOT','INDEX'
+                     ,      'HEAP'
+                    )                       AS organization
+              -- Segment Attributes
+            , DECODE(
+                      LTRIM(t.cache)
+                     ,'Y','CACHE'
+                     ,    'NOCACHE'
+                    )
+            , t.pct_used
+            , t.pct_free
+            , DECODE(
+                      t.ini_trans
+                     ,0,1
+                     ,null,1
+                     ,t.ini_trans
+                    )                       AS ini_trans
+            , DECODE(
+                      t.max_trans
+                     ,0,255
+                     ,null,255
+                     ,t.max_trans
+                    )                       AS max_trans
+              -- Storage Clause
+            , t.initial_extent
+            , t.next_extent
+            , t.min_extents
+            , DECODE(
+                      t.max_extents
+                     ,2147483645,'unlimited'
+                     ,           t.max_extents
+                    )                       AS max_extents
+            , t.pct_increase
+            , NVL(t.freelists,1)
+            , NVL(t.freelist_groups,1)
+            , LOWER(t.buffer_pool)          AS buffer_pool
+            , DECODE(
+                      t.logging
+                     ,'NO','NOLOGGING'
+                     ,     'LOGGING'
+                    )                       AS logging
+            , LOWER(t.tablespace_name)      AS tablespace_name
+            , s.blocks - NVL(t.empty_blocks,0)
+       FROM
+              ${view}_tables    t
+            , ${view}_segments  s
+       WHERE
+                  t.table_name   = UPPER('$name')
+              AND t.table_name   = s.segment_name
+      ";
+
+  if ( $view eq 'DBA' )
+  {
+    $stmt .=
+      "
+              AND s.owner        = UPPER('$owner')
+              AND t.owner        = s.owner
+      ";
+  }
+
+  return _create_table_text( $stmt, $schema, $owner, $name, $view ) .
+         ";\n\n";
+}
+
+# sub _create_table_family
+#
+# Combines the CREATE TABLE statement with its "family" -- Comments,
+# Triggers and Constraints
+#
+sub _create_table_family
+{
+  my ( $schema, $owner, $name, $view ) = @_;
+
+  my $sql = _create_table     ( @_ ) .
+            _create_comments  ( @_ );
+
+  # Add table's indexes
+  my $stmt =
+      "
+       SELECT
+              index_name
+       FROM
+              ${view}_indexes
+       WHERE
+                  table_name = UPPER('$name')
+      ";
+
+  if ( $view eq 'DBA' )
+  {
+    $stmt .=
+      "
+              AND owner        = UPPER('$owner')
+      ";
+  }
+
+  $stmt .= 
+      "
+       ORDER
+          BY
+             index_name
+      ";
+
+  $sth = $dbh->prepare( $stmt );
+  $sth->execute;
+  my $aref = $sth->fetchall_arrayref;
+
+  foreach my $row ( @$aref )
+  {
+    $sql .= _create_index( $schema, $owner, @$row->[0], $view );
+  }
+
+  $stmt =
+      "
+       SELECT
+              constraint_name
+            , constraint_type
+            , search_condition
+       FROM
+              ${view}_constraints cn
+       WHERE
+                  owner            = UPPER('$owner')
+              AND table_name       = UPPER('$name')
+              AND constraint_type IN('P','U','R','C')
+       ORDER
+          BY
+             DECODE(
+                     constraint_type
+                    ,'P',1
+                    ,'U',2
+                    ,'R',3
+                    ,'C',4
+                   )
+           , constraint_name
+      ";
+
+  $dbh->{ LongReadLen } = 8192;    # Allows SEARCH_CONDITION length of 8K
+  $dbh->{ LongTruncOk } = 1;
+
+  $sth = $dbh->prepare( $stmt );
+  $sth->execute;
+  $aref = $sth->fetchall_arrayref;
+
+  foreach my $row ( @$aref )
+  {
+    my ( $cons_name, $cons_type, $condition ) = @$row;
+
+    if ( $cons_type ne 'C' )
+    {
+      $sql .= _create_constraint( $schema, $owner, $cons_name, $view );
+    }
+    elsif ( $condition !~ /IS NOT NULL/ )
+    {
+      $sql .= _create_constraint( $schema, $owner, $cons_name, $view );
+    }
+  }
+
+
+  # Add table's triggers
+  $stmt =
+      "
+       SELECT
+              trigger_name
+       FROM
+              ${view}_triggers
+       WHERE
+                  table_name = UPPER('$name')
+      ";
+
+  if ( $view eq 'DBA' )
+  {
+    $stmt .=
+      "
+              AND owner        = UPPER('$owner')
+      ";
+  }
+
+  $stmt .= 
+      "
+       ORDER
+          BY
+             trigger_name
+      ";
+
+  $sth = $dbh->prepare( $stmt );
+  $sth->execute;
+  $aref = $sth->fetchall_arrayref;
+
+  foreach my $row ( @$aref )
+  {
+    $sql .= _create_trigger( $schema, $owner, @$row->[0], $view );
+  }
+
+  return $sql;
+}
+
+# sub _create_table_text
+#
+# Formats the CREATE TABLE statement
+#
+sub _create_table_text
+{
+  my ( $stmt, $schema, $owner, $name, $view ) = @_;
+
+  $sth = $dbh->prepare( $stmt );
+  $sth->execute;
+  my @row = $sth->fetchrow_array;
+
+  # Turn warnings off
+  $^W = 0;
+
+  my $monitoring   = shift @row;
+  my $table        = shift @row;
+  my $degree       = shift @row;
+  my $instances    = shift @row;
+  my $organization = shift @row;
+
+  my (
+       # Segment Attributes
+       $cache,
+       $pct_used,
+       $pct_free,
+       $ini_trans,
+       $max_trans,
+       $initial,
+       $next,
+       $min_extents,
+       $max_extents,
+       $pct_increase,
+       $freelists,
+       $freelist_groups,
+       $buffer_pool,
+       $logging,
+       $tablespace,
+       $blocks,
+     ) = @row;
+
+  ( $initial, $next ) = _initial_next( $blocks ) if $attr{ sizing };
+
+  my $sql  =
+          "PROMPT " .
+          "CREATE TABLE \L$schema$name\n\n" .
+          "CREATE TABLE \L$schema$name\n" .
+          "(\n    " .
+          _table_columns( $owner, $name, $view );
+
+  if ( $organization eq 'INDEX' )
+  {
+    $stmt =
+        "
+         SELECT
+                constraint_name
+         FROM
+                ${view}_constraints
+         WHERE
+                    table_name      = UPPER('$name')
+                AND constraint_type = 'P'
+        ";
+
+    if ( $view eq 'DBA' )
+    {
+      $stmt .=
+          "
+                AND owner           = UPPER('$owner')
+          ";
+    }
+
+    $sth = $dbh->prepare( $stmt );
+    $sth->execute;
+    my ( $index ) = $sth->fetchrow_array;
+
+    $sql .= "  , CONSTRAINT \L$index \UPRIMARY KEY\n" .
+            _index_columns( '      ', $owner, $index, $view, );
+  }
+
+  $sql .= ")\n" .
+          "ORGANIZATION        $organization\n" .
+          "$monitoring\n" .
+          "PARALLEL\n" .
+          "(\n" .
+          "  DEGREE            $degree\n" .
+          "  INSTANCES         $instances\n" .
+          ")\n";
+
+  unshift @row, ( '', $organization );
+
+  $sql .= _segment_attributes( \@row );
+
+  return $sql;
+}
+
+# sub _create_tablespace
+#
+# Returns DDL to create the named tablespace in the form of:
+#
+#     CREATE TABLESPACE <name>
+#     DATAFILE
+#        '<filespec>'
+#      , '<filespec>'
+#     DEFAULT STORAGE
+#     (
+#       <storage clause>
+#     )
+#     [MINIMUM EXTENT  <bytes>]
+#     [NO]LOGGING
+#     {PERMANENT|TEMPORARY}
+#     EXTENT MANAGEMENT {DICTIONARY|LOCAL <extent spec>}
+#
+sub _create_tablespace
+{
+  my ( $schema, $owner, $name, $view ) = @_;
+
+  die "\nYou must use the DBA views in order to CREATE TABLESPACE\n\n"
+      unless $view eq 'DBA';
+
+  my $sql;
+  my $stmt =
+      "
+       SELECT
+              initial_extent
+            , next_extent
+            , min_extents
+            , DECODE(
+                      max_extents
+                     ,2147483645,'unlimited'
+                     ,null,DECODE(
+                                   $block_size
+                                  , 2,121
+                                  , 4,'250  -- ???'
+                                  , 8,505
+                                  ,16,'1010  -- ???'
+                                  ,32,'2020  -- ???'
+                                  ,'???'
+                                 )
+                     ,max_extents
+                    )                       AS max_extents
+            , pct_increase
+            , min_extlen
+            , contents
+            , DECODE(
+                      logging 
+                     ,'NO','NOLOGGING'
+                     ,     'LOGGING'
+                    )                       AS logging
+            , extent_management
+            , allocation_type
+       FROM
+              dba_tablespaces
+       WHERE
+              tablespace_name = UPPER('$name')
+      ";
+
+  $sth = $dbh->prepare( $stmt );
+  $sth->execute;
+  my @row = $sth->fetchrow_array;
+  die "Tablespace \U$name \Ldoes not exist.\n\n" unless @row;
+
+  my (
+       $initial,
+       $next,
+       $min_extents,
+       $max_extents,
+       $pct_increase,
+       $min_extlen,
+       $contents,
+       $logging,
+       $extent_management,
+       $allocation_type,
+     ) = @row;
+
+  $sql  = "PROMPT " .
+          "CREATE TABLESPACE \L$name\n\n" .
+          "CREATE TABLESPACE \L$name\n" .
+          "DATAFILE\n";
+
+  $stmt =
+      "
+       SELECT
+              file_name
+            , bytes
+            , autoextensible
+            , DECODE(
+                      SIGN(2147483645 - maxbytes)
+                     ,-1,'unlimited'
+                     ,maxbytes
+                    )                               AS maxbytes
+            , increment_by * $block_size * 1024     AS increment_by
+       FROM
+              dba_data_files
+       WHERE
+              tablespace_name = UPPER('$name')
+      ";
+
+  $sth = $dbh->prepare( $stmt );
+  $sth->execute;
+  my $aref = $sth->fetchall_arrayref;
+
+  my $comma = '  ';
+  foreach my $row ( @$aref )
+  {
+    my (
+         $file_name,
+         $bytes,
+         $autoextensible,
+         $maxbytes,
+         $increment_by,
+       ) = @$row;
+
+    $sql .= "$comma '$file_name' SIZE $bytes REUSE\n" .
+            "       AUTOEXTEND ";
+
+    if ( $autoextensible eq 'YES' )
+    {
+      $sql .= "ON NEXT $increment_by MAXSIZE $maxbytes\n";
+    }
+    else
+    {
+      $sql .= "OFF\n";
+    }
+
+    $comma = ' ,';
+  }
+
+  if ( $extent_management eq 'LOCAL' )
+  {
+    $sql .= "EXTENT MANAGEMENT LOCAL ";
+
+    if ( $allocation_type eq 'SYSTEM' )
+    {
+      $sql .= "AUTOALLOCATE\n";
+    }
+    else
+    {
+      $sql .= "UNIFORM SIZE $next\n";
+    }
+  }
+  else  # It's Dictionary Managed
+  {
+    $sql .= "DEFAULT STORAGE\n" .
+            "(\n" .
+            "  INITIAL           $initial\n" .
+            "  NEXT              $next\n" .
+            "  MINEXTENTS        $min_extents\n" .
+            "  MAXEXTENTS        $max_extents\n" .
+            "  PCTINCREASE       $pct_increase\n" .
+            ")\n" .
+            "$contents\n";;
+
+    if ( $min_extlen > 0 )
+    {
+      $sql .= "MINUMUM EXTENT      $min_extlen\n";
+    }
+
+    $sql .= "EXTENT MANAGEMENT DICTIONARY\n";
+  }
+
+  $sql .= "$logging\n" .
+          ";\n\n";
+  return $sql;
+}
+
+# sub _create_trigger
+#
+# Returns DDL to create the named trigger in the form of:
+#
+#     CREATE OR REPLACE TRIGGER [schema.]<name>
+#     {BEFORE|AFTER|INSTEAD OF} <dml event>
+#     ON {[schema.]<table>|DATABASE|SCHEMA}
+#     REFERENCING <new> AS NEW <old> AS OLD
+#     [WHEN <whatever>]
+#     [FOR EACH ROW]
+#     <code>
+# 
+sub _create_trigger
+{
+  my ( $schema, $owner, $name, $view ) = @_;
+
+  my $stmt =
+      "
+       SELECT
+              description
+            , DECODE(
+                      when_clause
+                     ,null,null
+                     ,'WHEN ' || SUBSTR(when_clause,5) || CHR(10)
+                    )
+            , trigger_body
+       FROM
+              ${view}_triggers
+       WHERE
+                  trigger_name = UPPER('$name')
+      ";
+
+  if ( $view eq 'DBA' )
+  {
+    $stmt .=
+      "
+              AND owner        = UPPER('$owner')
+      ";
+  }
+
+  $dbh->{ LongReadLen } = 65536;    # Allows TRIGGER_BODY length of 64K
+  $dbh->{ LongTruncOk } = 1;
+
+  $sth = $dbh->prepare( $stmt );
+  $sth->execute;
+  my @row = $sth->fetchrow_array;
+  die "\nTrigger \U$schema$name \Ldoes not exist.\n\n" unless @row;
+
+  my ( $description, $when, $body ) = @row;
+
+  # $description has 3+ lines
+  # The 1st is the [schema.]<name> -- we don't need this
+  # The 2nd has the DML Event + Object Name (incl schema, if entered)
+  #    For capitalization purposes, break Line 2 into two pieces --
+  #    the event (upper case) + the object (lower case)
+  # The 3rd might have the "BEFORE EACH ROW" -- we want this
+
+  # find the end of the 1st line, and get rid of it
+  my $offset = index( $description, "\n" );
+  $description = uc( substr( $description, $offset + 1 ) );
+
+  # find the word "ON" -- it's the divider between event & object
+  $offset = index( $description, ' ON ' ) + 4;
+  my $event  = substr( $description, 0, $offset );
+
+  $description = lc( substr( $description, $offset ) );
+  $offset = index( $description, "\n" );
+  my $object  = substr( $description, 0, $offset );
+
+  my $action = $event . $object;
+
+  # the rest must be the FOR EACH ROW, if it's there
+  my $other = uc( substr( $description, $offset + 1 ) );
+
+  # body seems to end in a null character
+  $body =~ s/\c@//g;
+
+  my $sql = "PROMPT " .
+            "CREATE OR REPLACE TRIGGER \L$schema$name\n\n" .
+            "CREATE OR REPLACE TRIGGER \L$schema$name\n" .
+            "$action\n" .
+            "$when" .
+            "$other\n" .
+            "$body/\n\n";
+
+}
+
+# sub _create_type
+#
+# Returns DDL to create the named procedure in the form of:
+#
+#     CREATE OR REPLACE TYPE [schema.]<name>
+#     AS
+#     <source>
+# 
+# by calling _display_source
+#
+sub _create_type
+{
+  return _display_source( @_, 'TYPE' );
+}
+
+# sub _create_user
+#
+# Returns DDL to create the named user in the form of:
+#
+#     CREATE USER <name> IDENTIFIED {EXTERNALLY|BY VALUES '<values>'}
+#        PROFILE               <profile>
+#        DEFAULT TABLESPACE    <tablespace>
+#        TEMPORARY TABLESPACE  <tablespace>
+#        [QUOTA {UNLIMITED|<bytes>} ON TABLESPACE <tablespace1>]
+#        [QUOTA {UNLIMITED|<bytes>} ON TABLESPACE <tablespace2>]
+#
+#     [GRANT <role >            TO <name> {WITH ADMIN OPTION]]
+#     [GRANT <system privilege> TO <name> {WITH ADMIN OPTION]]
+#     [GRANT <privilege> ON <object> TO <name> {WITH GRANT OPTION]]
+# 
+sub _create_user
+{
+  my ( $schema, $owner, $name, $view ) = @_;
+
+  die "\nYou must use the DBA views in order to CREATE USER\n\n"
+      unless $view eq 'DBA';
+
+  my $stmt =
+      "
+       SELECT
+              DECODE(
+                      password
+                     ,'EXTERNAL','EXTERNALLY'
+                     ,'BY VALUES ''' || password || ''''
+                    )                         AS password
+            , profile
+            , default_tablespace
+            , temporary_tablespace
+       FROM
+              dba_users
+       WHERE
+              username = UPPER('$name')
+      ";
+
+  $sth = $dbh->prepare( $stmt );
+  $sth->execute;
+  my @row = $sth->fetchrow_array;
+  die "\nUser \U$name \Ldoes not exist.\n\n" unless @row;
+
+  my (
+       $password,
+       $profile,
+       $default_tablespace,
+       $temporary_tablespace,
+     ) = @row;
+
+  my $sql  =
+          "PROMPT " .
+          "CREATE USER \L$name\n\n" .
+          "CREATE USER \L$name \UIDENTIFIED $password\n" .
+          "   \UPROFILE              \L$profile\n" .
+          "   \UDEFAULT TABLESPACE   \L$default_tablespace\n" .
+          "   \UTEMPORARY TABLESPACE \L$temporary_tablespace\n";
+
+  # Add tablespace quotas
+  $stmt =
+      "
+       SELECT
+              DECODE(
+                      max_bytes
+                     ,-1,'unlimited'
+                     ,TO_CHAR(max_bytes,'99999999')
+                    )                         AS max_bytes
+            , tablespace_name
+       FROM
+              dba_ts_quotas
+       WHERE
+              username = UPPER('$name')
+       ORDER
+          BY
+              tablespace_name
+      ";
+
+  $sth = $dbh->prepare( $stmt );
+  $sth->execute;
+  my $aref = $sth->fetchall_arrayref;
+
+  foreach my $row( @$aref )
+  {
+    $sql .= "   QUOTA  @$row->[0]  ON \L@$row->[1]\n";
+  }
+
+  $sql .= ";\n\n";
+
+  $sql .= _granted_privs( $name );
+
+  return $sql;
+}
+
+# sub _create_view
+#
+# Returns DDL to create the named view in the form of:
+#
+#     CREATE OR REPLACE VIEW [schema.]<name>
+#     AS
+#     <query>
+# 
+sub _create_view
+{
+  my ( $schema, $owner, $name, $view ) = @_;
+
+  my $stmt =
+      "
+       SELECT
+              text
+       FROM
+              ${view}_views
+       WHERE
+                  view_name = UPPER('$name')
+      ";
+
+  if ( $view eq 'DBA' )
+  {
+    $stmt .=
+      "
+              AND owner     = UPPER('$owner')
+      ";
+  }
+
+  $dbh->{ LongReadLen } = 65536;    # Allows View TEXT length of 64K
+  $dbh->{ LongTruncOk } = 1;
+
+  $sth = $dbh->prepare( $stmt );
+  $sth->execute;
+  my ( $text ) = $sth->fetchrow_array;
+  die "\nView \U$name \Ldoes not exist.\n\n" unless $text;
+
+  return "PROMPT " .
+         "CREATE OR REPLACE VIEW \L$schema$name\n\n" .
+         "CREATE OR REPLACE VIEW \L$schema$name\n" .
+         "AS\n" .
+         "$text" .
+         ";\n\n";
+}
+
+# sub _display_source
+#
+# Returns DDL to create the named stored item in the form of:
+#
+#     CREATE OR REPLACE <TYPE> [schema.]<name>
+#     <source>
+#
+# where TYPE is one of:  PROCEDURE, FUNCTION, PACKAGE, PACKAGE BODY
+# 
+sub _display_source
+{
+  my ( $schema, $owner, $name, $view, $type ) = @_;
+
+  my $sql;
+  my $stmt =
+      "
+       SELECT
+              text
+       FROM
+              ${view}_source
+       WHERE
+                  type = '$type'
+              AND name = UPPER('$name')
+      ";
+
+  if ( $view eq 'DBA' )
+  {
+    $stmt .=
+      "
+              AND owner     = UPPER('$owner')
+      ";
+  }
+
+  $stmt .= 
+      "
+       ORDER
+          BY
+             line
+      ";
+
+  $sth = $dbh->prepare( $stmt );
+  $sth->execute;
+  my $aref = $sth->fetchall_arrayref;
+  die "\n\u\L$type \U$name \Ldoes not exist.\n\n" unless @$aref;
+
+  $sql = "PROMPT " .
+         "CREATE OR REPLACE $type \L$schema$name\n\n" .
+         "CREATE OR REPLACE ";
+
+  my $i = 1;
+  foreach my $row ( @$aref )
+  {
+    if ( $i++ == 1 )
+    {
+      # source.text already includes <TYPE> <name> 
+      # We want to insert the schema right before the name
+
+      @$row->[0] =~ s/$type\s+/$type \L$schema/;
+    }
+
+    $sql .= "@$row->[0]";
+  }
+
+  $sql .= "/\n\n";
+
+  return $sql;
+}
+
+# sub _drop_database_link
+#
+# Returns DDL to drop the named database link in the form of:
+#
+#     DROP [PUBLIC] DATABASE LINK <name>
+#
+sub _drop_database_link
+{
+  my ( $schema, $name, $type ) = @_;
+
+  my $public = ( $schema eq 'PUBLIC' ) ? ' PUBLIC' : '';
+
+  return "PROMPT " .
+         "DROP$public DATABASE LINK \L$name  \n\n" .
+         "DROP$public DATABASE LINK \L$name ;\n\n" ;
+}
+
+# sub _drop_object
+# 
+# Returns generic DDL to drop the named object in the form of:
+# 
+#     DROP <TYPE> <name>
+#
+sub _drop_object
+{
+  my ( $schema, $name, $type ) = @_;
+
+  return "PROMPT " .
+         "DROP \U$type \L$name  \n\n" .
+         "DROP \U$type \L$name ;\n\n";
+}
+
+# sub _drop_profile
+#
+# Returns DDL to drop the named profile in the form of:
+#
+#     DROP PROFILE <name> CASCADE
+#
+sub _drop_profile
+{
+  my ( $schema, $name, $type ) = @_;
+
+  my $public = ( $schema eq 'PUBLIC' ) ? ' PUBLIC' : '';
+
+  return "PROMPT " .
+         "DROP PROFILE \L$name \UCASCADE   \n\n" .
+         "DROP PROFILE \L$name \UCASCADE ; \n\n" ;
+}
+
+# sub _drop_schema_object
+# 
+# Returns generic DDL to drop the named object in the form of:
+# 
+#     DROP <TYPE> [schema.]<name>
+#
+sub _drop_schema_object
+{
+  my ( $schema, $name, $type ) = @_;
+
+  return "PROMPT " .
+         "DROP \U$type \L$schema$name  \n\n" .
+         "DROP \U$type \L$schema$name ;\n\n";
+}
+
+# sub _drop_synonym
+#
+# Returns DDL to drop the named object in the form of:
+#
+#     DROP PUBLIC SYNONYM  <name>
+#      or
+#     DROP SYNONYM [schema.]<name> 
+#
+sub _drop_synonym
+{
+  my ( $schema, $name, $type ) = @_;
+
+  my $public = ( $schema eq 'PUBLIC' ) ? ' PUBLIC' : '';
+
+  if ( $public )
+  {
+      return "PROMPT " .
+             "DROP PUBLIC SYNONYM \L$name  \n\n" .
+             "DROP PUBLIC SYNONYM \L$name ;\n\n" ; 
+  } else
+  {
+      return "PROMPT " .
+             "DROP SYNONYM  \L$schema$name  \n\n" .
+             "DROP SYNONYM  \L$schema$name  \n\n";
+  }
+}
+
+# sub _drop_table
+# 
+# Returns DDL to drop the named table in the form of:
+# 
+#     DROP TABLE [schema.]<name> CASCADE CONSTRAINTS
+#
+sub _drop_table
+{
+  my ( $schema, $name, $type ) = @_;
+
+  return "PROMPT " .
+         "DROP TABLE \L$schema$name \UCASCADE CONSTRAINTS  \n\n" .
+         "DROP TABLE \L$schema$name \UCASCADE CONSTRAINTS ;\n\n";
+}
+
+# sub _drop_tablespace
+# 
+# Returns DDL to drop the named tablespace in the form of:
+# 
+#     DROP TABLESPACE <name> INCLUDING CONTENTS CASCADE CONSTRAINTS
+#
+sub _drop_tablespace
+{
+  my ( $schema, $name, $type ) = @_;
+
+  return "PROMPT " .
+         "DROP TABLESPACE \L$name " .
+              "\UINCLUDING CONTENTS CASCADE CONSTRAINTS  \n\n" .
+         "DROP TABLESPACE \L$name " .
+              "\UINCLUDING CONTENTS CASCADE CONSTRAINTS ;\n\n";
+}
+
+# sub _drop_user
+# 
+# Returns DDL to drop the named user in the form of:
+# 
+#     DROP USER <name> CASCADE
+#
+sub _drop_user
+{
+  my ( $schema, $name, $type ) = @_;
+
+  return "PROMPT " .
+         "DROP USER \L$name \UCASCADE  \n\n" .
+         "DROP USER \L$name \UCASCADE ;\n\n";
+}
+
+#sub _generate_heading
+#
+# Initializes $ddl
+#
+sub _generate_heading
+{
+  my ( $module, $action, $type, $list ) = @_;
+  my $host;
+  my $instance;
+
+  $sth = $dbh->prepare(
+      "
+       SELECT
+              host_name
+            , instance_name
+       FROM
+              v\$instance
+      ");
+
+  $sth->execute;
+  ( $host, $instance ) = $sth->fetchrow_array;
+
+  $ddl =  "REM This DDL was reverse engineered\n" .
+          "REM by the Perl module $module\n" .
+          "REM\n" .
+          "REM at:   $host\n" .
+          "REM from: $instance\n" .
+          "REM\n" .
+          "REM on:   " . scalar ( localtime ) . "\n" .
+          "REM\n" .
+          "REM Generating $action \U$type \Lstatement";
+  $ddl .= ( @$list == 1 ) ? '' : "s";
+  $ddl .= " for:\n" .
+          "REM\n"; 
+
+  # Only include the schema if the Type has such a beast.
+  foreach my $row ( @$list )
+  {
+    # These don't
+    if (
+            "\L$type" eq 'directory'
+         or "\L$type" eq 'library'
+         or "\L$type" eq 'profile'
+         or "\L$type" eq 'role'
+         or "\L$type" eq 'rollback segment'
+         or "\L$type" eq 'tablespace'
+         or "\L$type" eq 'user'
+         or (
+                  "\L@$row->[0]" ne 'public'
+              and (
+                       "\L$type" eq 'database link'
+                    or "\L$type" eq 'synonym'
+                  )
+            )
+       )
+    {
+      $ddl .= "REM\t\U@$row->[1]\n";
+    }
+    # The rest do.
+    else
+    {
+      $ddl .= "REM\t\U@$row->[0].@$row->[1]\n";
+    }
+  }
+
+  $ddl .= "\n";
+};
+
+#sub _index_columns
+#
+# Returns a formatted string containing the index columns.
+#
+sub _index_columns
+{
+  my ( $indent, $owner, $name, $view, ) = @_;
+
+  my $stmt =
+      "
+       SELECT
+              LOWER(column_name)
+       FROM
+              ${view}_ind_columns
+       WHERE
+                  index_name  = UPPER('$name')
+      ";
+
+  if ( $view eq 'DBA' )
+  {
+    $stmt .=
+      "
+              AND index_owner = UPPER('$owner')
+      ";
+  }
+
+  $stmt .= 
+      "
+       ORDER
+          BY
+             column_position
+      ";
+
+  $sth = $dbh->prepare( $stmt );
+  $sth->execute;
+  my $aref = $sth->fetchall_arrayref;
+
+  my @cols;
+  foreach my $row ( @$aref )
+  {
+    push @cols, $row->[0];
+  }
+
+  return "${indent}(\n$indent    " .
+         join ( "\n$indent  , ", @cols ) .
+         "\n${indent})\n";
+}
+
+# sub _initial_next
+#
+# Given the number of blocks in a object, returns the smallest
+# INITIAL/NEXT values appropriate for an object of this size.
+#
+sub _initial_next
+{
+  my $blocks  = shift;
+
+  my $i = 0;
+  my $initial;
+  my $next;
+
+  until ( $initial ) 
+  {
+    # Turn warnings off
+    $^W = 0;
+
+    $initial = ( $size_arr[$i][0] eq "UNLIMITED" ) ? $size_arr[$i][1] :
+               ( $size_arr[$i][0]  > $blocks     ) ? $size_arr[$i][1] :
+                                                     undef;
+    $next    = ( $size_arr[$i][0]  > $blocks     ) ? $size_arr[$i][2] :
+                                                     undef;
+    $i++;
+  }
+  return $initial, $next;
+}
+
+#sub _key_columns
+#
+# Returns a formatted string containing the partitioning key columns.
+# Called from _partition_key_columns and _subpartition_key_columns,
+# which merely control which key columns table to query.
+#
+sub _key_columns
+{
+  my ( $owner, $name, $object_type, $view, $table ) = @_;
+
+  my $stmt =
+      "
+       SELECT
+              LOWER(column_name)
+       FROM
+              ${view}_${table}_key_columns
+       WHERE
+                  name           = UPPER('$name')
+              AND object_type LIKE UPPER('$object_type%')
+      ";
+
+  if ( $view eq 'DBA' )
+  {
+    $stmt .=
+      "
+              AND owner          = UPPER('$owner')
+      ";
+  }
+
+  $stmt .= 
+      "
+       ORDER
+          BY
+             column_position
+      ";
+
+  $sth = $dbh->prepare( $stmt );
+  $sth->execute;
+  my $aref = $sth->fetchall_arrayref;
+
+  my @cols;
+  foreach my $row ( @$aref )
+  {
+    push @cols, $row->[0];
+  }
+
+  return join ( "\n  , ", @cols );
+}
+
+# sub _partition_key_columns
+#
+# Returns a formatted string containing the partitioning key columns
+#
+sub _partition_key_columns
+{
+  return _key_columns( @_, 'PART' );
+}
+
+# sub _range_partitions
+#
+# Returns the ordered list of index range partitions with segment attributes
+#
+sub _range_partitions
+{
+  my ( $owner, $index, $view, $subpartitioning_type, $caller ) = @_;
+
+  my $sql .= "(\n";
+  my $stmt =
+      "
+       SELECT
+              partition_name
+            , high_value
+            , 'N/A'                         AS cache
+            , 'N/A'                         AS pct_used
+            , pct_free
+            , ini_trans
+            , max_trans
+              -- Storage Clause
+            , initial_extent
+            , next_extent
+            , min_extent
+            , DECODE(
+                      max_extent
+                     ,2147483645,'unlimited'
+                     ,           max_extent
+                    )                       AS max_extents
+            , pct_increase
+            , NVL(freelists,1)
+            , NVL(freelist_groups,1)
+            , LOWER(buffer_pool)
+            , DECODE(
+                      logging 
+                     ,'NO','NOLOGGING'
+                     ,     'LOGGING'
+                    )                       AS logging
+            , tablespace_name
+            , leaf_blocks                   AS blocks
+       FROM
+              ${view}_ind_partitions
+       WHERE
+                  index_name =  UPPER('$index')
+      ";
+
+  if ( $view eq 'DBA' )
+  {
+    $stmt .=
+    "
+            AND index_owner = UPPER('$owner')
+    ";
+  }
+
+  $stmt .=
+      "
+       ORDER
+          BY
+              partition_name
+      ";
+
+  $dbh->{ LongReadLen } = 8192;    # Allows HIGH_VALUE length of 8K
+  $dbh->{ LongTruncOk } = 1;
+
+  $sth = $dbh->prepare( $stmt );
+  $sth->execute;
+  my $aref = $sth->fetchall_arrayref;
+
+  my $comma = '    ';
+
+  foreach my $row ( @$aref )
+  {
+    my $partition  = shift @$row;
+    my $high_value = shift @$row;
+
+    $sql .= "${comma}PARTITION \L$partition";
+
+    if ($caller ne 'LOCAL' )
+    {
+      $sql .= " VALUES LESS THAN\n" .
+              "      (\n" .
+              "        $high_value\n" .
+              "      )\n";
+    }
+    else
+    {
+      $sql .= "\n";
+    }
+
+    unshift @$row, ( '      ', 'INDEX' );
+
+    $sql .= _segment_attributes( $row );
+
+    if ( $subpartitioning_type eq 'HASH' )
+    {
+      $stmt =
+        "
+         SELECT
+                subpartition_name
+              , tablespace_name
+         FROM
+                ${view}_ind_subpartitions
+         WHERE
+                    index_name     =  UPPER('$index')
+                AND partition_name = '$partition'
+        ";
+
+      if ( $view eq 'DBA' )
+      {
+        $stmt .=
+        "
+                AND index_owner    = UPPER('$owner')
+        ";
+      }
+
+      $stmt .=
+        "
+         ORDER
+            BY
+                subpartition_name
+        ";
+
+      $sth = $dbh->prepare( $stmt );
+      $sth->execute;
+      my $aref = $sth->fetchall_arrayref;
+
+      $sql .= "        (\n            ";
+
+      my @cols;
+      foreach my $row ( @$aref )
+      {
+        push @cols, "SUBPARTITION \L$row->[0] \UTABLESPACE \L$row->[1]";
+      }
+      $sql .= join ( "\n          , ", @cols );
+
+      $sql .= "\n        )\n";
+    }
+
+    $comma = '  , ';
+  }
+  $sql .= ");\n\n";
+
+  return $sql;
+}
+
+# sub _resize_index
+#
+# Returns DDL to rebuild the named index or its partition(s) in the form of:
+#
+#     ALTER INDEX [schema.]<name> REBUILD
+#     [PARTITION <partition>]
+#     STORAGE
+#     (
+#       INITIAL  <bytes>
+#       NEXT     <bytes>
+#     )
+#
+sub _resize_index
+{
+  my ( $owner, $name, $type, $view ) = @_;
+
+  my $cnt;
+  my $sql;
+  my $schema = _set_schema( $owner );
+  ( $name, my $partition ) = split /:/, $name;
+
+  my $stmt =
+      "
+       SELECT
+              count(*) AS cnt
+       FROM
+              ${view}_indexes
+       WHERE
+                  index_name = UPPER('$name')
+      ";
+
+  if ( $view eq 'DBA' )
+  {
+    $stmt .= "AND owner      = UPPER('$owner')";
+  }
+
+  $sth = $dbh->prepare( $stmt );
+  $sth->execute;
+  $cnt = $sth->fetchrow_array;
+  die "Index \U$name \Ldoes not exist.\n\n" unless $cnt;
+
+  if ( $partition ) # User wants one partition resized
+  {
+    $stmt =
+        "
+         SELECT
+                count(*) AS cnt
+         FROM
+                ${view}_segments
+         WHERE
+                    segment_name   = UPPER('$name')
+                AND segment_type   = 'INDEX PARTITION'
+                AND partition_name = UPPER('$partition')
+        ";
+    if ( $view eq 'DBA' )
+    {
+      $stmt .= "AND owner          = UPPER('$owner')";
+    }
+
+    $sth = $dbh->prepare( $stmt );
+    $sth->execute;
+    $cnt = $sth->fetchrow_array;
+    die "Partition \U$partition \Lof \UI\Lndex \U$name \Ldoes not exist.\n\n"
+        unless $cnt;
+
+    $sql .= _resize_index_partition( $type,$owner,$name,$partition,$view );
+
+    return $sql;
+  }
+
+  # Find out if the object is partitioned
+
+  $stmt =
+      "
+       SELECT
+              partitioned
+       FROM
+              ${view}_indexes
+       WHERE
+                  index_name = UPPER('$name')
+      ";
+
+  if ( $view eq 'DBA' )
+  {
+    $stmt .= 
+      "
+              AND owner      = UPPER('$owner')
+      ";
+  }
+
+  $sth = $dbh->prepare( $stmt );
+  $sth->execute;
+  my $partitioned = $sth->fetchrow_array;
+
+  if ( $partitioned eq 'NO' )
+  {
+    $stmt =
+        "
+         SELECT
+                s.blocks
+              , s.initial_extent
+              , s.next_extent
+         FROM
+                ${view}_segments s
+         WHERE
+                    s.segment_name = UPPER('$name')
+                AND s.segment_type = 'INDEX'
+        ";
+    if ( $view eq 'DBA' )
+    {
+      $stmt .= 
+        "
+                AND s.owner        = UPPER('$owner')
+        ";
+    }
+    $sth = $dbh->prepare( $stmt );
+    $sth->execute;
+    my ( $blocks, $initial, $next ) = $sth->fetchrow_array;
+
+    ( $initial, $next ) = _initial_next( $blocks ) if $attr{ sizing };
+
+    $sql .= "PROMPT " .
+            "ALTER INDEX \L$schema$name \UREBUILD\n\n" .
+            "ALTER INDEX \L$schema$name \UREBUILD\n" .
+            "STORAGE\n" .
+            "(\n" .
+            "  INITIAL  $initial\n" .
+            "  NEXT     $next\n" .
+            ") ;\n\n";
+
+    return $sql;
+  }
+  else
+  {
+    # It's partitioned -- get list of partitions
+    # and call _resize_index_partition for each one
+    $stmt =
+        "
+         SELECT
+                partition_name
+         FROM
+                ${view}_segments
+         WHERE
+                    segment_name = UPPER('$name')
+                AND segment_type = 'INDEX PARTITION'
+        ";
+    if ( $view eq 'DBA' )
+    {
+      $stmt .= "AND owner        = UPPER('$owner')";
+    }
+    $stmt .=   
+        "ORDER
+            BY
+                partition_name
+        ";
+
+    $sth = $dbh->prepare( $stmt );
+    $sth->execute;
+    my $aref = $sth->fetchall_arrayref;
+
+    foreach my $row ( @$aref )
+    {
+      my ( $partition ) = @$row;
+      $sql .= _resize_index_partition( $type,$owner,$name,$partition,$view );
+    }
+
+    return $sql;
+  }
+}
+
+# sub _resize_index_partition
+#
+# Returns DDL to rebuild one partition of the named object in the form of:
+#
+#     ALTER INDEX [schema.]<name> REBUILD
+#     PARTITION <partition>
+#     STORAGE
+#     (
+#       INITIAL  <bytes>
+#       NEXT     <bytes>
+#     )
+#
+sub _resize_index_partition
+{
+  my ( $type, $owner, $name, $partition, $view ) = @_;
+
+  my $sql;
+  my $schema = _set_schema( $owner );
+
+  my $stmt =
+      "
+         SELECT
+                s.blocks
+              , s.initial_extent
+              , s.next_extent
+         FROM
+                ${view}_segments  s
+         WHERE
+                    s.segment_name = UPPER('$name')
+                AND s.segment_type = 'INDEX PARTITION'
+        ";
+    if ( $view eq 'DBA' )
+    {
+      $stmt .= "AND s.owner        = UPPER('$owner')
+               ";
+    }
+  $sth = $dbh->prepare( $stmt );
+  $sth->execute;
+  my ( $blocks, $initial, $next ) = $sth->fetchrow_array;
+
+  ( $initial, $next ) = _initial_next( $blocks ) if $attr{ sizing };
+
+  $sql .= "PROMPT " .
+          "ALTER INDEX \L$schema$name \UREBUILD\n\n" .
+          "ALTER INDEX \L$schema$name \UREBUILD\n" .
+          "PARTITION \U$partition\n" .
+          "STORAGE\n" .
+          "(\n" .
+          "  INITIAL  $initial\n" .
+          "  NEXT     $next\n" .
+          ") ;\n\n";
+
+  return $sql;
+}
+
+# sub _resize_table
+#
+# Returns DDL to rebuild the named table or its partition(s) in the form of:
+#
+#     ALTER TABLE [schema.]<name> MOVE
+#     [PARTITION <partition>]
+#     STORAGE
+#     (
+#       INITIAL  <bytes>
+#       NEXT     <bytes>
+#     )
+#
+sub _resize_table
+{
+  my ( $owner, $name, $type, $view ) = @_;
+
+  my $cnt;
+  my $sql;
+  my $schema = _set_schema( $owner );
+  ( $name, my $partition ) = split /:/, $name;
+
+  my $stmt =
+      "
+       SELECT
+              count(*) AS cnt
+       FROM
+              ${view}_tables
+       WHERE
+                  table_name = UPPER('$name')
+      ";
+
+  if ( $view eq 'DBA' )
+  {
+    $stmt .= "AND owner      = UPPER('$owner')";
+  }
+
+  $sth = $dbh->prepare( $stmt );
+  $sth->execute;
+  $cnt = $sth->fetchrow_array;
+  die "Table \U$name \Ldoes not exist.\n\n" unless $cnt;
+
+  if ( $partition ) # User wants one partition resized
+  {
+    $stmt =
+        "
+         SELECT
+                count(*) AS cnt
+         FROM
+                ${view}_segments
+         WHERE
+                    segment_name   = UPPER('$name')
+                AND segment_type   = 'TABLE PARTITION'
+                AND partition_name = UPPER('$partition')
+        ";
+    if ( $view eq 'DBA' )
+    {
+      $stmt .= "AND owner          = UPPER('$owner')";
+    }
+
+    $sth = $dbh->prepare( $stmt );
+    $sth->execute;
+    $cnt = $sth->fetchrow_array;
+    die "Partition \U$partition \Lof \UT\Lable \U$name \Ldoes not exist.\n\n"
+        unless $cnt;
+
+    $sql .= _resize_table_partition( $type,$owner,$name,$partition,$view );
+
+    return $sql;
+  }
+
+  # Find out if the object is partitioned
+
+  $stmt =
+      "
+       SELECT
+              partitioned
+       FROM
+              ${view}_tables
+       WHERE
+                  table_name = UPPER('$name')
+      ";
+
+  if ( $view eq 'DBA' )
+  {
+    $stmt .= "AND owner      = UPPER('$owner')";
+  }
+
+  $sth = $dbh->prepare( $stmt );
+  $sth->execute;
+  my $partitioned = $sth->fetchrow_array;
+
+  if ( $partitioned eq 'NO' )
+  {
+    $stmt =
+        "
+         SELECT
+                s.blocks - NVL(t.empty_blocks,0)
+              , s.initial_extent
+              , s.next_extent
+         FROM
+                ${view}_segments s
+              , ${view}_tables   t
+         WHERE
+                    s.segment_name = UPPER('$name')
+                AND s.segment_type = 'TABLE'
+                AND t.table_name   = s.segment_name
+        ";
+    if ( $view eq 'DBA' )
+    {
+      $stmt .= "AND s.owner        = UPPER('$owner')
+                AND t.owner        = s.owner
+               ";
+    }
+    $sth = $dbh->prepare( $stmt );
+    $sth->execute;
+    my ( $blocks, $initial, $next ) = $sth->fetchrow_array;
+
+    ( $initial, $next ) = _initial_next( $blocks ) if $attr{ sizing };
+
+    $sql .= "PROMPT " .
+            "ALTER TABLE \L$schema$name \UMOVE\n\n" .
+            "ALTER TABLE \L$schema$name \UMOVE\n" .
+            "STORAGE\n" .
+            "(\n" .
+            "  INITIAL  $initial\n" .
+            "  NEXT     $next\n" .
+            ") ;\n\n";
+
+    return $sql;
+  }
+  else
+  {
+    # It's partitioned -- get list of partitions
+    # and call _resize_table_partition for each one
+    $stmt =
+        "
+         SELECT
+                partition_name
+         FROM
+                ${view}_segments
+         WHERE
+                    segment_name = UPPER('$name')
+                AND segment_type = 'TABLE PARTITION'
+        ";
+    if ( $view eq 'DBA' )
+    {
+      $stmt .= "AND owner        = UPPER('$owner')";
+    }
+    $stmt .=   
+        "ORDER
+            BY
+                partition_name
+        ";
+
+    $sth = $dbh->prepare( $stmt );
+    $sth->execute;
+    my $aref = $sth->fetchall_arrayref;
+
+    foreach my $row ( @$aref )
+    {
+      my ( $partition ) = @$row;
+      $sql .= _resize_table_partition( $type,$owner,$name,$partition,$view );
+    }
+
+    return $sql;
+  }
+}
+
+# sub _resize_table_partition
+#
+# Returns DDL to rebuild one partition of the named object in the form of:
+#
+#     ALTER {INDEX|TABLE} [schema.]<name> {REBUILD|MOVE}
+#     PARTITION <partition>
+#     STORAGE
+#     (
+#       INITIAL  <bytes>
+#       NEXT     <bytes>
+#     )
+#
+sub _resize_table_partition
+{
+  my ( $type, $owner, $name, $partition, $view ) = @_;
+
+  my $sql;
+  my $schema = _set_schema( $owner );
+
+  my $stmt =
+      "
+         SELECT
+                s.blocks - NVL(t.empty_blocks,0)
+              , s.initial_extent
+              , s.next_extent
+         FROM
+                ${view}_segments         s
+              , ${view}_tab_partitions   t
+         WHERE
+                    s.segment_name = UPPER('$name')
+                AND s.segment_type = 'TABLE PARTITION'
+                AND t.table_name   = s.segment_name
+        ";
+    if ( $view eq 'DBA' )
+    {
+      $stmt .= "AND s.owner        = UPPER('$owner')
+                AND t.table_owner  = s.owner
+               ";
+    }
+
+  $sth = $dbh->prepare( $stmt );
+  $sth->execute;
+  my ( $blocks, $initial, $next ) = $sth->fetchrow_array;
+
+  ( $initial, $next ) = _initial_next( $blocks ) if $attr{ sizing };
+
+  $sql .= "PROMPT " .
+          "ALTER TABLE \L$schema$name \UMOVE\n\n" .
+          "ALTER TABLE \L$schema$name \UMOVE\n" .
+          "PARTITION \U$partition\n" .
+          "STORAGE\n" .
+          "(\n" .
+          "  INITIAL  $initial\n" .
+          "  NEXT     $next\n" .
+          ") ;\n\n";
+
+  return $sql;
+}
+
+# sub _segments_attributes
+#
+# Formats the segment attributes portion of CREATE TABLE and CREATE INDEX
+# statements
+#
+sub _segment_attributes
+{
+  my ( $arrayref ) = @_;
+
+  my $sql;
+  my (
+       $indent,
+       # Physical Properties
+       $organization,
+       # Segment Attributes
+       $cache,
+       $pct_used,
+       $pct_free,
+       $ini_trans,
+       $max_trans,
+       $initial,
+       $next,
+       $min_extents,
+       $max_extents,
+       $pct_increase,
+       $freelists,
+       $freelist_groups,
+       $buffer_pool,
+       $logging,
+       $tablespace,
+       $blocks,
+     ) = @$arrayref;
+
+  ( $initial, $next ) = _initial_next( $blocks ) if $attr{ sizing };
+
+  if ( $organization eq 'HEAP' )
+  {
+    $sql = "${indent}$cache\n" . 
+           "${indent}PCTUSED             $pct_used\n";
+  }
+
+  $sql .= "${indent}PCTFREE             $pct_free\n" .
+          "${indent}INITRANS            $ini_trans\n" .
+          "${indent}MAXTRANS            $max_trans\n" .
+          "${indent}STORAGE\n" .
+          "${indent}(\n" .
+          "${indent}  INITIAL           $initial\n" .
+          "${indent}  NEXT              $next\n" .
+          "${indent}  MINEXTENTS        $min_extents\n" .
+          "${indent}  MAXEXTENTS        $max_extents\n" .
+          "${indent}  PCTINCREASE       $pct_increase\n" .
+          "${indent}  FREELISTS         $freelists\n" .
+          "${indent}  FREELIST GROUPS   $freelist_groups\n" .
+          "${indent}  BUFFER_POOL       $buffer_pool\n" .
+          "${indent})\n" .
+          "${indent}$logging\n" .
+          "${indent}TABLESPACE          \L$tablespace\n";
+
+  return $sql;
+}
+
+sub _set_schema
+{
+  my $owner = shift;
+
+  my $schema = ( "\U$owner" eq 'PUBLIC' ) ? 'PUBLIC'               :
+               ( $attr{ schema } == 1   ) ? $owner . '.'           :
+               ( $attr{ schema } )        ? $attr{ schema }  . '.' : '';
+
+  return $schema;
+}
+
+# sub _set_sizing
+#
+# If %attr has an entry for "sizing" == l, generates an arbitrary sizing
+# algorithm wherein the database block size is used to create an array such
+# that each object will have no more than 8 extents.  The INITIAL and NEXT
+# sizes of Tables and Indexes are set to the calculated value.
+#
+# If %attr DOES contain an entry for "sizing", it is parsed and stored in the
+# array called @size_arr.
+#
+sub _set_sizing 
+{
+  $sth = $dbh->prepare(
+      "
+       SELECT
+              value
+       FROM
+              v\$parameter
+       WHERE
+              name = 'db_block_size'
+      ");
+
+  $sth->execute;
+  $block_size = $sth->fetchrow_array / 1024;
+
+  if ( $attr{ sizing } == 1 )
+  {
+    # Create default array
+    for my $i ( 0 .. 4 )
+    {
+      my $limit = ( 4 * ( 10 ** ( $i + 1 ) ) + 1 );
+      my $initial = my $next = ( 5 * $block_size ) * ( 10 ** $i ) . "K";
+      push @size_arr, [$limit, $initial, $next];
+    }
+    # Force upper limit bound
+    $size_arr[$#size_arr][0] = 'UNLIMITED';
+  }
+  elsif ( $attr{ sizing } )
+  {
+    # parse user supplied string into @size_arr
+    my $remainder = $attr{ sizing };
+    while ( $remainder ) 
+    {
+      ( my ($limit,$initial,$next),$remainder ) = split /:/, $remainder, 4;
+
+      die "\nSupplied sizing string is malformed.\n\n" unless $initial;
+      die "\nSupplied sizing string is malformed.\n\n" unless $next;
+
+      push @size_arr, [$limit, $initial, $next];
+    }
+    # Force upper limit bound
+    $size_arr[$#size_arr][0] = 'UNLIMITED';
+  }
+}
+
+#sub _subpartition_key_columns
+#
+# Returns a formatted string containing the subpartitioning key columns
+#
+sub _subpartition_key_columns
+{
+  return _key_columns( @_, 'SUBPART' );
+}
+
+# sub _table_columns
+#
+# Returns a formatted string containing the column names, datatype and
+# length, and NOT NULL (if appropriate) for use in a CREATE TABLE
+# statement.
+#
+sub _table_columns
+{
+  my ( $owner, $name, $view ) = @_;
+
+  my $stmt =
+      "
+       SELECT
+              RPAD(LOWER(column_name),32)
+           || RPAD(
+                   DECODE(
+                           data_type
+                          ,'NUMBER',DECODE(
+                                            data_precision
+                                           ,null,DECODE(
+                                                         data_scale
+                                                        ,0,'INTEGER'
+                                                        ,  'NUMBER  '
+                                                       )
+                                           ,'NUMBER  '
+                                          )
+                          ,'CHAR','CHAR    '
+                          ,data_type
+                         )
+                     || DECODE(
+                                data_type
+                               ,'DATE',null
+                               ,'LONG',null
+                               ,'NUMBER',DECODE(
+                                                 data_precision
+                                                ,null,null
+                                                ,'('
+                                               )
+                               ,DECODE(
+                                        data_type_owner
+                                       ,null,'('
+                                       ,null         -- user defined data type
+                                      )
+                              )
+                     || DECODE(
+                                data_type
+                               ,'CHAR'    ,data_length
+                               ,'VARCHAR2',data_length
+                               ,'NUMBER'  ,data_precision
+                               , null
+                              )
+                     || DECODE(
+                                data_type
+                               ,'NUMBER',DECODE(
+                                 data_precision
+                                ,null,null
+                                ,DECODE(
+                                         data_scale
+                                        ,null,null
+                                        ,0   ,null
+                                        ,',' || data_scale
+                                       )
+                                    )
+                              )
+                     || DECODE(
+                                data_type
+                               ,'DATE',null
+                               ,'LONG',null
+                               ,'NUMBER',DECODE(
+                                                 data_precision
+                                                ,null,null
+                                                ,')'
+                                               )
+                               ,DECODE(
+                                        data_type_owner
+                                       ,null,')'
+                                       ,null         -- user defined data type
+                                      )
+                              )
+                   ,32
+                  )
+           || DECODE(
+                      nullable
+                     ,'N','NOT NULL'
+                     ,     null
+                    )
+       FROM
+              ${view}_tab_columns
+       WHERE
+                  table_name = UPPER('$name')
+      ";
+
+  if ( $view eq 'DBA' )
+  {
+    $stmt .= "AND owner      = UPPER('$owner')";
+  }
+
+  $stmt .= 
+      "
+       ORDER
+          BY
+             column_id
+      ";
+
+  $sth = $dbh->prepare( $stmt );
+  $sth->execute;
+  my $aref = $sth->fetchall_arrayref;
+
+  my @cols;
+  foreach my $row ( @$aref )
+  {
+    push @cols, $row->[0];
+  }
+
+  return join ( "\n  , ", @cols ) . "\n";
+}
+
+1;
+
+__END__
+
+# $Log: Oracle.pm,v $
+# Revision 1.16  2000/11/05 18:50:00  rvsutherland
+# Added CREATE SEQUENCE.
+# Added CREATE SYNONYM.
+#
+# Revision 1.15  2000/11/05 03:48:41  rvsutherland
+# We've been having fun today!
+# Added CREATE FUNCTION
+# Added CREATE PACKAGE
+# Added CREATE PROCEDURE
+# Added CREATE ROLE
+# Added CREATE TABLESPACE
+# Added CREATE TYPE
+# Added CREATE VIEW
+#
+# Revision 1.14  2000/11/03 02:49:56  rvsutherland
+# Added correct file -- 1.13 did not contain all of the changes it claimed.
+# Version 0.07 now up to date.
+#
+# Revision 1.13  2000/11/03 02:33:23  rvsutherland  
+# Added COMMENT ON Tables and Columns  
+# Added CREATE TRIGGER  
+# Added ALTER TABLE ADD CONSTRAINT   
+# Added object type "table family" which creates all of the above 
+#   plus the table plus its indexes 
+#
+# Revision 1.12  2000/10/31 09:27:50  rvsutherland 
+# Added CREATE TRIGGER. 
+# This probably needs a LOT more testing. 
+#
+# Revision 1.11  2000/10/29 17:13:20  rvsutherland
+# Added CREATE USER.
+# Did the laundry, cleaned the kitchen.
+#
+# Revision 1.10  2000/10/28 20:24:31  rvsutherland
+# Added DESCRIPTION and SYNOPSIS to pod.
+# Modified Header to omit Schema for objects without such a beast.
+#
+# Revision 1.9  2000/10/28 18:11:25  rvsutherland
+# Added inadvertantly missing sub _drop_object.
+# Corrected bug in CREATE TABLE for IOT tables.
+#
+# Revision 1.8  2000/10/28 11:55:14  rvsutherland
+# Added CREATE INDEX for partitioned indexes.
+#
+# Revision 1.7  2000/10/25 01:12:16  rvsutherland
+# Added CREATE INDEX for non-partitioned tables.
+#
+# Revision 1.6  2000/10/24 16:53:14  rvsutherland
+# Added IOT partitioned tables.
+#
+# Revision 1.5  2000/10/24 13:57:40  rvsutherland
+# Added HASH partitioning (w/o subpartitioning).
+# Added IOT non-partitioned tables.
+#
+# Revision 1.4  2000/10/21 11:04:06  rvsutherland
+# Expanded header, added missing ORDER BY's, miscellaneous fussing.
+#
+# Revision 1.3  2000/10/21 00:17:37  rvsutherland
+# Added RANGE and RANGE/HASH partitioning to CREATE TABLE functionality.
+#
+# Revision 1.2  2000/10/18 22:35:09  rvsutherland
+# Added CREATE TABLE functionality for non-partitioned tables.
+#
+# Revision 1.1  2000/10/18 00:00:39  rvsutherland
+# Initial revision
+#
+
+=head1 NAME
+
+DDL::Oracle - a DDL generator for Oracle databases
+
+=head1 VERSION
+
+VERSION = 0.16
+
+=head1 SYNOPSIS
+
+ use DBI;
+ use DDL::Oracle;
+
+ my $dbh = DBI->connect(
+                         "dbi:Oracle:dbname",
+                         "username",
+                         "password",
+                         {
+                          PrintError => 0,
+                          RaiseError => 1
+                         }
+     );
+
+ # Use default resizing and schema options.
+ # query default DBA_xxx tables (could use USER_xxx for non-DBA types)
+ DDL::Oracle->configure( 
+                         dbh    => $dbh,
+                       );
+
+ # Create a list of one or more objects
+ my $sth = $dbh->prepare(
+        "SELECT
+                owner
+              , name
+         FROM
+                user_tables
+         WHERE
+                tablespace_name = 'MY_TBLSP'    -- your mileage may vary
+        "
+     );
+ $sth->execute;
+ my $list = $sth->fetchall_arrayref;
+
+ my $obj = DDL::Oracle->new(
+                             type  => 'table',
+                             list  => $list,                          );
+                           );
+
+ my $ddl = $obj->create;      # or $obj->resize;  or $obj->drop;  etc.
+
+ print $ddl;    # Use STDOUT so user can redirect to desired file.
+
+=head1 DESCRIPTION
+
+=head2 Overview
+
+Designed for Oracle DBA's and users.  It reverse engineers database
+objects (tables, indexes, users, profiles, tablespaces, roles, 
+constraints, etc.).  It generates DDL to *resize* tables and indexes 
+to the provided standard or to a user defined standard.
+
+We originally wrote a script to defrag tablespaces, but as DBA's 
+we regularly find a need for the DDL of a single object or a list 
+of objects (such as all of the indexes for a certain table).  So 
+we are in the process of taking all of the DDL statement creation 
+logic out of defrag.pl, and putting it into the general purpose 
+DDL::Oracle module, then expanding that to include tablespaces, 
+users, roles, and all other dictionary objects.
+
+Oracle tablespaces tend to become fragmented (now THAT's an 
+understatement).  Even when object sizing standards are adopted, 
+it is difficult to get 100% compliance from users.  And even if 
+you get a high degree of compliance, objects turn out to be a 
+different size than originally thought/planned -- small tables 
+grow to become large (i.e., hundreds of extents), what was thought 
+would be a large table ends up having only a few rows, etc.  So 
+the main driver for DDL::Oracle is the object management needs of 
+Oracle DBA's.  The "resize" method generates DDL for a list of 
+tables or indexes.  For partitioned objects, the "appropriate" 
+size of EACH partition is calculated and supplied in the generated 
+DDL.  The original defrag.pl will be rewritten to use DDL::Oracle, 
+and supplied with its distribution.
+
+Other uses.
+
+A hole in Oracle's Designer/2000 case tool is the DDL for changes 
+to a table's structure.  It produces reports of tables that change, 
+and handles adding columns if they are added to the end of the table. 
+Our data model czar has a penchant for adding columns in the MIDDLE 
+of the table (imagine that!).  This requires moving the data from the 
+old table to the new structure.  Designer/2000 supplies no assistance 
+for this situation.  DDL::Oracle will.
+
+Our user management mainly consists of creating a new user with the 
+identical privileges of an existing user, so a "copy_user.pl" wrapper 
+will supply this functionality.
+
+What if you have to create a copy of an instance for some reason -- a QA 
+database, or a new host?  Oracle's export utility can move the instance 
+objects if the new database exists, but it won't create the tablespaces 
+and their datafiles.  Our data warehouse databases have dozens of 
+tablespaces and hundreds of data files.  How do you create the DDL for 
+that?  DDL::Oracle will have this capability.
+
+DBA's, what are your suggestions?
+
+=head2 Initialization and Constructor 
+
+configure
+
+The B<configure> method is used to supply the DBI connection and to set
+several session level options.  These are:
+
+      dbh     A reference to a valid DBI connection (obtained via
+              DBI->connect).  This is a mandatory argument.
+
+              NOTE:  The user connecting MUST have SELECT privileges
+                     on the following (in addition to the DBA or USER
+                     views):
+
+                         V$INSTANCE
+                         V$PARAMETER
+
+      schema  Defines whether and what to use as the scema for DDL
+              on objects which use this syntax.  "1" means use the
+              owner of the object as the schema; "0" or "" means
+              omit the schema syntax; any other arbtrary string will
+              be imbedded in the DDL as the schema.  The default is "1".
+
+      sizing  Defines whether and what to use in resizing segments.
+              "1" means resize segments using the default algorithm;
+              "0" or "" means keep the current INITIAL and NEXT
+              values; any other string will be interpreted as a
+              sizing definition.  The default is "1".
+
+      view    Defines which Dictionary views to query:  DBA or USER
+             (e.g., DBA_TABLES or USER_TABLES).  The default is DBA.
+
+new  
+
+The B<new> method is the object constructor.  The two mandatory object
+definitions are supplied with this method, to wit:
+
+      type    The type of object (e.g., TABLE, INDEX, SYNONYM, family,
+              etc.).
+
+              For 'table family', supply the name(s) of tables -- the
+              DDL will include the table and its:
+                  Comments (Table and Column)
+                  Indexes
+                  Constraints
+                  Triggers
+
+      list    An arrayref to an array of arrayrefs (as in the DBI's 
+             "fetchall_arrayref" method) containing pairs of owner and
+              name.
+
+=head2 Object methods
+
+create
+
+The B<create> method generates the DDL to create the list of Oracle objects.
+
+drop
+
+The B<drop> method generates the DDL to drop the list of Oracle objects.
+
+resize
+
+The B<resize> method generates the DDL to resize the list of Oracle objects.
+The 'type' defined in the 'new' method is limited to 'index' and 'table'.
+For tables, this generates an ALTER TABLE MOVE statement; for indexes, it
+generates an ALTER INDEX REBUILD statement.  If the table or index is
+partitioned, then a statement for each partition is generated.
+
+To generate DDL for a single partition of an index or table, define the 'name'
+as a colon delimited field (e.g., 'name:partition'). 
+
+=head1 BUGS
+
+=head1 FILES
+
+=head1 AUTHOR
+
+ Richard V. Sutherland
+ rvsutherland@yahoo.com
+
+=head1 COPYRIGHT
+
+Copyright (c) 2000, Richard V. Sutherland.  All rights reserved.
+This module is free software.  It may be used, redistributed,
+and/or modified under the same terms as Perl itself.
+
+=cut
+

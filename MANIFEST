@@ -1,0 +1,8 @@
+MANIFEST
+README
+Makefile.PL
+Oracle.pm
+test.pl
+ddl.pl
+copy_user.pl
+copy_user.sh

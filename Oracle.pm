@@ -1,4 +1,4 @@
-# $Id: Oracle.pm,v 1.19 2000/11/19 20:11:24 rvsutherland Exp $ 
+# $Id: Oracle.pm,v 1.22 2000/12/02 14:08:45 rvsutherland Exp $ 
 #
 # Copyright (c) 2000 Richard Sutherland - United States of America
 #
@@ -9,7 +9,7 @@ require 5.004;
 
 BEGIN
 {
-  $DDL::Oracle::VERSION = "0.19"; # Also update version in pod text below!
+  $DDL::Oracle::VERSION = "0.22"; # Also update version in pod text below!
 }
 
 package DDL::Oracle;
@@ -30,6 +30,8 @@ my %create =
 (
   constraint             => \&_create_constraint,
  'database link'         => \&_create_db_link,
+ 'exchange index'        => \&_create_exchange_index,
+ 'exchange table'        => \&_create_exchange_table,
   function               => \&_create_function,
   index                  => \&_create_index,
   package                => \&_create_package,
@@ -468,6 +470,255 @@ sub _create_db_link
          "CREATE$is_public DATABASE LINK \L$name\n" .
          "CONNECT TO \L$user \UIDENTIFIED BY \L$password\n" .
          "USING '$host'\n" .
+         ";\n\n";
+}
+
+# sub _create_exchange_index
+#
+# Returns DDL to create a temporary table as a mirror of the named partition.
+# See sub _create_table for the format.  Physical attributes come from the
+# partition.
+#
+sub _create_exchange_index
+{
+  my ( $schema, $owner, $name, $view ) = @_;
+
+  ( $name, my $partition ) = split /:/, $name;
+
+  my $sql;
+  my $stmt =
+      "
+       SELECT
+              SUBSTR(segment_type,7)       AS type
+            , blocks
+       FROM
+              ${view}_segments
+       WHERE
+                  segment_name   = UPPER('$name')
+              AND partition_name = UPPER('$partition')
+      ";
+
+  if ( $view eq 'DBA' )
+  {
+    $stmt .=
+      "
+              AND owner          = UPPER('$owner')
+      ";
+  }
+
+  $sth = $dbh->prepare( $stmt );
+  $sth->execute;
+  my @row = $sth->fetchrow_array;
+  die "Partition \U$partition \Lof \EIndex \U$name \Ldoes not exist,\n"
+    unless @row;
+
+  my ( 
+       $type,
+       $blocks,
+     ) = @row;
+
+  $stmt =
+      "
+       SELECT
+              LTRIM(i.degree)
+            , LTRIM(i.instances)
+            , i.table_name
+            , DECODE(
+                      i.uniqueness
+                     ,'UNIQUE',' UNIQUE'
+                     ,null
+                    )                       AS uniqueness
+            , DECODE(
+                      i.index_type
+                     ,'BITMAP',' BITMAP'
+                     ,null
+                    )                       AS index_type
+              -- Physical Properties
+            , 'INDEX'                       AS organization
+              -- Segment Attributes
+            , 'N/A'                         AS cache
+            , 'N/A'                         AS pct_used
+            , p.pct_free
+            , DECODE(
+                      p.ini_trans
+                     ,0,1
+                     ,null,1
+                     ,p.ini_trans
+                    )                       AS ini_trans
+            , DECODE(
+                      p.max_trans
+                     ,0,255
+                     ,null,255
+                     ,p.max_trans
+                    )                       AS max_trans
+              -- Storage Clause
+            , p.initial_extent
+            , p.next_extent
+            , p.min_extent
+            , DECODE(
+                      p.max_extent
+                     ,2147483645,'unlimited'
+                     ,           p.max_extent
+                    )                       AS max_extent
+            , p.pct_increase
+            , NVL(p.freelists,1)
+            , NVL(p.freelist_groups,1)
+            , LOWER(p.buffer_pool)          AS buffer_pool
+            , DECODE(
+                      p.logging
+                     ,'NO','NOLOGGING'
+                     ,     'LOGGING'
+                    )                       AS logging
+            , LOWER(p.tablespace_name)      AS tablespace_name
+            , $blocks                       AS blocks
+       FROM
+              ${view}_indexes       i
+            , ${view}_ind_${type}s  p
+       WHERE
+                  p.index_name   = UPPER('$name')
+              AND p.${type}_name = UPPER('$partition')
+              AND i.index_name   = p.index_name
+      ";
+
+  if ( $view eq 'DBA' )
+  {
+    $stmt .=
+      "
+              AND p.index_owner  = UPPER('$owner')
+              AND i.owner        = p.index_owner
+      ";
+  }
+
+  $sth = $dbh->prepare( $stmt );
+  $sth->execute;
+  @row = $sth->fetchrow_array;
+
+  my $degree     = shift @row;
+  my $instances  = shift @row;
+  my $table      = shift @row;
+  my $unique     = shift @row;
+  my $bitmap     = shift @row;
+
+  $sql = "PROMPT " .
+         "CREATE$unique$bitmap INDEX \L$schema$name \UON \L$schema$table\n\n" .
+         "CREATE$unique$bitmap INDEX \L$schema$name \UON \L$schema$table\n" .
+         _index_columns( '', $owner, $name, $view, ) .
+         "PARALLEL\n" .
+         "(\n" .
+         "  DEGREE            $degree\n" .
+         "  INSTANCES         $instances\n" .
+         ")\n";
+
+  unshift @row, ( '' );        # Indent (none)
+
+  $sql .= _segment_attributes( \@row ) .
+          ";\n\n";
+
+  return $sql;
+}
+
+# sub _create_exchange_table
+#
+# Returns DDL to create a temporary table as a mirror of the named partition.
+# See sub _create_table for the format.  Physical attributes come from the
+# partition.
+#
+sub _create_exchange_table
+{
+  my ( $schema, $owner, $name, $view ) = @_;
+
+  ( $name, my $partition ) = split /:/, $name;
+
+  my $stmt =
+      "
+       SELECT
+              SUBSTR(segment_type,7)       AS type
+            , blocks
+       FROM
+              ${view}_segments
+       WHERE
+                  segment_name   = UPPER('$name')
+              AND partition_name = UPPER('$partition')
+      ";
+
+  if ( $view eq 'DBA' )
+  {
+    $stmt .=
+      "
+              AND owner          = UPPER('$owner')
+      ";
+  }
+
+  $sth = $dbh->prepare( $stmt );
+  $sth->execute;
+  my @row = $sth->fetchrow_array;
+  die "Partition \U$partition \Lof \ETable \U$name \Ldoes not exist,\n"
+    unless @row;
+
+  my ( 
+       $type,
+       $blocks,
+     ) = @row;
+
+  $stmt =
+      "
+       SELECT
+              DECODE(
+                      t.monitoring
+                     ,'NO','NOMONITORING'
+                     ,     'MONITORING'
+                    )                              AS monitoring
+            , t.table_name
+            , LTRIM(t.degree)                      AS degree
+            , LTRIM(t.instances)                   AS instances
+            , 'HEAP'                               AS organization
+            , DECODE(
+                      t.cache
+                     ,'y','CACHE'
+                     ,    'NOCACHE'
+                    )                              AS cache
+            , p.pct_used
+            , p.pct_free
+            , p.ini_trans
+            , p.max_trans
+            , p.initial_extent
+            , p.next_extent
+            , p.min_extent
+            , DECODE(
+                      p.max_extent
+                     ,2147483645,'unlimited'
+                     ,p.max_extent
+                    )                              AS max_extents
+            , p.pct_increase
+            , p.freelists
+            , p.freelist_groups
+            , LOWER(p.buffer_pool)                 AS buffer_pool
+            , DECODE(
+                      p.logging
+                     ,'NO','NOLOGGING'
+                     ,     'LOGGING'
+                    )                              AS logging
+            , LOWER(p.tablespace_name)             AS tablespace_name
+            , $blocks - NVL(p.empty_blocks,0)      AS blocks
+       FROM
+              dba_tables        t
+            , dba_tab_${type}s  p
+       WHERE
+                  p.table_name   = UPPER('$name')
+              AND p.${type}_name = UPPER('$partition')
+              AND t.table_name   = p.table_name
+      ";
+
+  if ( $view eq 'DBA' )
+  {
+    $stmt .=
+      "
+              AND p.table_owner    = UPPER('$owner')
+              AND t.owner          = p.table_owner
+      ";
+  }
+
+  return _create_table_text( $stmt, $schema, $owner, $name, $view ) .
          ";\n\n";
 }
 
@@ -3992,6 +4243,15 @@ sub _table_columns
 __END__
 
 # $Log: Oracle.pm,v $
+# Revision 1.22  2000/12/02 14:08:45  rvsutherland
+# Updated VERSION to 0.22, and declared Beta stage reached.
+#
+# Revision 1.21  2000/11/26 20:12:15  rvsutherland
+# Added method 'exchange index'.
+#
+# Revision 1.20  2000/11/24 18:41:45  rvsutherland
+# Added method 'exchange table'
+#
 # Revision 1.19  2000/11/19 20:11:24  rvsutherland
 # Fixed resize method to handle subpartitions.
 # Modified CHECK CONSTRAINTS -- was adding white space.
@@ -4076,7 +4336,7 @@ DDL::Oracle - a DDL generator for Oracle databases
 
 =head1 VERSION
 
-VERSION = 0.19
+VERSION = 0.22
 
 =head1 SYNOPSIS
 

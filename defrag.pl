@@ -1,6 +1,6 @@
 #! /usr/bin/perl -w
 
-# $Id: defrag.pl,v 1.4 2000/11/19 20:08:58 rvsutherland Exp $
+# $Id: defrag.pl,v 1.7 2000/12/02 14:06:20 rvsutherland Exp $
 #
 # Copyright (c) 2000 Richard Sutherland - United States of America
 #
@@ -16,17 +16,28 @@ use Getopt::Long;
 use strict;
 
 my %args;
+my %uniq;
 
 my @export_objects;
+my @export_temps;
 my @sizing_array;
 
+my $add_temp_log;
+my $add_temp_sql;
 my $alttblsp;
 my $aref;
 my $create_ndx_ddl;
 my $create_tbl_ddl;
+my $create_temp_ddl;
+my $date;
 my $dbh;
 my $drop_ddl;
+my $drop_temp_ddl;
+my $drop_temp_log;
+my $drop_temp_sql;
+my $exchange_query;
 my $expdir;
+my $gzip;
 my $home = $ENV{HOME}
         || $ENV{LOGDIR}
         || ( getpwuid($REAL_USER_ID) )[7]
@@ -36,16 +47,23 @@ my $iot_query;
 my $logdir;
 my $obj;
 my $other_constraints;
-my $partition_query_hash;
-my $partition_query_range;
 my $partitions;
 my $prefix;
+my $prttn_exp_log;
+my $prttn_exp_par;
+my $prttn_exp_text;
+my $prttn_imp_log;
+my $prttn_imp_par;
+my $prttn_imp_text;
 my $row;
+my $script;
+my $shell;
 my $sqldir;
 my $sth;
 my $stmt;
-my $tblsp;
 my $table_query;
+my $tblsp;
+my $text;
 my $user = getlogin
         || scalar getpwuid($REAL_USER_ID)
         || undef;
@@ -87,7 +105,6 @@ KEY: foreach my $key ( sort keys %args )
                     or $key eq "sqldir"
                     or $key eq "prefix"
                     or $key eq "expdir"
-                    or $key eq "partitions"
                     or $key eq "resize"
                   );
   print "$key = $args{ $key }\n";
@@ -96,6 +113,8 @@ KEY: foreach my $key ( sort keys %args )
 close RC or die "Can't close .defrag.rc:  $!\n";
 print "\n";
 
+########################################################################
+
 #
 # Now we're ready -- start dafriggin' defraggin'
 #
@@ -103,46 +122,123 @@ print "\n";
 print "Generating files to defrag Tablespace $tblsp.\n",
       "Using Tablespace $alttblsp for partition operations.\n\n";
 
-print "Working...\n";
+print "Working...\n\n";
 
 initialize_queries();
 
-# The 8 steps below issue queries comprised of 3 main queries, sometimes
-# doing UNIONs and/or MINUSes among them.  The queries are:.
+# The 9 steps below issue queries mostly comprised of 4 main queries,
+# sometimes doing UNIONs and/or MINUSes among them.
+# See sub 'initialize_queries' for the queries and their descriptions.
 #
-#    $table_auery - retrieves Owner/Name of all tables entirely contained
-#                   within the tablespace -- a non-partitioned table or a
-#                   partitioned table with *every* partition residing in
-#                   the tablespace.
-#    $iot_query   - same as $table)_query, but for IOT's
-#    $index_query - retrieves Owner/Index Name/Table Name for all indexes
-#                   not belonging to the tables above with at least one
-#                   segment within the tablespace.  Indexes do not have
-#                   syntax for partition exchanges, so we're going to drop
-#                   and recreate the entire index even if only one partition
-#                   is in the tablespace.
-# Note that for performance reasons, the queries consist of UNION ALLs and
-# may return duplicates.  Therefore the wrapper query will perform SELECT
-# DISTINCT's.
+
+# Step 1 - Export the stray partitions -- those in our tablespace whose
+#          table also has partitions in at least one other tablespace.
+#          Using this option, there will be 2 exports.  After the first
+#          export, for each such partition:
+#            a) Create a Temp table mirroring the partition.
+#            b) Create indexes on the Temp table matching the LOCAL 
+#               indexes on the partitioned table.
+#            c) Create a PK matching the PK of the partitioned table,
+#               if any.
+#            d) EXCHANGE the Temp table with the partition.
 #
-# The results of the generated DDL is stored in 1 or 2 of the variables
-# which will be written to the 3 SQL files.  These are:
+#          With the data now in the Temp table, the Temp table gets 
+#          treated the same as other regular tables in our tablespace
+#          (see Steps 2 - 9), but has added operations following the
+#          creation of its indexes (same as the LOCAL indexes on the 
+#          partition) and the addition of its PK (if any).
 #
-#     $drop_ddl       - Contains all of the DROP statements for Tables,
-#                       Indexes and Constraints.  This is designed to run
-#                       after the Export has been checked and OK'ed.
-#                       Triggers are not dropped, but are restored by the
-#                       Import.
-#     $create_tbl_ddl - Contains all of the CREATE statements for Tables.
-#                       This is run after the objects are dropped and the
-#                       tablespace is coalesced.
-#     $create_ndx_ddl - Contains all of the CREATE statemsnts for Indexes
-#                       and Constraints.  This is executed after the Import
-#                       (which allows the data to be imported into unindexed
-#                       tables).
+#            a) the Temp table does an EXCHANGE PARTITION so that the
+#               data (which was imported into the Temp table) rejoins
+#               the partitioned table.
+#            b) the [now empty] Temp table is DROPped.
+#
+#            c) REBUILD all Global indexes (if any) on the partitioned
+#               table(s).
+#
+#          NOTE:  Two 'fall back' scripts are created which are to be
+#                 used ONLY in the event that problems occur during
+#                 the CTAS step (Shell #2 when using this option).
+#
+#                  ***  DO NOT PROCEED IF Shell #2 HAS ERRORS ***
+#
+#                 Shells #8 and #9  will restore the data to the original
+#                 condition Their Steps are:
+#                   a) DROP the Temp table(s).
+#                   b) TRUNCATE the partitions
+#                   c) MOVE the partitions back to our tablespace
+#                   d) Import the data back into the partitions.
+#
+
+$sth = $dbh->prepare( $exchange_query );
+$sth->execute;
+$aref = $sth->fetchall_arrayref;
+
+foreach $row ( @$aref )
+{
+  my ( $owner, $table, $partition, $type ) = @$row;
+
+  $obj = DDL::Oracle->new(
+                           type => 'exchange table',
+                           list => [
+                                     [
+                                       "$owner",
+                                       "$table:$partition",
+                                     ]
+                                   ],
+                         );
+  my $create_tbl = $obj->create;
+  # Remove REM lines created by DDL::Oracle
+  $create_tbl = ( join "\n",grep !/^REM/,split /\n/,$create_tbl )."\n\n";
+
+  my $temp = "${tblsp}_${date}_" . unique_nbr();
+
+  push @export_temps,   "\L$owner.$table:$partition";
+  push @export_objects, "\L$owner.$temp";
+
+  # Change the CREATE TABLE statement to create the temp
+  $create_tbl =~ s|\L$owner.$table|\L$owner.$temp|g;
+
+  my $exchange = index_and_exchange( $temp, @$row );
+
+  $obj = DDL::Oracle->new(
+                           type => 'table',
+                           list => [
+                                     [
+                                       "$owner",
+                                       "$temp",
+                                     ]
+                                   ],
+                         );
+  my $drop_tbl = $obj->drop;
+  # Remove REM lines created by DDL::Oracle
+  $drop_tbl = ( join "\n", grep !/^REM/, split /\n/, $drop_tbl ) . "\n\n";
+
+  my $drop_temp = $drop_tbl .
+                  trunc( @$row ) .
+                  move ( @$row, $tblsp );
+
+  $create_temp_ddl  = group_header( 1 )   unless $create_temp_ddl;
+  $create_temp_ddl .= $create_tbl .
+                      $exchange .
+                      move ( @$row, $alttblsp );
+
+  $drop_ddl         = group_header( 2 )   unless $drop_ddl;
+  $drop_ddl        .= $drop_tbl;
+
+  $create_tbl_ddl   = group_header( 7 )   unless $create_tbl_ddl;
+  $create_tbl_ddl  .= $create_tbl;
+
+  $create_ndx_ddl   = group_header( 9 )   unless $create_ndx_ddl;
+  $create_ndx_ddl  .= $exchange .
+                      $drop_tbl;      
+
+  $drop_temp_ddl    = group_header( 15 )  unless $drop_temp_ddl;
+  $drop_temp_ddl   .= $drop_temp;
+}
 
 #
-# Step 1 - Drop all Foreign Keys referenceing our tables and IOT's or
+# Step 2 - Drop all Foreign Keys referenceing our tables and IOT's or
 #          referenceing the tables of our other indexes.  NOTE:  our
 #          indexes may not be the target of a foreign key, but for 
 #          simplicity purposes if the index's table holds said target
@@ -199,10 +295,11 @@ $obj = DDL::Oracle->new(
                          list => $fk_aref,
                        );
 
-$drop_ddl .= $obj->drop if @$fk_aref;
+$drop_ddl .= group_header( 3 ) .
+             $obj->drop            if @$fk_aref;
 
 #
-# Step 2 - Drop and create the tables.  NOTE:  the DROP statements are in
+# Step 3 - Drop and create the tables.  NOTE:  the DROP statements are in
 #          one file followed by coalesce tablespace statements, and the
 #          CREATE statements are put in a separate file.  The assumption
 #          here is that the user will verify that the drop and coalesce
@@ -229,24 +326,27 @@ $sth = $dbh->prepare( $stmt );
 $sth->execute;
 $aref = $sth->fetchall_arrayref;
 
-foreach $row ( @$aref )
-{
-  push @export_objects, "\L@$row->[0].@$row->[1]";
-}
-
-$obj = DDL::Oracle->new(
-                         type => 'table',
-                         list => $aref,
-                       );
-
 if ( @$aref )
 {
-  $drop_ddl       .= $obj->drop;
-  $create_tbl_ddl .= $obj->create;
+  foreach $row ( @$aref )
+  {
+    push @export_objects, "\L@$row->[0].@$row->[1]";
+  }
+
+  $obj = DDL::Oracle->new(
+                           type => 'table',
+                           list => $aref,
+                         );
+
+  $drop_ddl       .= group_header( 4 ) .
+                     $obj->drop;
+
+  $create_tbl_ddl .= group_header( 8 ) .
+                     $obj->create;
 }
 
 #
-# Step 3 - Drop all Primary Key, Unique and Check constraints on the tables
+# Step 4 - Drop all Primary Key, Unique and Check constraints on the tables
 #          of our indexes (those on our tables disappeared with the DROP
 #          TABLE statements).
 #
@@ -279,9 +379,7 @@ $stmt =
                                 MINUS
                                 (
                                   $table_query
-                                )
-                                MINUS
-                                (
+                                  UNION ALL
                                   $iot_query
                                 )
                               )
@@ -300,10 +398,11 @@ $obj = DDL::Oracle->new(
                          list => $aref,
                        );
 
-$drop_ddl .= $obj->drop if @$aref;
+$drop_ddl .= group_header( 5 ) .
+             $obj->drop          if @$aref;
 
 #
-# Step 4 - Drop all of our indexes, unless they are the supporting index
+# Step 5 - Drop all of our indexes, unless they are the supporting index
 #          of a Primary Key or Unique constraint -- these disappeared in
 #          the preceding step.  NOTE:  This will generate DROP INDEX
 #          statements for PK/UK's if the constraint name differs from the
@@ -353,10 +452,11 @@ $obj = DDL::Oracle->new(
                          list => $aref,
                        );
 
-$drop_ddl .= $obj->drop if @$aref;
+$drop_ddl .= group_header( 6 ) .
+             $obj->drop           if @$aref;
 
 #
-# Step 5 - Create ALL indexes.
+# Step 6 - Create ALL indexes.
 #
 
 $stmt =
@@ -382,10 +482,11 @@ $obj = DDL::Oracle->new(
                          list => $aref,
                        );
 
-$create_ndx_ddl .= $obj->create if @$aref;
+$create_ndx_ddl .= group_header( 10 ) .
+                   $obj->create         if @$aref;
 
 #
-# Step 6 - Create all Primary Key, Unique and Check constraints on our
+# Step 7 - Create all Primary Key, Unique and Check constraints on our
 #          tables and on the tables of our indexes.  NOTE:  do not create
 #          the constraints for the IOT tables -- their primary keys were
 #          defined in the CREATE TABLE statements.
@@ -448,10 +549,11 @@ $obj = DDL::Oracle->new(
                          list => \@constraints,
                        );
 
-$create_ndx_ddl .= $obj->create if @constraints;
+$create_ndx_ddl .= group_header( 11 ) .
+                   $obj->create          if @constraints;
 
 #
-# Step 7 - Create all Check constraints on our IOT tables (their PK was
+# Step 8 - Create all Check constraints on our IOT tables (their PK was
 #          part of the CREATE TABLE, and they can't have any other indexes,
 #          thus no UK's)
 #
@@ -501,12 +603,13 @@ $obj = DDL::Oracle->new(
                          list => \@constraints,
                        );
 
-$create_ndx_ddl .= $obj->create if @constraints;
+$create_ndx_ddl .= group_header( 12 ) .
+                   $obj->create           if @constraints;
 
 #
-# Step 8 - And finally, recreate all Foreign Keys referenceing our tables
-# and IOT's or referenceing the tables of our other indexes.  Use the 
-# same list used in Step 1 to drop them ($fk_aref).
+# Step 9 - Recreate all Foreign Keys referenceing our tables and IOT's or
+#          referenceing the tables of our other indexes.  Use the same list
+#          used in Step 2 to drop them ($fk_aref).
 #
 
 $obj = DDL::Oracle->new(
@@ -514,137 +617,56 @@ $obj = DDL::Oracle->new(
                          list => $fk_aref,
                        );
 
-$create_ndx_ddl .= $obj->create if @$fk_aref;
+$create_ndx_ddl .= group_header( 13 ) .
+                   $obj->create          if @$fk_aref;
 
 #
-# Actually, it's not final.  We still have to deal with individual partitions.
+# Step 10 - REBUILD all UNUSABLE indexes/index [sub]partitions.  Most likely,
+#           these are non-partitioned or Global partitioned indexes on THE
+#           PARTITIONS.
 #
 
-#
-# Step 9 - Export the stray partitions -- those in our tablespace whose
-#          table also has partitions in at least one other tablespace.
-#
-#          Then, handle them according the the 'partitions' argument
-#          (see Help for description)
-#
+$stmt =
+      "
+       SELECT
+              owner
+            , index_name
+       FROM
+              dba_indexes
+       WHERE
+                  status = 'UNUSABLE'
+       UNION ALL
+       SELECT
+              index_owner
+            , index_name || ':' || partition_name
+       FROM
+              dba_ind_partitions
+       WHERE
+              status = 'UNUSABLE'
+       UNION ALL
+       SELECT
+              index_owner
+            , index_name || ':' || subpartition_name
+       FROM
+              dba_ind_subpartitions
+       WHERE
+              status = 'UNUSABLE'
+       ORDER
+          BY
+              1, 2
+      ";
 
-$drop_ddl .= "REM\n" .
-             "REM The remaining DDL, if any, was generated " .
-             "and/or altered by $0\n" .
-             "REM\n\n";
-
-$create_tbl_ddl .= "REM\n" .
-                   "REM The remaining DDL, if any, was generated " .
-                   "and/or altered by $0\n" .
-                   "REM\n\n";
-
-#
-# Doing RANGE partitions first
-#
-
-my $sql;
-
-$sth  = $dbh->prepare( $partition_query_range );
+$sth = $dbh->prepare( $stmt );
 $sth->execute;
 $aref = $sth->fetchall_arrayref;
 
-foreach $row ( @$aref )
-{
-  push @export_objects, "\L@$row->[0].@$row->[1]:@$row->[2]";
-}
+$obj = DDL::Oracle->new(
+                         type => 'index',
+                         list => $aref,
+                       );
 
-if ( @$aref and $partitions eq 'resize' )
-{
-  foreach $row ( @$aref )
-  {
-    my ( $owner, $table, $partition, $type ) = @$row;
-
-    $sql .= "PROMPT " .
-            "ALTER TABLE \L$owner.$table \UTRUNCATE $type \L$partition  \n\n" .
-            "ALTER TABLE \L$owner.$table \UTRUNCATE $type \L$partition ;\n\n" .
-            "PROMPT " .
-            "ALTER TABLE \L$owner.$table \UMOVE $type \L$partition\n\n" .
-            "ALTER TABLE \L$owner.$table \UMOVE $type \L$partition\n" .
-            "TABLESPACE \L$alttblsp\n" .
-            "STORAGE\n" .
-            "(\n" .
-            "  INITIAL 2K\n" .
-            "  NEXT    2K\n" .
-            ") ;\n\n";
-  }
-  $drop_ddl .= $sql;
-
-  foreach $row ( @$aref )
-  {
-    my ( $owner, $table, $partition, $type ) = @$row;
-
-    $obj = DDL::Oracle->new(
-                             type => 'table',
-                             list => [
-                                       [
-                                         "$owner",
-                                         "$table:$partition",
-                                       ]
-                                     ],
-                           );
-    $sql =  $obj->resize;
-    $sql =~ s/STORAGE/TABLESPACE \L$tblsp\n\USTORAGE/g;
-
-    $create_tbl_ddl .= $sql;
-  }
-}
-elsif ( @$aref )    # Use Exchange method for handling partitions
-{
-  print "We need an Exchange method for handling partitions\n\n";
-}
-
-#
-# Now doing HASH partitions
-#
-
-$sth  = $dbh->prepare( $partition_query_hash );
-$sth->execute;
-$aref = $sth->fetchall_arrayref;
-
-foreach $row ( @$aref )
-{
-  push @export_objects, "\L@$row->[0].@$row->[1]:@$row->[2]";
-}
-
-if ( @$aref and $partitions eq 'resize' )
-{
-  foreach $row ( @$aref )
-  {
-    my ( $owner, $table, $partition, $type ) = @$row;
-
-    $sql .= "PROMPT " .
-            "ALTER TABLE \L$owner.$table \UTRUNCATE $type \L$partition  \n\n" .
-            "ALTER TABLE \L$owner.$table \UTRUNCATE $type \L$partition ;\n\n" .
-            "PROMPT " .
-            "ALTER TABLE \L$owner.$table \UMOVE $type \L$partition\n\n" .
-            "ALTER TABLE \L$owner.$table \UMOVE $type \L$partition\n" .
-            "TABLESPACE \L$alttblsp ;\n\n";
-  }
-  $drop_ddl .= $sql;
-
-  $sql = undef;
-  foreach $row ( @$aref )
-  {
-    my ( $owner, $table, $partition, $type ) = @$row;
-
-    $sql .= "PROMPT " .
-            "ALTER TABLE \L$owner.$table \UMOVE $type \L$partition\n\n" .
-            "ALTER TABLE \L$owner.$table \UMOVE $type \L$partition\n" .
-            "TABLESPACE \L$tblsp ;\n\n";
-  }
-  $create_tbl_ddl .= $sql;
-}
-elsif ( @$aref )    # Use Exchange method for handling partitions
-{
-  print "We need an Exchange method for handling partitions\n\n";
-}
-
-#here
+$create_ndx_ddl .= group_header( 14 ) .
+                   $obj->resize         if @$aref;
 
 #
 # It's hard to believe, but maybe they gave us an empty tablespace
@@ -656,7 +678,7 @@ die "\n***Error:  Tablespace $tblsp is empty.
      unless $create_tbl_ddl . $create_ndx_ddl;
 
 #
-# OK, so we're ligit.  Coalesce all data/index tablespaces
+# OK, we're ligit.  Coalesce all data/index tablespaces
 #
 
 $stmt =
@@ -699,168 +721,248 @@ foreach $row ( @$aref )
 # Wrap it up -- open, write and close all files
 #
 
-print "\n";
+if ( $create_temp_ddl )
+{
+  $add_temp_sql = "$sqldir/$prefix${tblsp}_add_temp.sql";
+  $add_temp_log = "$sqldir/$prefix${tblsp}_add_temp.log";
+  print "Create temps            : $add_temp_sql\n";
+  write_file( $add_temp_sql, $create_temp_ddl, 'REM' );
 
-my $drop_all_sql = $sqldir . '/' . $prefix . $tblsp . '_drop_all.sql';
-my $drop_all_log = $sqldir . '/' . $prefix . $tblsp . '_drop_all.log';
-print "Drop objects  is   :  $drop_all_sql\n";
-open DELALL, ">$drop_all_sql"     or die "Can't open $drop_all_sql: $!\n";
-write_header( \*DELALL, $drop_all_sql, 'REM' );
-print DELALL $drop_ddl;
-print DELALL "REM  --- END OF FILE ---\n\n";
-close DELALL                  or die "Can't close $drop_all_sql: $!\n";
+  $drop_temp_sql = "$sqldir/$prefix${tblsp}_drop_temp.sql";
+  $drop_temp_log = "$sqldir/$prefix${tblsp}_drop_temp.log";
+  print "Drop temps              : $drop_temp_sql\n";
+  write_file( $drop_temp_sql, $drop_temp_ddl, 'REM' );
+}
 
-my $add_tbl_sql = $sqldir . '/' . $prefix . $tblsp . '_add_tbl.sql';
-my $add_tbl_log = $sqldir . '/' . $prefix . $tblsp . '_add_tbl.log';
+my $drop_all_sql = "$sqldir/$prefix${tblsp}_drop_all.sql";
+my $drop_all_log = "$sqldir/$prefix${tblsp}_drop_all.log";
+print "Drop objects            : $drop_all_sql\n";
+write_file( $drop_all_sql, $drop_ddl, 'REM' );
 
-print "Create tables is   :  $add_tbl_sql\n";
-open ADDTBL, ">$add_tbl_sql"     or die "Can't open $add_tbl_sql: $!\n";
-write_header( \*ADDTBL, $add_tbl_sql, 'REM' );
-print ADDTBL $create_tbl_ddl;
-print ADDTBL "REM  --- END OF FILE ---\n\n";
-close ADDTBL                  or die "Can't close $add_tbl_sql: $!\n";
+my $add_tbl_sql = "$sqldir/$prefix${tblsp}_add_tbl.sql";
+my $add_tbl_log = "$sqldir/$prefix${tblsp}_add_tbl.log";
+print "Create tables           : $add_tbl_sql\n";
+write_file( $add_tbl_sql, $create_tbl_ddl, 'REM' );
 
-my $add_ndx_sql = $sqldir . '/' . $prefix . $tblsp . '_add_ndx.sql';
-my $add_ndx_log = $sqldir . '/' . $prefix . $tblsp . '_add_ndx.log';
+my $add_ndx_sql = "$sqldir/$prefix${tblsp}_add_ndx.sql";
+my $add_ndx_log = "$sqldir/$prefix${tblsp}_add_ndx.log";
+print "Create indexes          : $add_ndx_sql\n\n";
+write_file( $add_ndx_sql, $create_ndx_ddl, 'REM' );
 
-print "Create indexes is  :  $add_ndx_sql\n";
-open ADDNDX, ">$add_ndx_sql"     or die "Can't open $add_ndx_sql: $!\n";
-write_header( \*ADDNDX, $add_ndx_sql, 'REM' );
-print ADDNDX $create_ndx_ddl;
-print ADDNDX "REM  --- END OF FILE ---\n\n";
-close ADDNDX                  or die "Can't close $add_ndx_sql: $!\n";
-
-my $pipefile = $expdir . '/' . $prefix . $tblsp . '.pipe';
+my $pipefile = "$expdir/$prefix$tblsp.pipe";
 unlink $pipefile;
 eval { system ("mknod $pipefile p") };
 
-my $imp_par = $expdir . '/' . $prefix . $tblsp . '_imp.par';
-print "Import parfile is  :  $imp_par\n";
-open IMPPAR, ">$imp_par"     or die "Can't open $imp_par: $!\n";
-write_header(\*IMPPAR, $imp_par, '# ' );
-my $imp_log = $logdir . "/" . $prefix . $tblsp . "_imp.log";
-print "Import logfile is  :  $imp_log\n";
+if ( $create_temp_ddl )
+{
+  $prttn_exp_par  = "$expdir/prttn_$prefix${tblsp}_exp.par";
+  $prttn_exp_log  = "$logdir/prttn_$prefix${tblsp}_exp.log";
+  $prttn_exp_text = "log         = $prttn_exp_log\n" .
+                    "file        = $pipefile\n" .
+                    "rows        = y\n" .
+                    "grants      = y\n" .
+                    "#direct      = y\n" .   # Has bug on Import??
+                    "buffer      = 65536\n" .
+                    "indexes     = n\n" .
+                    "compress    = n\n" .
+                    "triggers    = y\n" .
+                    "constraints = n\n" .
+                    "tables      = (\n" .
+                    "                  " .
+                    join ( "\n                , ", @export_temps ) .
+                    "\n              )\n\n";
 
-print IMPPAR "log         = $imp_log\n",
-             "file        = $pipefile\n",
-             "rows        = y\n",
-             "commit      = y\n",
-             "ignore      = y\n",
-             "buffer      = 65536\n",
-             "analyze     = n\n",
-             "full        = y\n\n",
-             "#tables      = (\n",
-             "#                  ",
-             join ( "\n#                , ", @export_objects ),
-             "\n#              )\n\n",
-             "#  --- END OF FILE ---\n\n";
-close IMPPAR                  or die "Can't close $imp_par: $!\n";
+  print "Partition Export parfile: $prttn_exp_par\n";
+  print "Partition Export logfile: $prttn_exp_log\n";
+  write_file( $prttn_exp_par, $prttn_exp_text, '#' );
 
-my $exp_par = $expdir . '/' . $prefix . $tblsp . '_exp.par';
-print "Export parfile is  :  $exp_par\n";
-open EXPPAR, ">$exp_par"     or die "Can't open $exp_par: $!\n";
-write_header(\*EXPPAR, $exp_par, '# ' );
-my $exp_log = $logdir . "/" . $prefix . $tblsp . "_exp.log";
-print "Export logfile is  :  $exp_log\n";
+  $prttn_imp_par  = "$expdir/prttn_$prefix${tblsp}_imp.par";
+  $prttn_imp_log  = "$logdir/prttn_$prefix${tblsp}_imp.log";
+  $prttn_imp_text = "log         = $prttn_imp_log\n" .
+                    "file        = $pipefile\n" .
+                    "rows        = y\n" .
+                    "commit      = y\n" .
+                    "ignore      = y\n" .
+                    "buffer      = 65536\n" .
+                    "analyze     = n\n" .
+                    "full        = y\n\n" .
+                    "#tables      = (\n" .
+                    "#                  " .
+                    join ( "\n#                , ", @export_temps ) .
+                    "\n#              )\n\n";
 
-print EXPPAR "log         = $exp_log\n",
-             "file        = $pipefile\n",
-             "rows        = y\n",
-             "grants      = y\n",
-             "#direct      = y\n",   # Has bug on Import??
-             "buffer      = 65536\n",
-             "indexes     = n\n",
-             "compress    = n\n",
-             "triggers    = y\n",
-             "constraints = n\n",
-             "tables      = (\n",
-             "                  ",
-             join ( "\n                , ", @export_objects ),
-             "\n              )\n\n",
-             "#  --- END OF FILE ---\n\n";
-close EXPPAR                  or die "Can't close $exp_par: $!\n";
+  print "Partition Import parfile: $prttn_imp_par\n";
+  print "Partition Import logfile: $prttn_imp_log\n\n";
+  write_file( $prttn_imp_par, $prttn_imp_text, '#' );
+}
 
-print "Export FIFO pipe is:  $pipefile\n";
+my $exp_par  = "$expdir/$prefix${tblsp}_exp.par";
+my $exp_log  = "$logdir/$prefix${tblsp}_exp.log";
+my $exp_text = "log         = $exp_log\n" .
+               "file        = $pipefile\n" .
+               "rows        = y\n" .
+               "grants      = y\n" .
+               "#direct      = y\n" .   # Has bug on Import??
+               "buffer      = 65536\n" .
+               "indexes     = n\n" .
+               "compress    = n\n" .
+               "triggers    = y\n" .
+               "constraints = n\n" .
+               "tables      = (\n" .
+               "                  " .
+               join ( "\n                , ", @export_objects ) .
+               "\n              )\n\n";
+
+print "Table Export parfile    : $exp_par\n";
+print "Table Export logfile    : $exp_log\n";
+write_file( $exp_par, $exp_text, '#' );
+
+my $imp_par  = "$expdir/$prefix${tblsp}_imp.par";
+my $imp_log  = "$logdir/$prefix${tblsp}_imp.log";
+my $imp_text = "log         = $imp_log\n" .
+               "file        = $pipefile\n" .
+               "rows        = y\n" .
+               "commit      = y\n" .
+               "ignore      = y\n" .
+               "buffer      = 65536\n" .
+               "analyze     = n\n" .
+               "full        = y\n\n" .
+               "#tables      = (\n" .
+               "#                  " .
+               join ( "\n#                , ", @export_objects ) .
+               "\n#              )\n\n";
+
+print "Table Import parfile    : $imp_par\n";
+print "Table Import logfile    : $imp_log\n\n";
+write_file( $imp_par, $imp_text, '#' );
+
+print "Export FIFO pipe        : $pipefile\n\n";
 
 #
 # And, finally, the little shell scripts to help with the driving
 #
 
+my $i = 0;
 print "\n";
-my $shell = $sqldir . '/' . $prefix . $tblsp . '.sh';
-my $gzip = $expdir . '/' . $prefix . $tblsp . '.dmp.gz';
 
-my $script = "${shell}1";
-print "Shell #1 is $script\n";
-open SHELL, ">$script"     or die "Can't open $script: $!\n";
-write_header( \*SHELL, $script, '# ' );
-print SHELL
-  "# Step 1 -- Export the tables in Tablespace $tblsp\n\n",
-  "nohup cat $pipefile | gzip -c \\\n",
-  "        > $gzip &\n\n",
-  "exp / parfile = $exp_par\n\n",
-  "#  --- END OF FILE ---\n\n";
-close SHELL                  or die "Can't close $script: $!\n";
-chmod( 0754, $script ) == 1 or die "\nCan't chmod $script: $!\n";
+$shell = "$sqldir/$prefix$tblsp.sh";
 
-$script = "${shell}2";
-print "Shell #2 is $script\n";
-open SHELL, ">$script"     or die "Can't open $script: $!\n";
-write_header( \*SHELL, $script, '# ' );
-print SHELL
-  "# Step 2 -- Use SQL*Plus to run $drop_all_sql\n",
-  "#           which will drop all objects in tablespace $tblsp\n\n",
-  "sqlplus -s / << EOF\n\n",
-  "   SPOOL $drop_all_log\n\n",
-  "   @ $drop_all_sql\n\n",
-  "EOF\n\n",
-  "#  --- END OF FILE ---\n\n";
-close SHELL                  or die "Can't close $script: $!\n";
-chmod( 0754, $script ) == 1 or die "\nCan't chmod $script: $!\n";
+if ( $create_temp_ddl )
+{
+  $gzip  = "$expdir/prttn_$prefix$tblsp.dmp.gz";
 
-$script = "${shell}3";
-print "Shell #3 is $script\n";
-open SHELL, ">$script"     or die "Can't open $script: $!\n";
-write_header( \*SHELL, $script, '# ' );
-print SHELL
-  "# Step 3 -- Use SQL*Plus to run $add_tbl_sql\n",
-  "#           which will recreate all tables in tablespace $tblsp\n\n",
-  "sqlplus -s / << EOF\n\n",
-  "   SPOOL $add_tbl_log\n\n",
-  "   @ $add_tbl_sql\n\n",
-  "EOF\n\n",
-  "#  --- END OF FILE ---\n\n";
-close SHELL                  or die "Can't close $script: $!\n";
-chmod( 0754, $script ) == 1 or die "\nCan't chmod $script: $!\n";
+  $script = $shell . ++$i;
+  $text =
+    "# Step $i -- Export the partitions in Tablespace $tblsp\n\n" .
+    "nohup cat $pipefile | gzip -c \\\n" .
+    "        > $gzip &\n\n" .
+    "exp / parfile = $prttn_exp_par\n\n";
+  create_shell( $script, $text );
 
-$script = "${shell}4";
-print "Shell #4 is $script\n";
-open SHELL, ">$script"     or die "Can't open $script: $!\n";
-write_header( \*SHELL, $script, '# ' );
-print SHELL
-  "# Step 4 -- Import the tables back into Tablespace $tblsp\n\n",
-  "nohup gunzip -c $gzip \\\n",
-  "              > $pipefile &\n\n",
-  "imp / parfile = $imp_par\n\n",
-  "#  --- END OF FILE ---\n\n";
-close SHELL                  or die "Can't close $script: $!\n";
-chmod( 0754, $script ) == 1 or die "\nCan't chmod $script: $!\n";
+  $script = $shell . ++$i;
+  $text =
+    "# Step $i -- Use SQL*Plus to run $add_temp_sql\n" .
+    "#           which will create temp tables for partitions " .
+    "in tablespace $tblsp\n\n" .
+    "sqlplus -s / << EOF\n\n" .
+    "   SPOOL $add_temp_log\n\n" .
+    "   @ $add_temp_sql\n\n" .
+    "EOF\n\n";
+  create_shell( $script, $text );
+}
 
-$script = "${shell}5";
-print "Shell #5 is $script\n";
-open SHELL, ">$script"     or die "Can't open $script: $!\n";
-write_header( \*SHELL, $script, '# ' );
-print SHELL
-  "# Step 5 -- Use SQL*Plus to run $add_ndx_sql\n",
-  "#           which will recreate all indexes/constraints ",
-  "in tablespace $tblsp\n\n",
-  "sqlplus -s / << EOF\n\n",
-  "   SPOOL $add_ndx_log\n\n",
-  "   @ $add_ndx_sql\n\n",
-  "EOF\n\n",
-  "#  --- END OF FILE ---\n\n";
-close SHELL                  or die "Can't close $script: $!\n";
-chmod( 0754, $script ) == 1 or die "\nCan't chmod $script: $!\n";
+$gzip  = "$expdir/$prefix$tblsp.dmp.gz";
+
+$script = $shell . ++$i;
+$text =
+  "# Step $i -- Export the tables in Tablespace $tblsp\n\n" .
+  "nohup cat $pipefile | gzip -c \\\n" .
+  "        > $gzip &\n\n" .
+  "exp / parfile = $exp_par\n\n";
+create_shell( $script, $text );
+
+$script = $shell . ++$i;
+$text =
+  "# Step $i -- Use SQL*Plus to run $drop_all_sql\n" .
+  "#           which will drop all objects in tablespace $tblsp\n\n" .
+  "sqlplus -s / << EOF\n\n" .
+  "   SPOOL $drop_all_log\n\n" .
+  "   @ $drop_all_sql\n\n" .
+  "EOF\n\n";
+create_shell( $script, $text );
+
+$script = $shell . ++$i;
+$text =
+  "# Step $i -- Use SQL*Plus to run $add_tbl_sql\n".
+  "#           which will recreate all tables in tablespace $tblsp\n\n" .
+  "sqlplus -s / << EOF\n\n" .
+  "   SPOOL $add_tbl_log\n\n" .
+  "   @ $add_tbl_sql\n\n" .
+  "EOF\n\n";
+create_shell( $script, $text );
+
+$script = $shell . ++$i;
+$text =
+  "# Step $i -- Import the tables back into Tablespace $tblsp\n\n" .
+  "nohup gunzip -c $gzip \\\n" .
+  "              > $pipefile &\n\n" .
+  "imp / parfile = $imp_par\n\n";
+create_shell( $script, $text );
+
+$script = $shell . ++$i;
+$text =
+  "# Step $i -- Use SQL*Plus to run $add_ndx_sql\n" .
+  "#           which will recreate all indexes/constraints " .
+  "in tablespace $tblsp\n\n" .
+  "sqlplus -s / << EOF\n\n" .
+  "   SPOOL $add_ndx_log\n\n" .
+  "   @ $add_ndx_sql\n\n" .
+  "EOF\n\n";
+create_shell( $script, $text );
+
+if ( $create_temp_ddl )
+{
+  $gzip  = "$expdir/prttn_$prefix$tblsp.dmp.gz";
+
+  print "\n*** The following 2 scripts ARE FOR FALLBACK PURPOSES ONLY!!\n" .
+        "*** Use these scripts ONLY IF Shell #2 HAD ERRORS.\n\n";
+
+  $script = $shell . ++$i;
+  $text =
+    "# USE FOR FALLBACK PURPOSES ONLY\n\n" .
+    "# Use SQL*Plus to run $drop_temp_sql\n" .
+    "# which will drop the temp tables holding data for partitions " .
+    "in tablespace $tblsp\n\n" .
+    "sqlplus -s / << EOF\n\n" .
+    "   SPOOL $drop_temp_log\n\n" .
+    "   @ $drop_temp_sql\n\n" .
+    "EOF\n\n";
+  create_shell( $script, $text );
+
+  $script = $shell . ++$i;
+  $text =
+    "# USE FOR FALLBACK PURPOSES ONLY\n\n" .
+    "#Import the tables back into the partitions in " .
+    "Tablespace $tblsp\n\n" .
+    "echo\n" .
+    "echo \"**************** NOTICE ***************\"\n" .
+    "echo\n" .
+    "echo Ignore warnings about missing partitions -- because not\n" .
+    "echo all partitions were exported, and thus not all partitions\n" .
+    "echo need be re-imported.\n" .
+    "echo The error to be ignored is:\n" .
+    "echo\n" .
+    "echo \"   IMP-00057: Warning: Dump file may not contain data of all partitions...\"\n" .
+    "echo\n" .
+    "echo \"************ END OF NOTICE ************\"\n\n" .
+    "nohup gunzip -c $gzip \\\n" .
+    "              > $pipefile &\n\n" .
+    "imp / parfile = $prttn_imp_par\n\n";
+  create_shell( $script, $text );
+}
+
+my @shells = glob("$sqldir/$prefix$tblsp.sh?");
+chmod( 0754, @shells ) == @shells or die "\nCan't chmod some shells: $!\n";
 
 print "\n$0 completed successfully\non ", scalar localtime,"\n\n";
 
@@ -908,6 +1010,21 @@ sub connect_to_oracle
                         );
 }
 
+# sub create_shell
+#
+# Opens, writes $text, closes the named shell script
+#
+sub create_shell
+{
+  my ( $script, $text ) = @_;
+
+  print "Shell #$i is $script\n";
+  open SHELL, ">$script"     or die "Can't open $script: $!\n";
+  write_header( \*SHELL, $script, '# ' );
+  print SHELL $text . "#  --- END OF FILE ---\n\n";
+  close SHELL                  or die "Can't close $script: $!\n";
+}
+
 # sub get_args
 #
 # Uses supplied module Getopt::Long to place command line options into the
@@ -924,7 +1041,6 @@ sub get_args
               "alttablespace:s",
               "expdir:s",
               "logdir:s",
-              "partitions:s",
               "password:s",
               "prefix:s",
               "sid:s",
@@ -965,9 +1081,6 @@ sub get_args
   $tblsp = uc( $args{ tablespace } ) or
   die "\n***Error:  You must specify --tablespace=<NAME>\n",
       "$0 aborted,\n\n";
-
-  $partitions = ( lc( $args{ partitions } ) eq 'resize' ? 'resize' 
-                                                        : 'exchange' );
 
   $alttblsp = uc( $args{ alttablespace } );
 
@@ -1068,6 +1181,145 @@ sub get_args
   $aref = $sth->fetchall_arrayref;
 
   $alttblsp = ( shift @$aref )->[0];
+
+  my ( undef,undef,undef,$day,$month,$year,undef,undef,undef ) = localtime;
+  $date = $year + 1900 . $month + 1 . $day;
+}
+
+# sub group_header
+#
+# Returns a Remark to identify the ensuing DDL statements
+#
+sub group_header
+{
+  my ( $nbr ) = @_;
+
+  return 'REM ' . '#' x 60 . "\n" .
+         "REM\n" .
+         "REM                      Statement Group $nbr\n" .
+         "REM\n" .
+         'REM ' . '#' x 60 . "\n\n";
+}
+
+# sub index_and_exchange
+#
+# Generate the DDL to:
+#
+# 1.  Create an index on named temp table equal to every LOCAL index on the
+#     named partitioned table.
+# 2.  Create a PK for the temp table equal to the PK of the partitioned table,
+#     if any.
+# 3.  Exchange the temp table with the named partition.
+#
+sub index_and_exchange
+{
+  my ( $temp, $owner, $table, $partition, $type ) = @_;
+
+  my $sql;
+  my $text;
+
+  # Get partitioned, local indexes
+  $stmt =
+      "
+       SELECT DISTINCT
+              index_name
+       FROM
+              dba_segments  s
+            , dba_indexes   i
+       WHERE
+                  i.owner           = UPPER('$owner')
+              AND i.table_name      = UPPER('$table')
+              AND s.owner           = i.owner
+              AND s.segment_name    = i.index_name
+              AND s.segment_type LIKE 'INDEX%PARTITION'
+              AND NOT EXISTS (
+                               SELECT
+                                      null
+                               FROM
+                                      dba_part_indexes
+                               WHERE
+                                          owner      = i.owner
+                                      AND index_name = i.index_name
+                                      AND locality   = 'GLOBAL'
+                             )
+      ";
+
+  $sth = $dbh->prepare( $stmt );
+  $sth->execute;
+  $aref = $sth->fetchall_arrayref;
+
+  foreach $row( @$aref )
+  {
+    my $index = @$row->[0];
+
+    $obj = DDL::Oracle->new(
+                             type => 'exchange index',
+                             list => [
+                                       [
+                                         "$owner",
+                                         "$index:$partition",
+                                       ]
+                                     ],
+                           );
+    my $sql = $obj->create;
+    # Remove REM lines created by DDL::Oracle
+    $sql =  ( join "\n", grep !/^REM/, split /\n/, $sql ) . "\n\n";
+
+    my $indx =  "${tblsp}_${date}_" . unique_nbr();
+    $sql     =~ s|\L$owner.$index|\L$owner.$indx|g;
+    $sql     =~ s|\L$owner.$table|\L$owner.$temp|g;
+
+    $text .= $sql;
+  }
+
+  $stmt =
+      "
+       SELECT
+              constraint_name
+       FROM
+              dba_constraints
+       WHERE
+                  owner      = UPPER('$owner')
+              AND table_name = UPPER('$table')
+              AND constraint_type = 'P'
+      ";
+
+  $sth = $dbh->prepare( $stmt );
+  $sth->execute;
+  my @row = $sth->fetchrow_array;
+
+  if ( @row )
+  {
+    my ( $constraint ) = @row;
+
+    $obj = DDL::Oracle->new(
+                             type => 'constraint',
+                             list => [
+                                       [
+                                         "$owner",
+                                         "$constraint",
+                                       ]
+                                     ],
+                           );
+    my $sql = $obj->create;
+    # Remove REM lines created by DDL::Oracle
+    $sql =  ( join "\n", grep !/^REM/, split /\n/, $sql ) . "\n\n";
+
+    my $cons =  "${tblsp}_${date}_" . unique_nbr();
+    $sql     =~ s|\L$owner.$table|\L$owner.$temp|g;
+    $sql     =~ s|\L$constraint|\L$cons|g;
+
+    $text .= $sql;
+  }
+
+  $text .= "PROMPT " .
+           "ALTER TABLE \L$owner.$table \UEXCHANGE $type \L$partition\n\n" .
+           "ALTER TABLE \L$owner.$table\n" .
+           "   \UEXCHANGE $type \L$partition \UWITH TABLE \L$temp\n" .
+           "   INCLUDING INDEXES\n".
+           "   WITHOUT VALIDATION ;\n\n";
+
+  return $text;
 }
 
 # sub initialize_queries
@@ -1077,6 +1329,45 @@ sub get_args
 #
 sub initialize_queries
 {
+  # This query produces a list of THE PARTITIONS, which are the partitions
+  # in THE TABLESPACE belonging to tables which have at least one partition
+  # in some other tablespace.  These will be the target of ALTER TABLE
+  # EXCHANGE [SUB]PARTITION statements with "temp" tables.
+  #
+  $exchange_query =
+      "
+       SELECT
+              owner
+            , segment_name
+            , partition_name
+            , SUBSTR(segment_type,7)       AS segment_type
+       FROM
+              dba_segments  s
+       WHERE
+                  segment_type LIKE 'TABLE%PARTITION'
+              AND tablespace_name = '$tblsp'
+              AND EXISTS (
+                           SELECT
+                                  null
+                           FROM
+                                  dba_segments
+                           WHERE
+                                      segment_type  LIKE 'TABLE%PARTITION'
+                                  AND tablespace_name <> '$tblsp'
+                                  AND owner            = s.owner
+                                  AND segment_name     = s.segment_name
+                         )
+       ORDER
+          BY
+              1, 2, 3
+      ";
+
+  # This query produces a list of THE INDEXES (and their tables) -- those
+  # non-partitioned indexes which reside in THE TABLESPACE, plus indexes 
+  # which have at least one partition in THE TABLESPACE.  These indexes are
+  # on tables other than the tables of THE PARTITIONS but may me on THE
+  # TABLES.
+  #
   $index_query =
       "
        SELECT
@@ -1084,38 +1375,65 @@ sub initialize_queries
             , index_name
             , table_name
        FROM
-              dba_indexes
+            (
+              SELECT
+                     owner
+                   , index_name
+                   , table_name
+              FROM
+                     dba_indexes
+              WHERE
+                         tablespace_name = '$tblsp'
+                     AND index_type     <> 'IOT - TOP'
+              UNION ALL
+              SELECT
+                     i.owner
+                   , i.index_name
+                   , i.table_name
+              FROM
+                     dba_indexes         i
+                   , dba_ind_partitions  p
+              WHERE
+                         p.tablespace_name = '$tblsp'
+                     AND i.owner           = p.index_owner
+                     AND i.index_name      = p.index_name
+                     AND i.index_type     <> 'IOT - TOP'
+              UNION ALL
+              SELECT
+                     i.owner
+                   , i.index_name
+                   , i.table_name
+              FROM
+                     dba_indexes            i
+                   , dba_ind_subpartitions  p
+              WHERE
+                         p.tablespace_name = '$tblsp'
+                     AND i.owner           = p.index_owner
+                     AND i.index_name      = p.index_name
+                     AND i.index_type      <> 'IOT - TOP'
+            )
        WHERE
-                  tablespace_name = '$tblsp'
-              AND index_type     <> 'IOT - TOP'
-       UNION ALL
-       SELECT
-              i.owner
-            , i.index_name
-            , i.table_name
-       FROM
-              dba_indexes         i
-            , dba_ind_partitions  p
-       WHERE
-                  p.tablespace_name = '$tblsp'
-              AND i.owner           = p.index_owner
-              AND i.index_name      = p.index_name
-              AND index_type       <> 'IOT - TOP'
-       UNION ALL
-       SELECT
-              i.owner
-            , i.index_name
-            , i.table_name
-       FROM
-              dba_indexes            i
-            , dba_ind_subpartitions  p
-       WHERE
-                  p.tablespace_name = '$tblsp'
-              AND i.owner           = p.index_owner
-              AND i.index_name      = p.index_name
-              AND index_type       <> 'IOT - TOP'
+             (
+                 owner
+               , table_name
+             ) NOT IN (
+                        SELECT
+                               owner
+                             , segment_name
+                        FROM
+                             (
+                               $exchange_query
+                             )
+                      )
+       ORDER
+          BY
+              1, 2, 3
       ";
 
+  # This query produces a list of THE IOTS -- non-partition index organized
+  # tables which reside in THE TABLESPACE or partitioned index organized
+  # tables which have at least one partition in THE TABLESPACE.
+  # 
   $iot_query =
       "
        SELECT
@@ -1152,6 +1470,10 @@ sub initialize_queries
               AND i.table_name      = p.index_name
       ";
 
+  # This query produces a list of THE TABLES -- non-partitioned tables which
+  # reside in THE TABLESPACE or partitioned tables which have at least one
+  # partition in THE TABLESPACE.
+  #
   $table_query =
       "
        SELECT
@@ -1207,84 +1529,20 @@ sub initialize_queries
                                       AND tablespace_name <> '$tblsp'
                              )
       ";
+}
 
-  $partition_query_hash =
-      "
-       SELECT DISTINCT
-              table_owner
-            , table_name
-            , partition_name
-            , segment_type
-       FROM
-            (
-              SELECT
-                     p.table_owner
-                   , p.table_name
-                   , p.partition_name
-                   , 'PARTITION'             AS segment_type
-              FROM
-                     dba_tab_partitions  p
-                   , dba_part_tables     t
-              WHERE
-                         p.tablespace_name   = '$tblsp'
-                     AND t.owner             = p.table_owner
-                     AND t.table_name        = p.table_name
-                     AND t.partitioning_type = 'HASH'
-                     AND (
-                             p.table_owner
-                           , p.table_name
-                         ) NOT IN (
-                                    $table_query
-                                  )
-              UNION ALL
-              SELECT
-                     table_owner
-                   , table_name
-                   , partition_name
-                   , 'SUBPARTITION'          AS segment_type
-              FROM
-                     dba_tab_subpartitions
-              WHERE
-                         tablespace_name = '$tblsp'
-                     AND (
-                             table_owner
-                           , table_name
-                         ) NOT IN (
-                                    $table_query
-                                  )
-            )
-      ";
+# sub move
+# 
+# Formats an ALTER TABLE MOVE [SUB]PARTITION statement
+#
+sub move
+{
+  my ( $owner, $table, $partition, $type, $tblsp ) = @_;
 
-  $partition_query_range =
-      "
-       SELECT DISTINCT
-              table_owner
-            , table_name
-            , partition_name
-            , segment_type
-       FROM
-            (
-              SELECT
-                     p.table_owner
-                   , p.table_name
-                   , p.partition_name
-                   , 'PARTITION'             AS segment_type
-              FROM
-                     dba_tab_partitions  p
-                   , dba_part_tables     t
-              WHERE
-                         p.tablespace_name   = '$tblsp'
-                     AND t.owner             = p.table_owner
-                     AND t.table_name        = p.table_name
-                     AND t.partitioning_type = 'RANGE'
-                     AND (
-                             p.table_owner
-                           , p.table_name
-                         ) NOT IN (
-                                    $table_query
-                                  )
-            )
-      ";
+  return "PROMPT " .
+         "ALTER TABLE \L$owner.$table \UMOVE $type \L$partition\n\n" .
+         "ALTER TABLE \L$owner.$table \UMOVE $type \L$partition\n" .
+         "TABLESPACE \L$tblsp ;\n\n";
 }
 
 # sub print_help
@@ -1294,7 +1552,7 @@ sub initialize_queries
 sub print_help
 {
   print "
-          Usage:  defrag.pl [OPTION] [OPTION]...
+  Usage:  defrag.pl [OPTION] [OPTION]...
 
   ?, -?, -h, --help   Prints this help.
 
@@ -1328,45 +1586,11 @@ sub print_help
            Directory to place the import/export .log files.  Defaults to
            environment variable DBA_LOG, or to the current directory.
 
-  --partitions=STRING *
-
-           Two options to handle partitions are available.  These pertain
-           to individual partitions not belonging to the tables wholely
-           residing in the named tablespace.  In other words, partitions
-           belonging to a table whose partitions exist in 2 or more 
-           tablespaces.
-
-           The first is 'resize', where the following takes place:
-               The partition is exported
-               During the DROP objects phase, the partition is
-                 a) truncated
-                 b) MOVEd to the alternate tablespace as a minimum size
-                    segment.
-               During the CREATE phase, the partition is
-                 a) MOVEd back into the primary tablespace
-                 b) Resized according to the resizing algorithm
-               The partition is then repopulated via the Import.  Note
-               that the indexes are still in place during the import,
-               slowing this operation.  This method is clean, safe and
-               simple, but may not be appropriate if there are many
-               partitions in the tablespace and/or they have many indexes.
-               No special processing is done for the indexes of the
-               tables of these partitions, the assumption being that the
-               indexes are in a separate tablespace.  This method has the
-               advantage of requiring but one export.
-
-               Note that HASH partitions/subpartitions are not (can not
-               be) resized by this method.  They are, however, moved out
-               of the primary tablespace so that the coalesce is
-               effective.  They are returned to the tablespace before
-               the import occurs.
-
-           The second... [has yet to be built]
-
   --password=PASSWORD
 
            User's password.  Not required if user is authenticated
            externally.  Respresents a security risk on Unix systems.
+
            If USER is given and PASSWORD is not, program will prompt
            for PASSWORD.  This would be preferable, since the password
            will then not be visible in a 'ps' command.
@@ -1374,8 +1598,8 @@ sub print_help
   --prefix=STRING *
 
            The leading portion of all filenames.  Defaults to 'defrag_',
-           and may be omitted (in which case filenames will begin with
-           the name of the tablespace).
+           and may be '' (in which case filenames will begin with the
+           name of the tablespace).
 
   --sid=SID *
 
@@ -1410,6 +1634,137 @@ sub print_help
      new entry is assigned at that time.
 
   ";
+
+  $text = "
+  Program 'defrag.pl' uses 4 main SQL statements to retrieve record sets which
+  form the basis of generated DDL.  They are sometimes UNIONed, sometimes 
+  MINUSed, etc., to refine the record sets.  The queries are:
+
+  THE TABLESPACE -- the Tablspace named by the '--tablespace=<name>' argument.
+
+  THE TABLES -- provides a list of Owner/Table_name's which fully reside in
+  THE TABLESPACE.  These are non-partitioned tables plus partitioned tables
+  where every partition and subpartition reside in THE TABLESPACE.  This list 
+  excludes IOT tables.
+
+  THE IOTS -- provides a list of Owner/Table_name's which fully or partially
+  reside in THE TABLESPACE.  In other words, if a partitioned IOT table has
+  even one partition in THE TABLESPACE, it is included in this list.  Reasons
+  these are in  a separate list from THE TABLES include the fact that their 
+  Primary Key is part of the CREATE TABLE syntax, and there are never other 
+  indexes on them,
+
+  THE INDEXES -- provides a list of Owner/Index_name/Table_name's for indexes
+  not belonging to THE TABLES but which fully or partially reside in THE
+  TABLESPACE.  In other words, a partitioned index with even one partition in
+  THE TABLESPACE is included in this list.
+
+  The data in THE TABLES and THE IOTS will be exported, after which members of
+  all 3 of the lists will be dropped before THE TABLESPACE is coalesced into
+  as few as 1 extent per datafile.
+
+  THE PARTITIONS -- provides Owner/Table_name/Partition_name/Segment_type's 
+  for all partitions and subpartitions not belonging to THE TABLES nor to THE
+  IOTS but which are located in THE TABLESPACE.  If any of these exist, the
+  first step will be to perform a 'safety' export of their data directly from
+  THE PARTITIONS.  Under normal circumstances, this export is not used.
+  Rather, for each partition a corresponding 'temp' table is built matching
+  the partition in structure, indexes and Primary Key.  The temp table is then
+  EXCHANGED with the partition; this results in the temp table holding the
+  data and the partition becoming empty.  The empty partition is moved to the
+  alternate tablespace before the coalescing takes place.  The temp table is
+  then treated like a member of THE TABLES (i.e., exported, dropped,
+  recreated, indexed, imported, etc.).  After the temp table has its data
+  imported, it is again EXCHANGED with its original partition, and thus the
+  data once again becomes part of the table in its new, properly sized 
+  segment.
+
+  Note that nothing is done with indexes on the tables of THE PARTITIONS.  In
+  the event that such an index or a partition thereof happens to reside in THE
+  TABLESPACE, it will still be there after all other objects have been dropped 
+  or moved eleehwhere.  Likewise, unless an alternate tablespace other than
+  THE TABLESPACE is given (or if the named alternate tablespace does not
+  exist), then the empty partition segments will also remain in THE TABLESPACE.
+  If either of these conditions occurs, the THE TABLESPACE will not be
+  completely empty when it is coalesced.  This is not necessarily a big
+  problem, it is just not as clean as when THE TABLESPACE becomes completely
+  empty before it is coalesced.
+
+  The following descriptions of the 'Statement Groups' show the sequence of
+  statments used to defragment THE TABLESPACE.  These DDL statements are in
+  3 to 5 files.  Shell scripts are provided which perform the statements in
+  the correct sequence, intermingled with the exports and imports.  The user
+  should check the execution of each shell script for errors before continuing
+  with the next step.  Within the SQL files, each group of statements is
+  delineated by a header record which refers to a 'Statement Group Number'.
+  These groups are defined below.
+  
+  EXPORT the data from THE PARTITIONS. (If all goes well, we won't use this.)
+  
+   1.  For each member of THE PARTITIONS:
+         a.  Create a Temp table.
+         b.  Add appropriate indexes.
+         c.  Add a PK, if any.
+         d.  EXCHANGE the Temp table with the partition.
+         e.  MOVE the [now empty] Temp table to the alternate tablespace.
+  
+  EXPORT the data from THE TABLES, THE IOTS and the Temp tables.
+  
+   2.  DROP the Temp tables created in Group #1.
+  
+   3.  DROP all Foreign Keys referencing THE TABLES, THE IOTS or the tables
+       of THE INDEXES.
+  
+   4.  DROP members of THE TABLES and THE IOTS.  Note: this DROPs all
+       constrints on these tables.
+
+   5.  DROP Primary Keys, Unique Constraints and Check Constraints on the
+       tables of THE INDEXES. 
+
+   6.  DROP members of THE INDEXES unless they enforce a Primay Key or Unique
+       Constraint of the same name -- those that do disappeared in Group #5.
+       Note: this will generate DROP INDEX statements for PK/UK's if the 
+       Constraint name differs from the Index name (e.g., system generated
+       names).  It won't cause any harm, but it will show an error in the log
+       file spooled in SQL*Plus; these should be ignored.  Maybe we'll fix
+       this someday.
+
+   7.  CREATE the Temp tables.
+  
+   8.  CREATE members of THE TABLES and THE IOTS.
+
+  IMPORT the data for THE TABLES, THE IOTS and the Temp tables.
+  
+   9.  CREATE indexes and PK's on the Temp tables.  EXCHANGE them with their
+       corresponding partition, and DROP the now empty Temp tables.
+  
+  10.  CREATE indexes on THE TABLES, plus THE INDEXES themselves.
+
+  11.  CREATE all Constraints on THE TABLES.
+
+  12.  CREATE Check Cosntraints on THE IOTS.
+
+  13.  CREATE Foreign Keys referencing THE TABLES, THE IOTS or the tables
+       of THE INDEXES.
+
+  14.  REBUILD non-partitioned or Global partitioned indexes on THE PARTITIONS
+       (these were marked UNUSABLE during the partition EXCHANGE).
+
+  ONLY IF PROBLEMS OCCURED DURING EXECUTION OF GROUP #1:
+
+  15.  DROP the Temp tables.
+
+  IMPORT the data for THE PARTITIONS.
+
+  ";
+
+  write_file( "./README.stmts", $text, '' );
+
+  print "
+  Also, see the 'README.stmts' which was just written in this directory
+  for information about the DDL statements generated and their sequence.
+  ";
+
   return;
 }
 
@@ -1436,23 +1791,67 @@ sub set_defaults
     }
     close RC                         or die "Can't close defragrc:  $!\n";
 
-  # Just in case they farkled the .defragrc file
-  $args{ expdir }     = '.'       unless $args{ expdir };
-  $args{ sqldir }     = '.'       unless $args{ sqldir };
-  $args{ logdir }     = '.'       unless $args{ logdir };
-  $args{ prefix }     = 'defrag_' unless $args{ prefix };
-  $args{ partitions } = 'resize' unless $args{ partitions };
+    # Just in case they farkled the .defragrc file
+    $args{ expdir } = '.'       unless $args{ expdir };
+    $args{ sqldir } = '.'       unless $args{ sqldir };
+    $args{ logdir } = '.'       unless $args{ logdir };
+    $args{ prefix } = 'defrag_' unless $args{ prefix };
   }
   else 
   {
     # First time for this user
-    $args{ expdir }     = $ENV{ DBA_EXP }    || ".";
-    $args{ sqldir }     = $ENV{ DBA_SQL }    || ".";
-    $args{ logdir }     = $ENV{ DBA_LOG }    || $ENV{ LOGDIR } || ".";
-    $args{ prefix }     = "defrag_";
-    $args{ partitions } = 'resize';
+    $args{ expdir } = $ENV{ DBA_EXP }    || ".";
+    $args{ sqldir } = $ENV{ DBA_SQL }    || ".";
+    $args{ logdir } = $ENV{ DBA_LOG }    || $ENV{ LOGDIR } || ".";
+    $args{ prefix } = "defrag_";
   }
   Getopt::Long::Configure( 'passthrough' );
+}
+
+# sub trunc
+#
+# Formats a TRUNCATE statement for the supplied [sub]partition
+#
+sub trunc
+{
+  my ( $owner, $table, $partition, $type ) = @_;
+
+  return  "PROMPT " .
+          "ALTER TABLE \L$owner.$table \UTRUNCATE $type \L$partition  \n\n" .
+          "ALTER TABLE \L$owner.$table \UTRUNCATE $type \L$partition ;\n\n";
+}
+
+# sub unique_nbr
+#
+# Generates a unique number between 1 and 99999 for use in Temp Table names
+#
+sub unique_nbr
+{
+  my $nbr;
+
+  while( 1 )
+  {
+    $nbr = int( rand 999999 ) + 1;
+    $uniq{ $nbr }++;
+    last unless $uniq{ $nbr } > 1;
+  }
+
+  return $nbr
+}
+
+# sub write_file
+#
+# Opens, writes, closes a .sql or .par file
+#
+sub write_file
+{
+  my ( $filename, $text, $remark ) = @_;
+
+  open FILE, ">$filename"     or die "Can't open $filename: $!\n";
+  write_header( \*FILE, $filename, $remark );
+  print FILE $text,
+             "$remark --- END OF FILE ---\n\n";
+  close FILE                  or die "Can't close $filename: $!\n";
 }
 
 # sub write_header
@@ -1470,6 +1869,19 @@ sub write_header
 }
 
 # $Log: defrag.pl,v $
+# Revision 1.7  2000/12/02 14:06:20  rvsutherland
+# Completed 'exchange' method for handling partitions,
+# including REBUILD of UNUSABLE indexes.
+# Removed 'resize' method for handling partitions.
+#
+# Revision 1.6  2000/11/26 20:10:54  rvsutherland
+# Added 'exchange' method for handling partitions.  Will probably
+# remove the 'resize' method next update.
+#
+# Revision 1.5  2000/11/24 18:36:00  rvsutherland
+# Restructured file writes
+# Revamped 'resize' method for handling partitions
+#
 # Revision 1.4  2000/11/19 20:08:58  rvsutherland
 # Added 'resize' partitions option.
 # Restructured file creation.
@@ -1484,6 +1896,10 @@ sub write_header
 # Revision 1.2  2000/11/16 09:14:38  rvsutherland
 # Major restructure to take advantage of DDL::Oracle.pm
 #
+
+__END__
+
+########################################################################
 
 =head1 NAME
 
@@ -1500,8 +1916,6 @@ defrag.pl -- Creates SQL*Plus command files to defragment a tablespace.
 [--expdir=PATH]
 
 [--logdir=PATH]
-
-[--partitions={resize|exchange}]
 
 [--resize=STRING]
 
@@ -1544,11 +1958,18 @@ The steps in the process are:
     6.  Recreate the indexes.
     7.  Restore all constraints.
 
-=head1 TODO
+=head1 TO DO
 
 =head1 BUGS
 
 =head1 FILES
+
+The names and number of files output varies according to the Tablespace
+specified and the options selected.  All .sql and .log files and shell
+scripts produced are displayed on STDOUT during the execution of the program.
+
+Also, see 'README.stmts', which will be created when Help is displayed (by
+entering 'defrag.pl' without any arguments).
 
 =head1 AUTHOR
 

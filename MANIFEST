@@ -1,5 +1,6 @@
 MANIFEST
 README
+README.stmts
 Makefile.PL
 Oracle.pm
 test.pl

@@ -1,4 +1,4 @@
-# $Id: Oracle.pm,v 1.42 2001/03/31 18:25:56 rvsutherland Exp $ 
+# $Id: Oracle.pm,v 1.43 2001/04/07 11:18:26 rvsutherland Exp $ 
 #
 # Copyright (c) 2000, 2001 Richard Sutherland - United States of America
 #
@@ -9,7 +9,7 @@ require 5.004;
 
 BEGIN
 {
-  $DDL::Oracle::VERSION = "1.07"; # Also update version in pod text below!
+  $DDL::Oracle::VERSION = "1.08"; # Also update version in pod text below!
 }
 
 package DDL::Oracle;
@@ -492,8 +492,8 @@ sub _create_comments
 #
 #     TABLESPACE
 #     ROLLBACK SEGMENT
-#     PUBLIC DATABASE LINK (syntax doesn't permit schema; omit private links)
-#     SYNONYM
+#     PUBLIC DATABASE LINK
+#     PUBLIC SYNONYM
 #     PROFILE
 #     ROLE
 #     USER
@@ -552,7 +552,7 @@ sub _create_components
     $sql .= _create_rollback_segment( undef, undef, @$row->[0], $view );
   }
 
-  # Get database links
+  # Get PUBLIC database links
   $stmt =
       "
        SELECT
@@ -575,7 +575,7 @@ sub _create_components
     $sql .= _create_db_link( 'PUBLIC ', 'PUBLIC', @$row->[0], $view );
   }
 
-  # Get synonyms
+  # Get PUBLIC synonyms
   $stmt =
       "
        SELECT
@@ -583,6 +583,8 @@ sub _create_components
             , synonym_name
        FROM
               dba_synonyms
+       WHERE
+              owner = 'PUBLIC'
        ORDER
           BY
               owner
@@ -2531,24 +2533,24 @@ sub _create_partitioned_iot
       ";
   }
 
-  my $sql = _create_table_text( $stmt, $schema, $owner, $name, $view ) .
-            _create_comments( $schema, $owner, $name, $view );
+  my $sql = _create_table_text( $stmt, $schema, $owner, $name, $view );
 
   $stmt =
       "
        SELECT
-              index_name
+              constraint_name
        FROM
-              ${view}_part_indexes
+              ${view}_constraints
        WHERE
-                  table_name = UPPER( ? )
+                  table_name      = UPPER( ? )
+              AND constraint_type = 'P'
       ";
 
   if ( $view eq 'DBA' )
   {
     $stmt .=
       "
-              AND owner      = UPPER('$owner')
+              AND owner           = UPPER('$owner')
       ";
   }
 
@@ -2560,7 +2562,8 @@ sub _create_partitioned_iot
           "(\n    " .
           _partition_key_columns( $owner, $name, 'TABLE', $view ) .
           "\n)\n" .
-          _range_partitions( $owner, $index, $view, 'NONE', 'IOT' );
+          _range_partitions( $owner, $index, $view, 'NONE', 'IOT' ) .
+          _create_comments( $schema, $owner, $name, $view );
 
   return $sql;
 }
@@ -3094,7 +3097,12 @@ sub _create_profile
               profile = UPPER( ? )
        ORDER
           BY
-              resource_type
+              DECODE(
+                      SUBSTR(resource_name,1,8)
+                     ,'FAILED_L',2
+                     ,'PASSWORD',2
+                     ,1
+                    )
             , resource_name
       ");
 
@@ -3710,32 +3718,94 @@ sub _create_table_family
 {
   my ( $schema, $owner, $name, $view ) = @_;
 
-  my $sql = _create_table     ( @_ );
+  my $stmt;
+  my $sql = _create_table( @_ );
 
   # Add table's indexes
-  my $stmt =
+  if ( $oracle_major == 7 )
+  {
+    $stmt =
+      "
+       SELECT
+              'NOT IOT'               AS iot_type
+       FROM
+              ${view}_tables
+       WHERE
+                  table_name = UPPER( ? )
+      ";
+  }
+  else
+  {
+    $stmt =
+      "
+       SELECT
+              iot_type
+       FROM
+              ${view}_tables
+       WHERE
+                  table_name = UPPER( ? )
+      ";
+  }
+
+  if ( $view eq 'DBA' )
+  {
+    $stmt .=
+        "
+              AND owner      = UPPER('$owner')
+        ";
+  }
+
+  $sth = $dbh->prepare( $stmt );
+  $sth->execute( $name );
+  my ( $iot ) = $sth->fetchrow_array;
+
+  $stmt =
       "
        SELECT
               index_name
        FROM
               ${view}_indexes
        WHERE
-                  table_name = UPPER( ? )
+                  table_name  = UPPER( ? )
       ";
 
   if ( $view eq 'DBA' )
   {
     $stmt .=
       "
-              AND owner        = UPPER('$owner')
+              AND table_owner = UPPER('$owner')
       ";
+  }
+
+  if ( $iot eq 'IOT' )
+  {
+    # Omit the PK, it's in the CREATE TABLE on an IOT
+    $stmt .=
+      "
+       MINUS
+       SELECT
+              constraint_name
+       FROM
+              ${view}_constraints
+       WHERE
+                  table_name      = UPPER( '$name' )
+              AND constraint_type = 'P'
+      ";
+
+    if ( $view eq 'DBA' )
+    {
+      $stmt .=
+      "
+              AND owner           = UPPER('$owner')
+      ";
+    }
   }
 
   $stmt .= 
       "
        ORDER
           BY
-             index_name
+             1
       ";
 
   $sth = $dbh->prepare( $stmt );
@@ -3759,7 +3829,25 @@ sub _create_table_family
        WHERE
                   owner            = UPPER( ? )
               AND table_name       = UPPER( ? )
+      ";
+
+  if ( $iot eq 'IOT' )
+  {
+    $stmt .=
+      "
+              AND constraint_type IN('U','R','C')
+      ";
+  }
+  else
+  {
+    $stmt .=
+      "
               AND constraint_type IN('P','U','R','C')
+      ";
+  }
+
+  $stmt .= 
+      "
        ORDER
           BY
              DECODE(
@@ -6838,7 +6926,7 @@ DDL::Oracle - a DDL generator for Oracle databases
 
 =head1 VERSION
 
-VERSION = 1.07
+VERSION = 1.08
 
 =head1 SYNOPSIS
 
@@ -6853,7 +6941,7 @@ VERSION = 1.07
                           PrintError => 0,
                           RaiseError => 1
                          }
-     );
+                       );
 
  # Use default resize and schema options.
  # query default DBA_xxx tables (could use USER_xxx for non-DBA types)
@@ -6884,6 +6972,19 @@ VERSION = 1.07
  my $ddl = $obj->create;      # or $obj->resize;  or $obj->drop;  etc.
 
  print $ddl;    # Use STDOUT so user can redirect to desired file.
+
+ # Here's another example, this time for type 'components'.  This type
+ # differs from the norm, because it has no owner and no name.
+
+ my $obj = DDL::Oracle->new(
+                             type => 'components',
+                             list => [[ 'no owner','no name' ]]
+                           );
+
+ my $ddl = $obj->create;
+
+ print $ddl;
+
 
 =head1 DESCRIPTION
 
@@ -7006,6 +7107,12 @@ definitions are supplied with this method, to wit:
 create
 
 The B<create> method generates the DDL to create the list of Oracle objects.
+Virtually every type of Oracle object (table, index, user, synonym, trigger,
+etc.) can be CREATEd via this method -- see hash %create for a complete list.
+There is also a type called 'components' which is an aggregate type.  It
+generates the DDL for all objects of types which do not have an owner
+(tablespace, rollback segment, profile, role, user) and for PUBLIC database
+links and synonyms.  See the SYNOPSIS for an example of this.
 
 drop
 

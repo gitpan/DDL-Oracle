@@ -1,4 +1,4 @@
-# $Id: Oracle.pm,v 1.26 2000/12/29 23:18:13 rvsutherland Exp $ 
+# $Id: Oracle.pm,v 1.28 2001/01/01 13:01:12 rvsutherland Exp $ 
 #
 # Copyright (c) 2000 Richard Sutherland - United States of America
 #
@@ -9,7 +9,7 @@ require 5.004;
 
 BEGIN
 {
-  $DDL::Oracle::VERSION = "0.27"; # Also update version in pod text below!
+  $DDL::Oracle::VERSION = "0.28"; # Also update version in pod text below!
 }
 
 package DDL::Oracle;
@@ -5613,127 +5613,13 @@ sub _table_columns
 
 __END__
 
-# $Log: Oracle.pm,v $
-# Revision 1.26  2000/12/29 23:18:13  rvsutherland
-# Added DROP/CREATE SNAPSHOT LOG
-# Added DROP/CREATE MATERIALIZED VIEW LOG
-#
-# Revision 1.25  2000/12/28 21:51:56  rvsutherland
-# Retrofitted Oracle 7.3 and 8.0 for:
-#     CREATE TABLE
-#     CREATE INDEX
-#     CREATE TABLESPACE
-# Added support in CREATE TABLE for these additional data types
-#     RAW
-#     NCHAR
-#     UROWID
-#     NVARCHAR2
-# Corrected RESIZE method to not include STORAGE clause for Hash [SUB]PARTITIONs
-# Corrected NEXT (extent) if last tier had been reached (was null)
-#
-# Revision 1.24  2000/12/09 17:40:14  rvsutherland
-# Additional tuning refinements.
-# Minor cleanup of code.
-# VERSION changed to 0.24
-#
-# Revision 1.23  2000/12/06 00:45:30  rvsutherland
-# Switched to bind variables for performance enhancements.
-# Fixed spacing on CREATE TRIGGER (was inadvertantly adding a blank line).
-#
-# Revision 1.22  2000/12/02 14:08:45  rvsutherland
-# Updated VERSION to 0.22, and declared Beta stage reached.
-#
-# Revision 1.21  2000/11/26 20:12:15  rvsutherland
-# Added method 'exchange index'.
-#
-# Revision 1.20  2000/11/24 18:41:45  rvsutherland
-# Added method 'exchange table'
-#
-# Revision 1.19  2000/11/19 20:11:24  rvsutherland
-# Fixed resize method to handle subpartitions.
-# Modified CHECK CONSTRAINTS -- was adding white space.
-#
-# Revision 1.18  2000/11/16 09:14:38  rvsutherland
-# Added DROP CONSTRAINT
-# Corrected CREATE TABLE for partitions (didn't like CACHE/NOCACHE)
-#
-# Revision 1.17  2000/11/11 00:20:42  rvsutherland
-# Moved _create_comments from _create_table_family to _create_table
-#
-# Revision 1.16  2000/11/05 18:50:00  rvsutherland
-# Added CREATE SEQUENCE.
-# Added CREATE SYNONYM.
-#
-# Revision 1.15  2000/11/05 03:48:41  rvsutherland
-# We've been having fun today!
-# Added CREATE FUNCTION
-# Added CREATE PACKAGE
-# Added CREATE PROCEDURE
-# Added CREATE ROLE
-# Added CREATE TABLESPACE
-# Added CREATE TYPE
-# Added CREATE VIEW
-#
-# Revision 1.14  2000/11/03 02:49:56  rvsutherland
-# Added correct file -- 1.13 did not contain all of the changes it claimed.
-# Version 0.07 now up to date.
-#
-# Revision 1.13  2000/11/03 02:33:23  rvsutherland  
-# Added COMMENT ON Tables and Columns  
-# Added CREATE TRIGGER  
-# Added ALTER TABLE ADD CONSTRAINT   
-# Added object type "table family" which creates all of the above 
-#   plus the table plus its indexes 
-#
-# Revision 1.12  2000/10/31 09:27:50  rvsutherland 
-# Added CREATE TRIGGER. 
-# This probably needs a LOT more testing. 
-#
-# Revision 1.11  2000/10/29 17:13:20  rvsutherland
-# Added CREATE USER.
-# Did the laundry, cleaned the kitchen.
-#
-# Revision 1.10  2000/10/28 20:24:31  rvsutherland
-# Added DESCRIPTION and SYNOPSIS to pod.
-# Modified Header to omit Schema for objects without such a beast.
-#
-# Revision 1.9  2000/10/28 18:11:25  rvsutherland
-# Added inadvertantly missing sub _drop_object.
-# Corrected bug in CREATE TABLE for IOT tables.
-#
-# Revision 1.8  2000/10/28 11:55:14  rvsutherland
-# Added CREATE INDEX for partitioned indexes.
-#
-# Revision 1.7  2000/10/25 01:12:16  rvsutherland
-# Added CREATE INDEX for non-partitioned tables.
-#
-# Revision 1.6  2000/10/24 16:53:14  rvsutherland
-# Added IOT partitioned tables.
-#
-# Revision 1.5  2000/10/24 13:57:40  rvsutherland
-# Added HASH partitioning (w/o subpartitioning).
-# Added IOT non-partitioned tables.
-#
-# Revision 1.4  2000/10/21 11:04:06  rvsutherland
-# Expanded header, added missing ORDER BY's, miscellaneous fussing.
-#
-# Revision 1.3  2000/10/21 00:17:37  rvsutherland
-# Added RANGE and RANGE/HASH partitioning to CREATE TABLE functionality.
-#
-# Revision 1.2  2000/10/18 22:35:09  rvsutherland
-# Added CREATE TABLE functionality for non-partitioned tables.
-#
-# Revision 1.1  2000/10/18 00:00:39  rvsutherland
-# Initial revision
-#
-
 =head1 NAME
 
 DDL::Oracle - a DDL generator for Oracle databases
 
 =head1 VERSION
 
-VERSION = 0.27
+VERSION = 0.28
 
 =head1 SYNOPSIS
 

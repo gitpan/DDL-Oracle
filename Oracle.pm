@@ -1,4 +1,4 @@
-# $Id: Oracle.pm,v 1.18 2000/11/16 09:14:38 rvsutherland Exp $ 
+# $Id: Oracle.pm,v 1.19 2000/11/19 20:11:24 rvsutherland Exp $ 
 #
 # Copyright (c) 2000 Richard Sutherland - United States of America
 #
@@ -9,7 +9,7 @@ require 5.004;
 
 BEGIN
 {
-  $DDL::Oracle::VERSION = "0.18"; # Also update version in pod text below!
+  $DDL::Oracle::VERSION = "0.19"; # Also update version in pod text below!
 }
 
 package DDL::Oracle;
@@ -178,11 +178,10 @@ sub resize
 
   foreach my $row ( @{ $self->{ list } } )
   {
-    # Turn warnings off
-    $^W = 0;
-
     my ( $owner, $name ) = @$row;
-    $ddl .= $resize{ $type }->( $owner, $name, $type, $attr{ view } ); 
+    my $schema = _set_schema( $owner );
+
+    $ddl .= $resize{ $type }->( $schema, $owner, $name, $attr{ view } ); 
   }
 
   return $ddl;
@@ -365,7 +364,7 @@ sub _create_constraint
   $sql .= ( $cons_type eq 'P' ) ? "PRIMARY KEY\n" :
           ( $cons_type eq 'U' ) ? "UNIQUE\n"      :
           ( $cons_type eq 'R' ) ? "FOREIGN KEY\n" :
-                                  "\nCHECK ( $condition )\n";
+                                  "\nCHECK ($condition)\n";
 
   if ( $cons_type ne 'C' )
   {
@@ -3256,11 +3255,10 @@ sub _range_partitions
 #
 sub _resize_index
 {
-  my ( $owner, $name, $type, $view ) = @_;
+  my ( $schema, $owner, $name, $view ) = @_;
 
   my $cnt;
   my $sql;
-  my $schema = _set_schema( $owner );
   ( $name, my $partition ) = split /:/, $name;
 
   my $stmt =
@@ -3286,28 +3284,39 @@ sub _resize_index
   if ( $partition ) # User wants one partition resized
   {
     $stmt =
-        "
-         SELECT
-                count(*) AS cnt
-         FROM
-                ${view}_segments
-         WHERE
-                    segment_name   = UPPER('$name')
-                AND segment_type   = 'INDEX PARTITION'
-                AND partition_name = UPPER('$partition')
-        ";
+      "
+       SELECT
+              SUBSTR(segment_type,7)   -- PARTITION or SUBPARTITION
+       FROM
+              ${view}_segments
+       WHERE
+                  segment_name   = UPPER('$name')
+              AND partition_name = UPPER('$partition')
+      ";
     if ( $view eq 'DBA' )
     {
-      $stmt .= "AND owner          = UPPER('$owner')";
+      $stmt .=
+      "      
+              AND owner          = UPPER('$owner')
+      ";
     }
 
     $sth = $dbh->prepare( $stmt );
     $sth->execute;
-    $cnt = $sth->fetchrow_array;
-    die "Partition \U$partition \Lof \UI\Lndex \U$name \Ldoes not exist.\n\n"
-        unless $cnt;
+    my $type = $sth->fetchrow_array;
+    die "Partition \U$partition \Lof \UI\Lndex \U$name \Ldoes not exist,\n",
+        "  OR it is the parent of Hash subpartition(s)\n",
+        "  (i.e., it is not a segment and has no size).\n\n"
+        unless $type;
 
-    $sql .= _resize_index_partition( $type,$owner,$name,$partition,$view );
+    $sql .= _resize_index_partition(
+                                     $schema,
+                                     $owner,
+                                     $name,
+                                     $partition,
+                                     $type,
+                                     $view
+                                   );
 
     return $sql;
   }
@@ -3379,24 +3388,27 @@ sub _resize_index
     # It's partitioned -- get list of partitions
     # and call _resize_index_partition for each one
     $stmt =
-        "
-         SELECT
-                partition_name
-         FROM
-                ${view}_segments
-         WHERE
-                    segment_name = UPPER('$name')
-                AND segment_type = 'INDEX PARTITION'
-        ";
+      "
+       SELECT
+              partition_name
+            , SUBSTR(segment_type,7)   -- PARTITION or SUBPARTITION
+       FROM
+              ${view}_segments
+       WHERE
+                  segment_name = UPPER('$name')
+      ";
     if ( $view eq 'DBA' )
     {
-      $stmt .= "AND owner        = UPPER('$owner')";
+      $stmt .= 
+      " 
+              AND owner        = UPPER('$owner')
+      ";
     }
-    $stmt .=   
-        "ORDER
-            BY
-                partition_name
-        ";
+    $stmt .= "
+       ORDER
+          BY
+              partition_name
+      ";
 
     $sth = $dbh->prepare( $stmt );
     $sth->execute;
@@ -3404,8 +3416,16 @@ sub _resize_index
 
     foreach my $row ( @$aref )
     {
-      my ( $partition ) = @$row;
-      $sql .= _resize_index_partition( $type,$owner,$name,$partition,$view );
+      my ( $partition, $type ) = @$row;
+
+      $sql .= _resize_index_partition(
+                                       $schema,
+                                       $owner,
+                                       $name,
+                                       $partition,
+                                       $type,
+                                       $view
+                                     );
     }
 
     return $sql;
@@ -3416,8 +3436,7 @@ sub _resize_index
 #
 # Returns DDL to rebuild one partition of the named object in the form of:
 #
-#     ALTER INDEX [schema.]<name> REBUILD
-#     PARTITION <partition>
+#     ALTER INDEX [schema.]<name> REBUILD [SUB]PARTITION <partition>
 #     STORAGE
 #     (
 #       INITIAL  <bytes>
@@ -3426,28 +3445,29 @@ sub _resize_index
 #
 sub _resize_index_partition
 {
-  my ( $type, $owner, $name, $partition, $view ) = @_;
+  my( $schema, $owner, $name, $partition, $type, $view ) = @_;
 
   my $sql;
-  my $schema = _set_schema( $owner );
-
   my $stmt =
       "
-         SELECT
-                s.blocks
-              , s.initial_extent
-              , s.next_extent
-         FROM
-                ${view}_segments  s
-         WHERE
-                    s.segment_name = UPPER('$name')
-                AND s.segment_type = 'INDEX PARTITION'
-        ";
+       SELECT
+              blocks
+            , initial_extent
+            , next_extent
+       FROM
+              ${view}_segments
+       WHERE
+                  segment_name   = UPPER('$name')
+              AND partition_name = UPPER('$partition')
+      ";
     if ( $view eq 'DBA' )
     {
-      $stmt .= "AND s.owner        = UPPER('$owner')
-               ";
+      $stmt .= 
+      "
+              AND owner          = UPPER('$owner')
+      ";
     }
+
   $sth = $dbh->prepare( $stmt );
   $sth->execute;
   my ( $blocks, $initial, $next ) = $sth->fetchrow_array;
@@ -3455,9 +3475,8 @@ sub _resize_index_partition
   ( $initial, $next ) = _initial_next( $blocks ) if $attr{ resize };
 
   $sql .= "PROMPT " .
-          "ALTER INDEX \L$schema$name \UREBUILD\n\n" .
-          "ALTER INDEX \L$schema$name \UREBUILD\n" .
-          "PARTITION \U$partition\n" .
+          "ALTER INDEX \L$schema$name \UREBUILD $type \L$partition\n\n" .
+          "ALTER INDEX \L$schema$name \UREBUILD $type \L$partition\n" .
           "STORAGE\n" .
           "(\n" .
           "  INITIAL  $initial\n" .
@@ -3471,8 +3490,7 @@ sub _resize_index_partition
 #
 # Returns DDL to rebuild the named table or its partition(s) in the form of:
 #
-#     ALTER TABLE [schema.]<name> MOVE
-#     [PARTITION <partition>]
+#     ALTER TABLE [schema.]<name> MOVE [[SUB]PARTITION <partition>]
 #     STORAGE
 #     (
 #       INITIAL  <bytes>
@@ -3481,11 +3499,10 @@ sub _resize_index_partition
 #
 sub _resize_table
 {
-  my ( $owner, $name, $type, $view ) = @_;
+  my ( $schema, $owner, $name, $view ) = @_;
 
   my $cnt;
   my $sql;
-  my $schema = _set_schema( $owner );
   ( $name, my $partition ) = split /:/, $name;
 
   my $stmt =
@@ -3500,7 +3517,8 @@ sub _resize_table
 
   if ( $view eq 'DBA' )
   {
-    $stmt .= "AND owner      = UPPER('$owner')";
+    $stmt .= 
+      "       AND owner      = UPPER('$owner')";
   }
 
   $sth = $dbh->prepare( $stmt );
@@ -3511,33 +3529,43 @@ sub _resize_table
   if ( $partition ) # User wants one partition resized
   {
     $stmt =
-        "
-         SELECT
-                count(*) AS cnt
-         FROM
-                ${view}_segments
-         WHERE
-                    segment_name   = UPPER('$name')
-                AND segment_type   = 'TABLE PARTITION'
-                AND partition_name = UPPER('$partition')
-        ";
+      "
+       SELECT
+              SUBSTR(segment_type,7)   -- PARTITION or SUBPARTITION
+       FROM
+              ${view}_segments
+       WHERE
+                  segment_name   = UPPER('$name')
+              AND partition_name = UPPER('$partition')
+      ";
     if ( $view eq 'DBA' )
     {
-      $stmt .= "AND owner          = UPPER('$owner')";
+      $stmt .=
+      "       AND owner          = UPPER('$owner')";
     }
 
     $sth = $dbh->prepare( $stmt );
     $sth->execute;
-    $cnt = $sth->fetchrow_array;
-    die "Partition \U$partition \Lof \UT\Lable \U$name \Ldoes not exist.\n\n"
-        unless $cnt;
+    my $type = $sth->fetchrow_array;
+    die "Partition \U$partition \Lof \UT\Lable \U$name \Ldoes not exist,\n",
+        "  OR it is the parent of Hash subpartition(s)\n",
+        "  (i.e., it is not a segment and has no size).\n\n"
+        unless $type;
 
-    $sql .= _resize_table_partition( $type,$owner,$name,$partition,$view );
+    $sql .= _resize_table_partition(
+                                     $schema,
+                                     $owner,
+                                     $name,
+                                     $partition,
+                                     $type,
+                                     $view
+                                   );
 
     return $sql;
   }
 
-  # Find out if the object is partitioned
+  # Didn't want single partition, so
+  # find out if the object is partitioned
 
   $stmt =
       "
@@ -3561,24 +3589,26 @@ sub _resize_table
   if ( $partitioned eq 'NO' )
   {
     $stmt =
-        "
-         SELECT
-                s.blocks - NVL(t.empty_blocks,0)
-              , s.initial_extent
-              , s.next_extent
-         FROM
-                ${view}_segments s
-              , ${view}_tables   t
-         WHERE
-                    s.segment_name = UPPER('$name')
-                AND s.segment_type = 'TABLE'
-                AND t.table_name   = s.segment_name
-        ";
+      "
+       SELECT
+              s.blocks - NVL(t.empty_blocks,0)
+            , s.initial_extent
+            , s.next_extent
+       FROM
+              ${view}_segments s
+            , ${view}_tables   t
+       WHERE
+                  s.segment_name = UPPER('$name')
+              AND s.segment_type = 'TABLE'
+              AND t.table_name   = s.segment_name
+      ";
     if ( $view eq 'DBA' )
     {
-      $stmt .= "AND s.owner        = UPPER('$owner')
+      $stmt .= 
+      "
+                AND s.owner        = UPPER('$owner')
                 AND t.owner        = s.owner
-               ";
+      ";
     }
     $sth = $dbh->prepare( $stmt );
     $sth->execute;
@@ -3602,24 +3632,27 @@ sub _resize_table
     # It's partitioned -- get list of partitions
     # and call _resize_table_partition for each one
     $stmt =
-        "
-         SELECT
-                partition_name
-         FROM
-                ${view}_segments
-         WHERE
-                    segment_name = UPPER('$name')
-                AND segment_type = 'TABLE PARTITION'
-        ";
+      "
+       SELECT
+              partition_name
+            , SUBSTR(segment_type,7)   -- PARTITION or SUBPARTITION
+       FROM
+              ${view}_segments
+       WHERE
+                  segment_name = UPPER('$name')
+      ";
     if ( $view eq 'DBA' )
     {
-      $stmt .= "AND owner        = UPPER('$owner')";
+      $stmt .= 
+      " 
+              AND owner        = UPPER('$owner')
+      ";
     }
-    $stmt .=   
-        "ORDER
-            BY
-                partition_name
-        ";
+    $stmt .= "
+       ORDER
+          BY
+              partition_name
+      ";
 
     $sth = $dbh->prepare( $stmt );
     $sth->execute;
@@ -3627,8 +3660,16 @@ sub _resize_table
 
     foreach my $row ( @$aref )
     {
-      my ( $partition ) = @$row;
-      $sql .= _resize_table_partition( $type,$owner,$name,$partition,$view );
+      my ( $partition, $type ) = @$row;
+
+      $sql .= _resize_table_partition(
+                                       $schema,
+                                       $owner,
+                                       $name,
+                                       $partition,
+                                       $type,
+                                       $view
+                                     );
     }
 
     return $sql;
@@ -3639,8 +3680,7 @@ sub _resize_table
 #
 # Returns DDL to rebuild one partition of the named object in the form of:
 #
-#     ALTER {INDEX|TABLE} [schema.]<name> {REBUILD|MOVE}
-#     PARTITION <partition>
+#     ALTER TABLE [schema.]<name> MOVE [SUB]PARTITION <partition>
 #     STORAGE
 #     (
 #       INITIAL  <bytes>
@@ -3649,30 +3689,31 @@ sub _resize_table
 #
 sub _resize_table_partition
 {
-  my ( $type, $owner, $name, $partition, $view ) = @_;
+  my( $schema, $owner, $name, $partition, $type, $view ) = @_;
 
   my $sql;
-  my $schema = _set_schema( $owner );
-
   my $stmt =
       "
-         SELECT
-                s.blocks - NVL(t.empty_blocks,0)
-              , s.initial_extent
-              , s.next_extent
-         FROM
-                ${view}_segments         s
-              , ${view}_tab_partitions   t
-         WHERE
-                    s.segment_name = UPPER('$name')
-                AND s.segment_type = 'TABLE PARTITION'
-                AND t.table_name   = s.segment_name
-        ";
+       SELECT
+              s.blocks - NVL(t.empty_blocks,0)
+            , s.initial_extent
+            , s.next_extent
+       FROM
+              ${view}_segments      s
+            , ${view}_tab_${type}s  t
+       WHERE
+                  s.segment_name   = UPPER('$name')
+              AND s.partition_name = UPPER('$partition')
+              AND t.table_name     = UPPER('$name')
+              AND t.partition_name = UPPER('$partition')
+      ";
     if ( $view eq 'DBA' )
     {
-      $stmt .= "AND s.owner        = UPPER('$owner')
-                AND t.table_owner  = s.owner
-               ";
+      $stmt .= 
+      "
+              AND s.owner          = UPPER('$owner')
+              AND t.table_owner    = UPPER('$owner')
+      ";
     }
 
   $sth = $dbh->prepare( $stmt );
@@ -3682,9 +3723,8 @@ sub _resize_table_partition
   ( $initial, $next ) = _initial_next( $blocks ) if $attr{ resize };
 
   $sql .= "PROMPT " .
-          "ALTER TABLE \L$schema$name \UMOVE\n\n" .
-          "ALTER TABLE \L$schema$name \UMOVE\n" .
-          "PARTITION \U$partition\n" .
+          "ALTER TABLE \L$schema$name \UMOVE $type \L$partition\n\n" .
+          "ALTER TABLE \L$schema$name \UMOVE $type \L$partition\n" .
           "STORAGE\n" .
           "(\n" .
           "  INITIAL  $initial\n" .
@@ -3952,6 +3992,10 @@ sub _table_columns
 __END__
 
 # $Log: Oracle.pm,v $
+# Revision 1.19  2000/11/19 20:11:24  rvsutherland
+# Fixed resize method to handle subpartitions.
+# Modified CHECK CONSTRAINTS -- was adding white space.
+#
 # Revision 1.18  2000/11/16 09:14:38  rvsutherland
 # Added DROP CONSTRAINT
 # Corrected CREATE TABLE for partitions (didn't like CACHE/NOCACHE)
@@ -4032,7 +4076,7 @@ DDL::Oracle - a DDL generator for Oracle databases
 
 =head1 VERSION
 
-VERSION = 0.18
+VERSION = 0.19
 
 =head1 SYNOPSIS
 

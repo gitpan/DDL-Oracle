@@ -1,6 +1,6 @@
 #! /usr/bin/perl -w
 
-# $Id: defrag.pl,v 1.3 2000/11/17 21:35:53 rvsutherland Exp $
+# $Id: defrag.pl,v 1.4 2000/11/19 20:08:58 rvsutherland Exp $
 #
 # Copyright (c) 2000 Richard Sutherland - United States of America
 #
@@ -20,22 +20,31 @@ my %args;
 my @export_objects;
 my @sizing_array;
 
+my $alttblsp;
 my $aref;
 my $create_ndx_ddl;
 my $create_tbl_ddl;
-my $cwd  = cwd;
 my $dbh;
 my $drop_ddl;
-my $filename;
+my $expdir;
 my $home = $ENV{HOME}
         || $ENV{LOGDIR}
         || ( getpwuid($REAL_USER_ID) )[7]
         || die "\nCan't determine HOME directory.\n";
 my $index_query;
 my $iot_query;
+my $logdir;
 my $obj;
 my $other_constraints;
+my $partition_query_hash;
+my $partition_query_range;
+my $partitions;
+my $prefix;
+my $row;
+my $sqldir;
 my $sth;
+my $stmt;
+my $tblsp;
 my $table_query;
 my $user = getlogin
         || scalar getpwuid($REAL_USER_ID)
@@ -64,17 +73,9 @@ else
 
 print "\n$0 is being executed by $user\non ", scalar localtime,"\n\n";
 
-connect_to_oracle();
-
-my $sqldir = ( $args{ sqldir } eq "." ) ? $cwd : $args{ sqldir };
-my $tblsp  = uc( $args{ tablespace } );
-my $prefix = $args{ prefix };
-
 #
 # Display user options, and save them in .defrag.rc
 #
-
-print "Generating files to defrag  Tablespace \U$tblsp.\n\n";
 
 delete $args{ sid } if $args{ sid } eq "";
 open RC, ">$home/.defragrc" or die "Can't open .defrag.rc:  $!\n";
@@ -86,6 +87,7 @@ KEY: foreach my $key ( sort keys %args )
                     or $key eq "sqldir"
                     or $key eq "prefix"
                     or $key eq "expdir"
+                    or $key eq "partitions"
                     or $key eq "resize"
                   );
   print "$key = $args{ $key }\n";
@@ -94,48 +96,12 @@ KEY: foreach my $key ( sort keys %args )
 close RC or die "Can't close .defrag.rc:  $!\n";
 print "\n";
 
-# Confirm the tablespace exists
-my $stmt =
-      "
-       SELECT
-              'EXISTS'
-       FROM
-              dba_tablespaces  t
-       WHERE
-                  tablespace_name   = '$tblsp'
-              AND status            = 'ONLINE'
-              AND contents         <> 'TEMPORARY'
-              AND extent_management = 'DICTIONARY'
-              AND NOT EXISTS(
-                              SELECT
-                                     null
-                              FROM
-                                     dba_segments  s
-                              WHERE
-                                         s.segment_type    = 'ROLLBACK'
-                                     AND s.tablespace_name =
-                                         t.tablespace_name
-                            )
-      ";
-
-$sth = $dbh->prepare( $stmt );
-$sth->execute;
-my $row = $sth->fetchrow_array;
-
-if ( not $row ) 
-{
-  print STDERR "\n***Error:  Tablespace \U$tblsp",
-               " does not exist\n",
-               "           or is not ONLINE\n",
-               "           or is managed LOCALLY\n",
-               "           or is a TEMPORARY tablespace\n",
-               "           or contains ROLLBACK segments.\n\n";
-  exit 1;
-}
-
 #
 # Now we're ready -- start dafriggin' defraggin'
 #
+
+print "Generating files to defrag Tablespace $tblsp.\n",
+      "Using Tablespace $alttblsp for partition operations.\n\n";
 
 print "Working...\n";
 
@@ -263,7 +229,7 @@ $sth = $dbh->prepare( $stmt );
 $sth->execute;
 $aref = $sth->fetchall_arrayref;
 
-foreach my $row ( @$aref )
+foreach $row ( @$aref )
 {
   push @export_objects, "\L@$row->[0].@$row->[1]";
 }
@@ -463,7 +429,7 @@ $sth->execute;
 $aref = $sth->fetchall_arrayref;
 
 my @constraints;
-foreach my $row ( @$aref )
+foreach $row ( @$aref )
 {
   my ( $owner, $constraint_name, $cons_type, $condition, ) = @$row;
 
@@ -520,7 +486,7 @@ $sth->execute;
 $aref = $sth->fetchall_arrayref;
 
 @constraints = ();
-foreach my $row ( @$aref )
+foreach $row ( @$aref )
 {
   my ( $owner, $constraint_name, $cons_type, $condition, ) = @$row;
 
@@ -553,6 +519,132 @@ $create_ndx_ddl .= $obj->create if @$fk_aref;
 #
 # Actually, it's not final.  We still have to deal with individual partitions.
 #
+
+#
+# Step 9 - Export the stray partitions -- those in our tablespace whose
+#          table also has partitions in at least one other tablespace.
+#
+#          Then, handle them according the the 'partitions' argument
+#          (see Help for description)
+#
+
+$drop_ddl .= "REM\n" .
+             "REM The remaining DDL, if any, was generated " .
+             "and/or altered by $0\n" .
+             "REM\n\n";
+
+$create_tbl_ddl .= "REM\n" .
+                   "REM The remaining DDL, if any, was generated " .
+                   "and/or altered by $0\n" .
+                   "REM\n\n";
+
+#
+# Doing RANGE partitions first
+#
+
+my $sql;
+
+$sth  = $dbh->prepare( $partition_query_range );
+$sth->execute;
+$aref = $sth->fetchall_arrayref;
+
+foreach $row ( @$aref )
+{
+  push @export_objects, "\L@$row->[0].@$row->[1]:@$row->[2]";
+}
+
+if ( @$aref and $partitions eq 'resize' )
+{
+  foreach $row ( @$aref )
+  {
+    my ( $owner, $table, $partition, $type ) = @$row;
+
+    $sql .= "PROMPT " .
+            "ALTER TABLE \L$owner.$table \UTRUNCATE $type \L$partition  \n\n" .
+            "ALTER TABLE \L$owner.$table \UTRUNCATE $type \L$partition ;\n\n" .
+            "PROMPT " .
+            "ALTER TABLE \L$owner.$table \UMOVE $type \L$partition\n\n" .
+            "ALTER TABLE \L$owner.$table \UMOVE $type \L$partition\n" .
+            "TABLESPACE \L$alttblsp\n" .
+            "STORAGE\n" .
+            "(\n" .
+            "  INITIAL 2K\n" .
+            "  NEXT    2K\n" .
+            ") ;\n\n";
+  }
+  $drop_ddl .= $sql;
+
+  foreach $row ( @$aref )
+  {
+    my ( $owner, $table, $partition, $type ) = @$row;
+
+    $obj = DDL::Oracle->new(
+                             type => 'table',
+                             list => [
+                                       [
+                                         "$owner",
+                                         "$table:$partition",
+                                       ]
+                                     ],
+                           );
+    $sql =  $obj->resize;
+    $sql =~ s/STORAGE/TABLESPACE \L$tblsp\n\USTORAGE/g;
+
+    $create_tbl_ddl .= $sql;
+  }
+}
+elsif ( @$aref )    # Use Exchange method for handling partitions
+{
+  print "We need an Exchange method for handling partitions\n\n";
+}
+
+#
+# Now doing HASH partitions
+#
+
+$sth  = $dbh->prepare( $partition_query_hash );
+$sth->execute;
+$aref = $sth->fetchall_arrayref;
+
+foreach $row ( @$aref )
+{
+  push @export_objects, "\L@$row->[0].@$row->[1]:@$row->[2]";
+}
+
+if ( @$aref and $partitions eq 'resize' )
+{
+  foreach $row ( @$aref )
+  {
+    my ( $owner, $table, $partition, $type ) = @$row;
+
+    $sql .= "PROMPT " .
+            "ALTER TABLE \L$owner.$table \UTRUNCATE $type \L$partition  \n\n" .
+            "ALTER TABLE \L$owner.$table \UTRUNCATE $type \L$partition ;\n\n" .
+            "PROMPT " .
+            "ALTER TABLE \L$owner.$table \UMOVE $type \L$partition\n\n" .
+            "ALTER TABLE \L$owner.$table \UMOVE $type \L$partition\n" .
+            "TABLESPACE \L$alttblsp ;\n\n";
+  }
+  $drop_ddl .= $sql;
+
+  $sql = undef;
+  foreach $row ( @$aref )
+  {
+    my ( $owner, $table, $partition, $type ) = @$row;
+
+    $sql .= "PROMPT " .
+            "ALTER TABLE \L$owner.$table \UMOVE $type \L$partition\n\n" .
+            "ALTER TABLE \L$owner.$table \UMOVE $type \L$partition\n" .
+            "TABLESPACE \L$tblsp ;\n\n";
+  }
+  $create_tbl_ddl .= $sql;
+}
+elsif ( @$aref )    # Use Exchange method for handling partitions
+{
+  print "We need an Exchange method for handling partitions\n\n";
+}
+
+#here
 
 #
 # It's hard to believe, but maybe they gave us an empty tablespace
@@ -609,47 +701,47 @@ foreach $row ( @$aref )
 
 print "\n";
 
-$filename = $sqldir . "/" . $prefix . $tblsp . "_drop_all.sql";
-print "Drop objects  is   :  $filename\n";
-open DELALL, ">$filename"     or die "Can't open $filename: $!\n";
-write_header( \*DELALL, $filename, 'REM' );
+my $drop_all_sql = $sqldir . '/' . $prefix . $tblsp . '_drop_all.sql';
+my $drop_all_log = $sqldir . '/' . $prefix . $tblsp . '_drop_all.log';
+print "Drop objects  is   :  $drop_all_sql\n";
+open DELALL, ">$drop_all_sql"     or die "Can't open $drop_all_sql: $!\n";
+write_header( \*DELALL, $drop_all_sql, 'REM' );
 print DELALL $drop_ddl;
-print DELALL "\n\nREM  --- END OF FILE ---\n\n";
-close DELALL                  or die "Can't close $filename: $!\n";
+print DELALL "REM  --- END OF FILE ---\n\n";
+close DELALL                  or die "Can't close $drop_all_sql: $!\n";
 
-$filename = $sqldir . "/" . $prefix . $tblsp . "_add_tbl.sql";
-print "Create tables is   :  $filename\n";
-open ADDTBL, ">$filename"     or die "Can't open $filename: $!\n";
-write_header( \*ADDTBL, $filename, 'REM' );
+my $add_tbl_sql = $sqldir . '/' . $prefix . $tblsp . '_add_tbl.sql';
+my $add_tbl_log = $sqldir . '/' . $prefix . $tblsp . '_add_tbl.log';
+
+print "Create tables is   :  $add_tbl_sql\n";
+open ADDTBL, ">$add_tbl_sql"     or die "Can't open $add_tbl_sql: $!\n";
+write_header( \*ADDTBL, $add_tbl_sql, 'REM' );
 print ADDTBL $create_tbl_ddl;
-print ADDTBL "\n\nREM  --- END OF FILE ---\n\n";
-close ADDTBL                  or die "Can't close $filename: $!\n";
+print ADDTBL "REM  --- END OF FILE ---\n\n";
+close ADDTBL                  or die "Can't close $add_tbl_sql: $!\n";
 
-$filename = $sqldir . "/" . $prefix . $tblsp . "_add_ndx.sql";
-print "Create indexes is  :  $filename\n";
-open ADDNDX, ">$filename"     or die "Can't open $filename: $!\n";
-write_header( \*ADDNDX, $filename, 'REM' );
+my $add_ndx_sql = $sqldir . '/' . $prefix . $tblsp . '_add_ndx.sql';
+my $add_ndx_log = $sqldir . '/' . $prefix . $tblsp . '_add_ndx.log';
+
+print "Create indexes is  :  $add_ndx_sql\n";
+open ADDNDX, ">$add_ndx_sql"     or die "Can't open $add_ndx_sql: $!\n";
+write_header( \*ADDNDX, $add_ndx_sql, 'REM' );
 print ADDNDX $create_ndx_ddl;
-print ADDNDX "\n\nREM  --- END OF FILE ---\n\n";
-close ADDNDX                  or die "Can't close $filename: $!\n";
+print ADDNDX "REM  --- END OF FILE ---\n\n";
+close ADDNDX                  or die "Can't close $add_ndx_sql: $!\n";
 
-my $logdir = ( $args{logdir} eq "." ) ? $cwd : $args{ logdir };
-my $expdir = ( $args{expdir} eq "." ) ? $cwd : $args{ expdir };
-
-my $pipefile = $expdir . "/" . $prefix . $tblsp . ".pipe";
+my $pipefile = $expdir . '/' . $prefix . $tblsp . '.pipe';
 unlink $pipefile;
-print "Export FIFO pipe is:  $pipefile\n";
 eval { system ("mknod $pipefile p") };
 
-$filename = $expdir . "/" . $prefix . $tblsp . "_imp.par";
-print "Import parfile is  :  $filename\n";
-open IMPPAR, ">$filename"     or die "Can't open $filename: $!\n";
-write_header(\*IMPPAR, $filename, '# ' );
+my $imp_par = $expdir . '/' . $prefix . $tblsp . '_imp.par';
+print "Import parfile is  :  $imp_par\n";
+open IMPPAR, ">$imp_par"     or die "Can't open $imp_par: $!\n";
+write_header(\*IMPPAR, $imp_par, '# ' );
+my $imp_log = $logdir . "/" . $prefix . $tblsp . "_imp.log";
+print "Import logfile is  :  $imp_log\n";
 
-my $logfile = $logdir . "/" . $prefix . $tblsp . "_imp.log";
-print "Import logfile is  :  $logfile\n";
-
-print IMPPAR "log         = $logfile\n",
+print IMPPAR "log         = $imp_log\n",
              "file        = $pipefile\n",
              "rows        = y\n",
              "commit      = y\n",
@@ -660,19 +752,18 @@ print IMPPAR "log         = $logfile\n",
              "#tables      = (\n",
              "#                  ",
              join ( "\n#                , ", @export_objects ),
-             "\n#              )\n\n\n\n",
+             "\n#              )\n\n",
              "#  --- END OF FILE ---\n\n";
-close IMPPAR                  or die "Can't close $filename: $!\n";
+close IMPPAR                  or die "Can't close $imp_par: $!\n";
 
-$filename = $expdir . "/" . $prefix . $tblsp . "_exp.par";
-print "Export parfile is  :  $filename\n";
-open EXPPAR, ">$filename"     or die "Can't open $filename: $!\n";
-write_header(\*EXPPAR, $filename, '# ' );
+my $exp_par = $expdir . '/' . $prefix . $tblsp . '_exp.par';
+print "Export parfile is  :  $exp_par\n";
+open EXPPAR, ">$exp_par"     or die "Can't open $exp_par: $!\n";
+write_header(\*EXPPAR, $exp_par, '# ' );
+my $exp_log = $logdir . "/" . $prefix . $tblsp . "_exp.log";
+print "Export logfile is  :  $exp_log\n";
 
-my $logfile = $logdir . "/" . $prefix . $tblsp . "_exp.log";
-print "Export logfile is  :  $logfile\n";
-
-print EXPPAR "log         = $logfile\n",
+print EXPPAR "log         = $exp_log\n",
              "file        = $pipefile\n",
              "rows        = y\n",
              "grants      = y\n",
@@ -685,9 +776,91 @@ print EXPPAR "log         = $logfile\n",
              "tables      = (\n",
              "                  ",
              join ( "\n                , ", @export_objects ),
-             "\n              )\n\n\n\n",
+             "\n              )\n\n",
              "#  --- END OF FILE ---\n\n";
-close EXPPAR                  or die "Can't close $filename: $!\n";
+close EXPPAR                  or die "Can't close $exp_par: $!\n";
+
+print "Export FIFO pipe is:  $pipefile\n";
+
+#
+# And, finally, the little shell scripts to help with the driving
+#
+
+print "\n";
+my $shell = $sqldir . '/' . $prefix . $tblsp . '.sh';
+my $gzip = $expdir . '/' . $prefix . $tblsp . '.dmp.gz';
+
+my $script = "${shell}1";
+print "Shell #1 is $script\n";
+open SHELL, ">$script"     or die "Can't open $script: $!\n";
+write_header( \*SHELL, $script, '# ' );
+print SHELL
+  "# Step 1 -- Export the tables in Tablespace $tblsp\n\n",
+  "nohup cat $pipefile | gzip -c \\\n",
+  "        > $gzip &\n\n",
+  "exp / parfile = $exp_par\n\n",
+  "#  --- END OF FILE ---\n\n";
+close SHELL                  or die "Can't close $script: $!\n";
+chmod( 0754, $script ) == 1 or die "\nCan't chmod $script: $!\n";
+
+$script = "${shell}2";
+print "Shell #2 is $script\n";
+open SHELL, ">$script"     or die "Can't open $script: $!\n";
+write_header( \*SHELL, $script, '# ' );
+print SHELL
+  "# Step 2 -- Use SQL*Plus to run $drop_all_sql\n",
+  "#           which will drop all objects in tablespace $tblsp\n\n",
+  "sqlplus -s / << EOF\n\n",
+  "   SPOOL $drop_all_log\n\n",
+  "   @ $drop_all_sql\n\n",
+  "EOF\n\n",
+  "#  --- END OF FILE ---\n\n";
+close SHELL                  or die "Can't close $script: $!\n";
+chmod( 0754, $script ) == 1 or die "\nCan't chmod $script: $!\n";
+
+$script = "${shell}3";
+print "Shell #3 is $script\n";
+open SHELL, ">$script"     or die "Can't open $script: $!\n";
+write_header( \*SHELL, $script, '# ' );
+print SHELL
+  "# Step 3 -- Use SQL*Plus to run $add_tbl_sql\n",
+  "#           which will recreate all tables in tablespace $tblsp\n\n",
+  "sqlplus -s / << EOF\n\n",
+  "   SPOOL $add_tbl_log\n\n",
+  "   @ $add_tbl_sql\n\n",
+  "EOF\n\n",
+  "#  --- END OF FILE ---\n\n";
+close SHELL                  or die "Can't close $script: $!\n";
+chmod( 0754, $script ) == 1 or die "\nCan't chmod $script: $!\n";
+
+$script = "${shell}4";
+print "Shell #4 is $script\n";
+open SHELL, ">$script"     or die "Can't open $script: $!\n";
+write_header( \*SHELL, $script, '# ' );
+print SHELL
+  "# Step 4 -- Import the tables back into Tablespace $tblsp\n\n",
+  "nohup gunzip -c $gzip \\\n",
+  "              > $pipefile &\n\n",
+  "imp / parfile = $imp_par\n\n",
+  "#  --- END OF FILE ---\n\n";
+close SHELL                  or die "Can't close $script: $!\n";
+chmod( 0754, $script ) == 1 or die "\nCan't chmod $script: $!\n";
+
+$script = "${shell}5";
+print "Shell #5 is $script\n";
+open SHELL, ">$script"     or die "Can't open $script: $!\n";
+write_header( \*SHELL, $script, '# ' );
+print SHELL
+  "# Step 5 -- Use SQL*Plus to run $add_ndx_sql\n",
+  "#           which will recreate all indexes/constraints ",
+  "in tablespace $tblsp\n\n",
+  "sqlplus -s / << EOF\n\n",
+  "   SPOOL $add_ndx_log\n\n",
+  "   @ $add_ndx_sql\n\n",
+  "EOF\n\n",
+  "#  --- END OF FILE ---\n\n";
+close SHELL                  or die "Can't close $script: $!\n";
+chmod( 0754, $script ) == 1 or die "\nCan't chmod $script: $!\n";
 
 print "\n$0 completed successfully\non ", scalar localtime,"\n\n";
 
@@ -738,8 +911,8 @@ sub connect_to_oracle
 # sub get_args
 #
 # Uses supplied module Getopt::Long to place command line options into the
-# hash %args.  Ensures that at least one of the mandatory arguments has
-# been supplied, and sets the defrag type.
+# hash %args.  Ensures that at least the mandatory argument --tablespace
+# was supplied.  Also verifies directory arguments and connects to Oracle.
 #
 sub get_args
 {
@@ -751,6 +924,7 @@ sub get_args
               "alttablespace:s",
               "expdir:s",
               "logdir:s",
+              "partitions:s",
               "password:s",
               "prefix:s",
               "sid:s",
@@ -763,23 +937,137 @@ sub get_args
   #
   # If there is anything left in @ARGV, we have a problem
   #
-  if ( @ARGV ) 
-  {
-    print STDERR "\n***Error:  unrecognized argument";
-    print  ( @ARGV == 1 ? ":  " : "s:  " );
-    print ( join " ",@ARGV );
-    print "\n\n$0 aborted,\n\n";
-    exit 1;
-  }
+  die "\n***Error:  unrecognized argument",
+      ( @ARGV == 1 ? ":  " : "s:  " ),
+      ( join " ",@ARGV ),
+      "\n$0 aborted,\n\n" ,
+    if @ARGV;
+  
   #
-  # Otherwise, abort unless we have minimum requirements
+  # Validate arguments (maybe they type as bad as we do!
   #
-  elsif ( not defined $args{ tablespace } ) 
-  {
-    print STDERR "\n***Error:  You must specify --tablespace\n\n",
-                 "$0 aborted,\n\n";
-    exit 1;
-  }
+
+  $sqldir = ( $args{ sqldir } eq "." ) ? cwd : $args{ sqldir };
+  die "\n***Error:  sqldir defined as '$sqldir', which is not a Directory\n",
+      "$0 aborted,\n\n"
+    unless -d $sqldir;
+
+  $logdir = ( $args{ logdir } eq "." ) ? cwd : $args{ logdir };
+  die "\n***Error:  logdir defined as '$logdir', which is not a Directory\n",
+      "$0 aborted,\n\n"
+    unless -d $logdir;
+
+  $expdir = ( $args{ expdir } eq "." ) ? cwd : $args{ expdir };
+  die "\n***Error:  expdir defined as '$expdir', which is not a Directory\n",
+      "$0 aborted,\n\n"
+    unless -d $expdir;
+
+  $tblsp = uc( $args{ tablespace } ) or
+  die "\n***Error:  You must specify --tablespace=<NAME>\n",
+      "$0 aborted,\n\n";
+
+  $partitions = ( lc( $args{ partitions } ) eq 'resize' ? 'resize' 
+                                                        : 'exchange' );
+
+  $alttblsp = uc( $args{ alttablespace } );
+
+  $prefix = $args{ prefix };
+
+  connect_to_oracle();      # Will fail unless sid, user, password are OK
+
+  # Confirm the tablespace exists
+  $stmt =
+      "
+       SELECT
+              'EXISTS'
+       FROM
+              dba_tablespaces  t
+       WHERE
+                  tablespace_name   = '$tblsp'
+              AND status            = 'ONLINE'
+              AND contents         <> 'TEMPORARY'
+              AND extent_management = 'DICTIONARY'
+              AND NOT EXISTS(
+                              SELECT
+                                     null
+                              FROM
+                                     dba_segments  s
+                              WHERE
+                                         s.segment_type    = 'ROLLBACK'
+                                     AND s.tablespace_name =
+                                         t.tablespace_name
+                            )
+      ";
+
+  $sth = $dbh->prepare( $stmt );
+  $sth->execute;
+  $row = $sth->fetchrow_array;
+
+  die "\n***Error:  Tablespace \U$tblsp",
+      " does not exist\n",
+      "           or is not ONLINE\n",
+      "           or is managed LOCALLY\n",
+      "           or is a TEMPORARY tablespace\n",
+      "           or contains ROLLBACK segments.\n\n"
+    unless $row;
+
+  # First row returned is valid tablespace, and is $alttblsp.
+  # Since we know $tblsp is good, we're guaranteed at least one row.
+  $stmt =
+      "
+       SELECT
+              tablespace_name
+       FROM
+              dba_tablespaces  t
+       WHERE
+                  tablespace_name   = '$alttblsp'
+              AND status            = 'ONLINE'
+              AND contents         <> 'TEMPORARY'
+              AND extent_management = 'DICTIONARY'
+              AND NOT EXISTS(
+                              SELECT
+                                     null
+                              FROM
+                                     dba_segments  s
+                              WHERE
+                                         s.segment_type    = 'ROLLBACK'
+                                     AND s.tablespace_name =
+                                         t.tablespace_name
+                            )
+       UNION ALL
+       SELECT
+              tablespace_name
+       FROM
+              dba_tablespaces  t
+       WHERE
+                  tablespace_name   = 'USERS'
+              AND status            = 'ONLINE'
+              AND contents         <> 'TEMPORARY'
+              AND extent_management = 'DICTIONARY'
+              AND NOT EXISTS(
+                              SELECT
+                                     null
+                              FROM
+                                     dba_segments  s
+                              WHERE
+                                         s.segment_type    = 'ROLLBACK'
+                                     AND s.tablespace_name =
+                                         t.tablespace_name
+                            )
+       UNION ALL
+       SELECT
+              tablespace_name
+       FROM
+              dba_tablespaces
+       WHERE
+                  tablespace_name   = '$tblsp'
+      ";
+
+  $sth = $dbh->prepare( $stmt );
+  $sth->execute;
+  $aref = $sth->fetchall_arrayref;
+
+  $alttblsp = ( shift @$aref )->[0];
 }
 
 # sub initialize_queries
@@ -850,25 +1138,6 @@ sub initialize_queries
               AND i.index_type      = 'IOT - TOP'
               AND i.owner           = p.index_owner
               AND i.table_name      = p.index_name
-              AND NOT EXISTS (
-                               SELECT
-                                      null
-                               FROM
-                                      dba_ind_partitions
-                               WHERE
-                                          index_owner      = i.owner
-                                      AND table_name       = i.index_name
-                                      AND tablespace_name <> '$tblsp'
-                               UNION ALL
-                               SELECT
-                                      null
-                               FROM
-                                      dba_ind_subpartitions
-                               WHERE
-                                          index_owner      = i.owner
-                                      AND table_name       = i.index_name
-                                      AND tablespace_name <> '$tblsp'
-                             )
        UNION ALL
        SELECT
               i.owner
@@ -881,16 +1150,6 @@ sub initialize_queries
               AND i.index_type      = 'IOT - TOP'
               AND i.owner           = p.index_owner
               AND i.table_name      = p.index_name
-              AND NOT EXISTS (
-                               SELECT
-                                      null
-                               FROM
-                                      dba_ind_subpartitions
-                               WHERE
-                                          index_owner      = i.owner
-                                      AND table_name       = i.index_name
-                                      AND tablespace_name <> '$tblsp'
-                             )
       ";
 
   $table_query =
@@ -948,6 +1207,84 @@ sub initialize_queries
                                       AND tablespace_name <> '$tblsp'
                              )
       ";
+
+  $partition_query_hash =
+      "
+       SELECT DISTINCT
+              table_owner
+            , table_name
+            , partition_name
+            , segment_type
+       FROM
+            (
+              SELECT
+                     p.table_owner
+                   , p.table_name
+                   , p.partition_name
+                   , 'PARTITION'             AS segment_type
+              FROM
+                     dba_tab_partitions  p
+                   , dba_part_tables     t
+              WHERE
+                         p.tablespace_name   = '$tblsp'
+                     AND t.owner             = p.table_owner
+                     AND t.table_name        = p.table_name
+                     AND t.partitioning_type = 'HASH'
+                     AND (
+                             p.table_owner
+                           , p.table_name
+                         ) NOT IN (
+                                    $table_query
+                                  )
+              UNION ALL
+              SELECT
+                     table_owner
+                   , table_name
+                   , partition_name
+                   , 'SUBPARTITION'          AS segment_type
+              FROM
+                     dba_tab_subpartitions
+              WHERE
+                         tablespace_name = '$tblsp'
+                     AND (
+                             table_owner
+                           , table_name
+                         ) NOT IN (
+                                    $table_query
+                                  )
+            )
+      ";
+
+  $partition_query_range =
+      "
+       SELECT DISTINCT
+              table_owner
+            , table_name
+            , partition_name
+            , segment_type
+       FROM
+            (
+              SELECT
+                     p.table_owner
+                   , p.table_name
+                   , p.partition_name
+                   , 'PARTITION'             AS segment_type
+              FROM
+                     dba_tab_partitions  p
+                   , dba_part_tables     t
+              WHERE
+                         p.tablespace_name   = '$tblsp'
+                     AND t.owner             = p.table_owner
+                     AND t.table_name        = p.table_name
+                     AND t.partitioning_type = 'RANGE'
+                     AND (
+                             p.table_owner
+                           , p.table_name
+                         ) NOT IN (
+                                    $table_query
+                                  )
+            )
+      ";
 }
 
 # sub print_help
@@ -990,6 +1327,41 @@ sub print_help
 
            Directory to place the import/export .log files.  Defaults to
            environment variable DBA_LOG, or to the current directory.
+
+  --partitions=STRING *
+
+           Two options to handle partitions are available.  These pertain
+           to individual partitions not belonging to the tables wholely
+           residing in the named tablespace.  In other words, partitions
+           belonging to a table whose partitions exist in 2 or more 
+           tablespaces.
+
+           The first is 'resize', where the following takes place:
+               The partition is exported
+               During the DROP objects phase, the partition is
+                 a) truncated
+                 b) MOVEd to the alternate tablespace as a minimum size
+                    segment.
+               During the CREATE phase, the partition is
+                 a) MOVEd back into the primary tablespace
+                 b) Resized according to the resizing algorithm
+               The partition is then repopulated via the Import.  Note
+               that the indexes are still in place during the import,
+               slowing this operation.  This method is clean, safe and
+               simple, but may not be appropriate if there are many
+               partitions in the tablespace and/or they have many indexes.
+               No special processing is done for the indexes of the
+               tables of these partitions, the assumption being that the
+               indexes are in a separate tablespace.  This method has the
+               advantage of requiring but one export.
+
+               Note that HASH partitions/subpartitions are not (can not
+               be) resized by this method.  They are, however, moved out
+               of the primary tablespace so that the coalesce is
+               effective.  They are returned to the tablespace before
+               the import occurs.
+
+           The second... [has yet to be built]
 
   --password=PASSWORD
 
@@ -1044,7 +1416,7 @@ sub print_help
 # sub set_defaults
 #
 # If file HOME/.defragrc exists, reads its contents into hash %args.
-# Otherwise, it fills the hash with arbitrary defaults.
+# Otherwise, fill the hash with arbitrary defaults.
 #
 sub set_defaults
 {
@@ -1065,18 +1437,20 @@ sub set_defaults
     close RC                         or die "Can't close defragrc:  $!\n";
 
   # Just in case they farkled the .defragrc file
-  $args{ expdir } = "."       unless $args{ expdir };
-  $args{ sqldir } = "."       unless $args{ sqldir };
-  $args{ logdir } = "."       unless $args{ logdir };
-  $args{ prefix } = "defrag_" unless $args{ prefix };
+  $args{ expdir }     = '.'       unless $args{ expdir };
+  $args{ sqldir }     = '.'       unless $args{ sqldir };
+  $args{ logdir }     = '.'       unless $args{ logdir };
+  $args{ prefix }     = 'defrag_' unless $args{ prefix };
+  $args{ partitions } = 'resize' unless $args{ partitions };
   }
   else 
   {
     # First time for this user
-    $args{ expdir } = $ENV{ DBA_EXP }    || ".";
-    $args{ sqldir } = $ENV{ DBA_SQL }    || ".";
-    $args{ logdir } = $ENV{ DBA_LOG }    || $ENV{ LOGDIR } || ".";
-    $args{ prefix } = "defrag_";
+    $args{ expdir }     = $ENV{ DBA_EXP }    || ".";
+    $args{ sqldir }     = $ENV{ DBA_SQL }    || ".";
+    $args{ logdir }     = $ENV{ DBA_LOG }    || $ENV{ LOGDIR } || ".";
+    $args{ prefix }     = "defrag_";
+    $args{ partitions } = 'resize';
   }
   Getopt::Long::Configure( 'passthrough' );
 }
@@ -1096,6 +1470,14 @@ sub write_header
 }
 
 # $Log: defrag.pl,v $
+# Revision 1.4  2000/11/19 20:08:58  rvsutherland
+# Added 'resize' partitions option.
+# Restructured file creation.
+# Added shell scripts to simplify executing generated files.
+# Modified selection of IOT tables (now handled same as indexes)
+# Added validation of input arguments -- meaning we now check for
+# hanging chad and pregnant votes  ;-)
+#
 # Revision 1.3  2000/11/17 21:35:53  rvsutherland
 # Commented out Direct Path export -- Import has a bug (at least on Linux)
 #
@@ -1118,6 +1500,8 @@ defrag.pl -- Creates SQL*Plus command files to defragment a tablespace.
 [--expdir=PATH]
 
 [--logdir=PATH]
+
+[--partitions={resize|exchange}]
 
 [--resize=STRING]
 

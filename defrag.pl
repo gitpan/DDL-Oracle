@@ -1,6 +1,6 @@
 #! /usr/bin/perl -w
 
-# $Id: defrag.pl,v 1.8 2000/12/06 00:43:45 rvsutherland Exp $
+# $Id: defrag.pl,v 1.9 2000/12/09 17:38:56 rvsutherland Exp $
 #
 # Copyright (c) 2000 Richard Sutherland - United States of America
 #
@@ -18,8 +18,22 @@ use strict;
 my %args;
 my %uniq;
 
+my @constraints;
 my @export_objects;
 my @export_temps;
+my @perf_tables = ( 
+                   'DBA_ALL_TABLES',
+                   'DBA_INDEXES', 
+                   'DBA_PART_INDEXES',
+                   'DBA_PART_TABLES',
+                   'DBA_SEGMENTS', 
+                   'DBA_TABLES', 
+                   'THE_CONSTRAINTS',
+                   'THE_IOTS',
+                   'THE_INDEXES',
+                   'THE_PARTITIONS',
+                   'THE_TABLES',
+                  );
 my @sizing_array;
 
 my $add_temp_log;
@@ -35,15 +49,11 @@ my $drop_ddl;
 my $drop_temp_ddl;
 my $drop_temp_log;
 my $drop_temp_sql;
-my $exchange_query;
 my $expdir;
-my $gzip;
 my $home = $ENV{HOME}
         || $ENV{LOGDIR}
-        || ( getpwuid($REAL_USER_ID) )[7]
+        || ( getpwuid( $REAL_USER_ID ) )[7]
         || die "\nCan't determine HOME directory.\n";
-my $index_query;
-my $iot_query;
 my $logdir;
 my $obj;
 my $other_constraints;
@@ -57,15 +67,13 @@ my $prttn_imp_par;
 my $prttn_imp_text;
 my $row;
 my $script;
-my $shell;
 my $sqldir;
 my $sth;
 my $stmt;
-my $table_query;
 my $tblsp;
 my $text;
 my $user = getlogin
-        || scalar getpwuid($REAL_USER_ID)
+        || scalar getpwuid( $REAL_USER_ID )
         || undef;
 
 
@@ -84,34 +92,36 @@ if (
   print_help();
   exit 0;
 }
-else 
-{
-  get_args();
-}
 
 print "\n$0 is being executed by $user\non ", scalar localtime,"\n\n";
+get_args();
+print "Generating files to defrag Tablespace $tblsp.\n",
+      "Using Tablespace $alttblsp for partition operations.\n\n";
+initialize_queries();
 
 #
 # Display user options, and save them in .defrag.rc
 #
 
 delete $args{ sid } if $args{ sid } eq "";
-open RC, ">$home/.defragrc" or die "Can't open .defrag.rc:  $!\n";
-KEY: foreach my $key ( sort keys %args ) 
-{
-  next KEY unless (
-                       $key eq "sid"
-                    or $key eq "logdir"
-                    or $key eq "sqldir"
-                    or $key eq "prefix"
-                    or $key eq "expdir"
-                    or $key eq "resize"
-                  );
-  print "$key = $args{ $key }\n";
-  print RC "$key = $args{ $key }\n";
-}
-close RC or die "Can't close .defrag.rc:  $!\n";
-print "\n";
+open RC, ">$home/.defragrc" or die "Can't open $home/.defragrc:  $!\n";
+KEY:
+  foreach my $key ( sort keys %args ) 
+  {
+    next KEY unless (
+                         $key eq "sid"
+                      or $key eq "logdir"
+                      or $key eq "sqldir"
+                      or $key eq "prefix"
+                      or $key eq "expdir"
+                      or $key eq "resize"
+                    );
+    print "$key = $args{ $key }\n";
+    print RC "$key = $args{ $key }\n";
+  }
+close RC or die "Can't close $home/.defragrc:  $!\n";
+
+print "\nWorking...\n\n";
 
 ########################################################################
 
@@ -119,28 +129,24 @@ print "\n";
 # Now we're ready -- start dafriggin' defraggin'
 #
 
-print "Generating files to defrag Tablespace $tblsp.\n",
-      "Using Tablespace $alttblsp for partition operations.\n\n";
-
-print "Working...\n\n";
-
-initialize_queries();
-
-# The 9 steps below issue queries mostly comprised of 4 main queries,
-# sometimes doing UNIONs and/or MINUSes among them.
+# The 10 steps below issue queries mostly comprised of 5 main queries,
+# sometimes doing UNIONs and/or MINUSes among them.  The query results
+# are stored in temporary tables for performance reasons.
+#
 # See sub 'initialize_queries' for the queries and their descriptions.
 #
 
 # Step 1 - Export the stray partitions -- those in our tablespace whose
 #          table also has partitions in at least one other tablespace.
-#          Using this option, there will be 2 exports.  After the first
-#          export, for each such partition:
+#          If said partitions exist, there will be 2 exports.  After the
+#          first export, for each such partition:
 #            a) Create a Temp table mirroring the partition.
 #            b) Create indexes on the Temp table matching the LOCAL 
 #               indexes on the partitioned table.
 #            c) Create a PK matching the PK of the partitioned table,
 #               if any.
 #            d) EXCHANGE the Temp table with the partition.
+#            e) MOVE the [now empty] partition to the alternate tablespace.
 #
 #          With the data now in the Temp table, the Temp table gets 
 #          treated the same as other regular tables in our tablespace
@@ -158,7 +164,7 @@ initialize_queries();
 #
 #          NOTE:  Two 'fall back' scripts are created which are to be
 #                 used ONLY in the event that problems occur during
-#                 the CTAS step (Shell #2 when using this option).
+#                 Step 1 (Shell #2 when such partitions exist).
 #
 #                  ***  DO NOT PROCEED IF Shell #2 HAS ERRORS ***
 #
@@ -228,14 +234,27 @@ foreach $row ( @$aref )
   # Remove REM lines created by DDL::Oracle
   $drop_tbl = ( join "\n", grep !/^REM/, split /\n/, $drop_tbl ) . "\n\n";
 
+  $obj = DDL::Oracle->new(
+                           type => 'table',
+                           list => [
+                                     [
+                                       "$owner",
+                                       "$table:$partition",
+                                     ]
+                                   ],
+                         );
+  my $resize = $obj->resize;
+  # Remove REM lines created by DDL::Oracle
+  $resize = ( join "\n", grep !/^REM/, split /\n/, $resize ) . "\n\n";
+
   my $drop_temp = $drop_tbl .
                   trunc( @$row ) .
-                  move ( @$row, $tblsp );
+                  $resize;
 
   $create_temp_ddl  = group_header( 1 )   unless $create_temp_ddl;
   $create_temp_ddl .= $create_tbl .
                       $exchange .
-                      move ( @$row, $alttblsp );
+                      move( @$row, $alttblsp );
 
   $drop_ddl         = group_header( 2 )   unless $drop_ddl;
   $drop_ddl        .= $drop_tbl;
@@ -263,7 +282,7 @@ foreach $row ( @$aref )
 
 $stmt =
       "
-       SELECT
+       SELECT --+ use_hash(c r)
               c.owner
             , c.constraint_name
        FROM
@@ -281,25 +300,19 @@ $stmt =
                                 owner
                               , table_name
                          FROM
-                              (
-                                SELECT
-                                       owner
-                                     , table_name
-                                FROM
-                                       THE_TABLES
-                                UNION ALL
-                                SELECT
-                                       owner
-                                     , table_name
-                                FROM
-                                       THE_IOTs
-                                UNION ALL
-                                SELECT
-                                       owner
-                                     , table_name
-                                FROM
-                                       THE_INDEXES
-                              )
+                                THE_TABLES
+                         UNION ALL
+                         SELECT
+                                owner
+                              , table_name
+                         FROM
+                                THE_IOTs
+                         UNION ALL
+                         SELECT
+                                owner
+                              , table_name
+                         FROM
+                                THE_INDEXES
                        )
        ORDER
           BY
@@ -315,14 +328,13 @@ $obj = DDL::Oracle->new(
                          list => $fk_aref,
                        );
 
-$drop_ddl .= group_header( 3 ) .
-             $obj->drop            if @$fk_aref;
+$drop_ddl .= group_header( 3 ) . $obj->drop    if @$fk_aref;
 
 #
 # Step 3 - Drop and create the tables.  NOTE:  the DROP statements are in
-#          one file followed by coalesce tablespace statements, and the
+#          one file followed by COALESCE tablespace statements, and the
 #          CREATE statements are put in a separate file.  The assumption
-#          here is that the user will verify that the drop and coalesce
+#          here is that the user will verify that the DROP and COALESCE
 #          statements executed OK before executing the CREATE tables file.
 #
 
@@ -366,11 +378,9 @@ if ( @$aref )
                            list => $aref,
                          );
 
-  $drop_ddl       .= group_header( 4 ) .
-                     $obj->drop;
+  $drop_ddl       .= group_header( 4 ) . $obj->drop;
 
-  $create_tbl_ddl .= group_header( 8 ) .
-                     $obj->create;
+  $create_tbl_ddl .= group_header( 8 ) . $obj->create;
 }
 
 #
@@ -396,27 +406,21 @@ $stmt =
                                 owner
                               , table_name
                          FROM
-                              (
-                                SELECT
-                                       owner
-                                     , table_name
-                                FROM
-                                       THE_INDEXES
-                                MINUS
-                                (
-                                  SELECT
-                                         owner
-                                       , table_name
-                                  FROM
-                                         THE_TABLES
-                                  UNION ALL
-                                  SELECT
-                                         owner
-                                       , table_name
-                                  FROM
-                                         THE_IOTs
-                                )
-                              )
+                                THE_INDEXES
+                         MINUS
+                         (
+                           SELECT
+                                  owner
+                                , table_name
+                           FROM
+                                  THE_TABLES
+                           UNION ALL
+                           SELECT
+                                  owner
+                                , table_name
+                           FROM
+                                  THE_IOTs
+                         )
                        )
        ORDER
           BY
@@ -432,17 +436,12 @@ $obj = DDL::Oracle->new(
                          list => $aref,
                        );
 
-$drop_ddl .= group_header( 5 ) .
-             $obj->drop          if @$aref;
+$drop_ddl .= group_header( 5 ) . $obj->drop    if @$aref;
 
 #
 # Step 5 - Drop all of our indexes, unless they are the supporting index
 #          of a Primary Key or Unique constraint -- these disappeared in
-#          the preceding step.  NOTE:  This will generate DROP INDEX
-#          statements for PK/UK's if the constraint name differs from the
-#          index name (e.g., system generated names).  It won't cause any
-#          harm, but it WILL get an error in SQL*Plus.  Maybe we'll fix
-#          this someday.
+#          the preceding step.
 #
 
 $stmt =
@@ -492,8 +491,7 @@ $obj = DDL::Oracle->new(
                          list => $aref,
                        );
 
-$drop_ddl .= group_header( 6 ) .
-             $obj->drop           if @$aref;
+$drop_ddl .= group_header( 6 ) . $obj->drop    if @$aref;
 
 #
 # Step 6 - Create ALL indexes.
@@ -520,8 +518,7 @@ $obj = DDL::Oracle->new(
                          list => $aref,
                        );
 
-$create_ndx_ddl .= group_header( 10 ) .
-                   $obj->create         if @$aref;
+$create_ndx_ddl .= group_header( 10 ) . $obj->create    if @$aref;
 
 #
 # Step 7 - Create all Primary Key, Unique and Check constraints on our
@@ -569,7 +566,6 @@ $sth = $dbh->prepare( $stmt );
 $sth->execute;
 $aref = $sth->fetchall_arrayref;
 
-my @constraints;
 foreach $row ( @$aref )
 {
   my ( $owner, $constraint_name, $cons_type, $condition, ) = @$row;
@@ -589,8 +585,7 @@ $obj = DDL::Oracle->new(
                          list => \@constraints,
                        );
 
-$create_ndx_ddl .= group_header( 11 ) .
-                   $obj->create          if @constraints;
+$create_ndx_ddl .= group_header( 11 ) . $obj->create    if @constraints;
 
 #
 # Step 8 - Create all Check constraints on our IOT tables (their PK was
@@ -647,8 +642,7 @@ $obj = DDL::Oracle->new(
                          list => \@constraints,
                        );
 
-$create_ndx_ddl .= group_header( 12 ) .
-                   $obj->create           if @constraints;
+$create_ndx_ddl .= group_header( 12 ) . $obj->create    if @constraints;
 
 #
 # Step 9 - Recreate all Foreign Keys referenceing our tables and IOT's or
@@ -661,8 +655,7 @@ $obj = DDL::Oracle->new(
                          list => $fk_aref,
                        );
 
-$create_ndx_ddl .= group_header( 13 ) .
-                   $obj->create          if @$fk_aref;
+$create_ndx_ddl .= group_header( 13 ) . $obj->create    if @$fk_aref;
 
 #
 # Step 10 - REBUILD all UNUSABLE indexes/index [sub]partitions. These are
@@ -710,8 +703,7 @@ $obj = DDL::Oracle->new(
                          list => $aref,
                        );
 
-$create_ndx_ddl .= group_header( 14 ) .
-                   $obj->resize         if @$aref;
+$create_ndx_ddl .= group_header( 14 ) . $obj->resize    if @$aref;
 
 #
 # It's hard to believe, but maybe they gave us an empty tablespace
@@ -737,19 +729,16 @@ $stmt =
               AND contents         <> 'TEMPORARY'
               AND tablespace_name  <> 'SYSTEM'
               AND extent_management = 'DICTIONARY'
-              AND NOT EXISTS        (
-                                      SELECT
-                                             null
-                                      FROM
-                                             dba_segments  s
-                                      WHERE
-                                                 s.segment_type    = 'ROLLBACK'
-                                             AND s.tablespace_name =
-                                                 t.tablespace_name
-                                    )
+       MINUS
+       SELECT
+              LOWER(tablespace_name)
+       FROM
+              dba_segments
+       WHERE
+              segment_type    = 'ROLLBACK'
        ORDER
           BY
-              tablespace_name
+              1
       ";
 
 $sth = $dbh->prepare( $stmt );
@@ -762,36 +751,7 @@ foreach $row ( @$aref )
                "ALTER TABLESPACE @$row->[0] COALESCE ;\n\n",
 }
 
-# Drop the Performance enhancing tables.
-foreach my $table ( 
-                    'DBA_SEGMENTS', 
-                    'THE_CONSTRAINTS',
-                    'THE_IOTS',
-                    'THE_INDEXES',
-                    'THE_PARTITIONS',
-                    'THE_TABLES',
-                  )
-{
-   $stmt =
-    "
-     SELECT
-            'Present, sir!'
-     FROM
-            user_tables
-     WHERE
-            table_name = ?
-    ";
-
-  $sth = $dbh->prepare( $stmt );
-  $sth->execute( $table );
-  my $cnt = $sth->fetchrow_array;
-
-  $stmt = "TRUNCATE TABLE $table";
-  $dbh->do( $stmt )                  if $cnt;
-
-  $stmt = "DROP TABLE $table";
-  $dbh->do( $stmt )                  if $cnt;
-}
+drop_perf_temps();
 
 #
 # Wrap it up -- open, write and close all files
@@ -918,14 +878,14 @@ print "Export FIFO pipe        : $pipefile\n\n";
 # And, finally, the little shell scripts to help with the driving
 #
 
-my $i = 0;
 print "\n";
 
-$shell = "$sqldir/$prefix$tblsp.sh";
+my $i     = 0;
+my $shell = "$sqldir/$prefix$tblsp.sh";
+my $gzip  = "$expdir/prttn_$prefix$tblsp.dmp.gz";
 
 if ( $create_temp_ddl )
 {
-  $gzip  = "$expdir/prttn_$prefix$tblsp.dmp.gz";
 
   $script = $shell . ++$i;
   $text =
@@ -946,8 +906,6 @@ if ( $create_temp_ddl )
     "EOF\n\n";
   create_shell( $script, $text );
 }
-
-$gzip  = "$expdir/$prefix$tblsp.dmp.gz";
 
 $script = $shell . ++$i;
 $text =
@@ -1037,7 +995,7 @@ if ( $create_temp_ddl )
   create_shell( $script, $text );
 }
 
-my @shells = glob("$sqldir/$prefix$tblsp.sh?");
+my @shells = glob( "$sqldir/$prefix$tblsp.sh?" );
 chmod( 0754, @shells ) == @shells or die "\nCan't chmod some shells: $!\n";
 
 print "\n$0 completed successfully\non ", scalar localtime,"\n\n";
@@ -1078,6 +1036,8 @@ sub connect_to_oracle
                        }
                      );
 
+  # $dbh->do( "alter session set sql_trace = true" );
+
   DDL::Oracle->configure(
                           dbh    => $dbh,
                           view   => 'DBA',
@@ -1099,6 +1059,76 @@ sub create_shell
   write_header( \*SHELL, $script, '# ' );
   print SHELL $text . "#  --- END OF FILE ---\n\n";
   close SHELL                  or die "Can't close $script: $!\n";
+}
+
+# sub drop_perf_temps
+#
+# Drops the temporary tables created to boost performance
+#
+sub drop_perf_temps
+{
+  foreach my $table( @perf_tables )
+  {
+    $stmt =
+     "
+      SELECT
+             'Yo!'
+      FROM
+             user_synonyms
+      WHERE
+             synonym_name = UPPER( ? )
+     ";
+
+    $sth = $dbh->prepare( $stmt );
+    $sth->execute( $table );
+    my $present = $sth->fetchrow_array;
+    $dbh->do( "DROP SYNONYM $table" )    if $present;
+
+    if ( $table =~ /^DBA/ )
+    {
+      $stmt =
+       "
+        SELECT
+               'Present, sir!'
+        FROM
+               user_tables
+        WHERE
+               table_name = UPPER( ? )
+       ";
+
+      $sth = $dbh->prepare( $stmt );
+      $sth->execute( "$prefix$table" );
+      my $present = $sth->fetchrow_array;
+
+      if ( $present )
+      {
+        $dbh->do( "TRUNCATE TABLE $prefix$table" );
+        $dbh->do( "DROP     TABLE $prefix$table" );
+      }
+    }
+    else
+    {
+      $stmt =
+       "
+        SELECT
+               'Present, sir!'
+        FROM
+               user_tables
+        WHERE
+               table_name = ?
+       ";
+
+      $sth = $dbh->prepare( $stmt );
+      $sth->execute( $table );
+      my $present = $sth->fetchrow_array;
+
+      if ( $present )
+      {
+        $dbh->do( "TRUNCATE TABLE $table" );
+        $dbh->do( "DROP     TABLE $table" );
+      }
+    }
+  }
 }
 
 # sub get_args
@@ -1139,6 +1169,10 @@ sub get_args
   # Validate arguments (maybe they type as bad as we do!
   #
 
+  $tblsp = uc( $args{ tablespace } ) or
+  die "\n***Error:  You must specify --tablespace=<NAME>\n",
+      "$0 aborted,\n\n";
+
   $sqldir = ( $args{ sqldir } eq "." ) ? cwd : $args{ sqldir };
   die "\n***Error:  sqldir defined as '$sqldir', which is not a Directory\n",
       "$0 aborted,\n\n"
@@ -1154,21 +1188,21 @@ sub get_args
       "$0 aborted,\n\n"
     unless -d $expdir;
 
-  $tblsp = uc( $args{ tablespace } ) or
-  die "\n***Error:  You must specify --tablespace=<NAME>\n",
-      "$0 aborted,\n\n";
-
   $alttblsp = uc( $args{ alttablespace } );
 
   $prefix = $args{ prefix };
 
   connect_to_oracle();      # Will fail unless sid, user, password are OK
 
+  print "Initializing private copies of some dictionary views...\n\n";
+
+  initialize_perf_temps();
+
   # Confirm the tablespace exists
   $stmt =
       "
        SELECT
-              'EXISTS'
+              tablespace_name
        FROM
               dba_tablespaces  t
        WHERE
@@ -1176,16 +1210,13 @@ sub get_args
               AND status            = 'ONLINE'
               AND contents         <> 'TEMPORARY'
               AND extent_management = 'DICTIONARY'
-              AND NOT EXISTS(
-                              SELECT
-                                     null
-                              FROM
-                                     dba_segments  s
-                              WHERE
-                                         s.segment_type    = 'ROLLBACK'
-                                     AND s.tablespace_name =
-                                         t.tablespace_name
-                            )
+       MINUS
+       SELECT
+              tablespace_name
+       FROM
+              dba_segments
+       WHERE
+              segment_type = 'ROLLBACK'
       ";
 
   $sth = $dbh->prepare( $stmt );
@@ -1204,52 +1235,50 @@ sub get_args
   # Since we know $tblsp is good, we're guaranteed at least one row.
   $stmt =
       "
-       SELECT
-              tablespace_name
-       FROM
-              dba_tablespaces  t
-       WHERE
-                  tablespace_name   = '$alttblsp'
-              AND status            = 'ONLINE'
-              AND contents         <> 'TEMPORARY'
-              AND extent_management = 'DICTIONARY'
-              AND NOT EXISTS(
-                              SELECT
-                                     null
-                              FROM
-                                     dba_segments  s
-                              WHERE
-                                         s.segment_type    = 'ROLLBACK'
-                                     AND s.tablespace_name =
-                                         t.tablespace_name
-                            )
+       (
+         SELECT
+                tablespace_name
+         FROM
+                dba_tablespaces
+         WHERE
+                    tablespace_name   = '$alttblsp'
+                AND status            = 'ONLINE'
+                AND contents         <> 'TEMPORARY'
+                AND extent_management = 'DICTIONARY'
+         MINUS
+         SELECT
+                tablespace_name
+         FROM
+                dba_segments
+         WHERE
+                segment_type = 'ROLLBACK'
+       )
        UNION ALL
-       SELECT
-              tablespace_name
-       FROM
-              dba_tablespaces  t
-       WHERE
-                  tablespace_name   = 'USERS'
-              AND status            = 'ONLINE'
-              AND contents         <> 'TEMPORARY'
-              AND extent_management = 'DICTIONARY'
-              AND NOT EXISTS(
-                              SELECT
-                                     null
-                              FROM
-                                     dba_segments  s
-                              WHERE
-                                         s.segment_type    = 'ROLLBACK'
-                                     AND s.tablespace_name =
-                                         t.tablespace_name
-                            )
+       (
+         SELECT
+                tablespace_name
+         FROM
+                dba_tablespaces
+         WHERE
+                    tablespace_name   = 'USERS'
+                AND status            = 'ONLINE'
+                AND contents         <> 'TEMPORARY'
+                AND extent_management = 'DICTIONARY'
+         MINUS
+         SELECT
+                tablespace_name
+         FROM
+                dba_segments
+         WHERE
+                segment_type = 'ROLLBACK'
+       )
        UNION ALL
-       SELECT
-              tablespace_name
-       FROM
-              dba_tablespaces
-       WHERE
-                  tablespace_name   = '$tblsp'
+       (
+         SELECT
+                '$tblsp'
+         FROM
+                dual
+       )
       ";
 
   $sth = $dbh->prepare( $stmt );
@@ -1319,7 +1348,7 @@ sub index_and_exchange
        FROM
               dba_segments
        WHERE
-              segment_type   = 'INDEX'
+              segment_type = 'INDEX'
        ORDER
           BY
               1
@@ -1403,6 +1432,41 @@ sub index_and_exchange
   return $text;
 }
 
+# sub initialize_perf_temps
+#
+sub initialize_perf_temps
+{
+  # Drop the Performance enhancing tables -- they shouldn't be here,
+  # but who knows, maybe we crashed last time (how rude!)
+
+  drop_perf_temps();
+
+  # Some Dictionary views are queried repeatedly by us (defrag.pl) as well
+  # as by DDL::Oracle.  They are often complex views, taking as much as 3
+  # to 10 seconds for each query on a large database (e.g., 50,000 segments).
+  # Let's get our own, more efficient copy of this data and avoid this
+  # overhead
+
+  TABLE:
+    foreach my $table( @perf_tables )
+    {
+      next TABLE unless $table =~ /^DBA/;
+
+      $dbh->do
+      ( "
+         CREATE GLOBAL TEMPORARY TABLE $prefix$table
+         ON COMMIT PRESERVE ROWS
+         AS
+         SELECT
+                *
+         FROM
+                sys.$table
+        "
+      );
+      $dbh->do( "CREATE SYNONYM $table FOR $prefix$table" );
+    }
+}
+
 # sub initialize_queries
 #
 # Initializes the driving queries used to retrieve object names involved in
@@ -1411,52 +1475,6 @@ sub index_and_exchange
 #
 sub initialize_queries
 {
-  # Drop the Performance enhancing tables -- they shouldn't be here,
-  # but who knows, maybe we crashed last time (how rude!)
-  foreach my $table ( 
-                      'DBA_SEGMENTS', 
-                      'THE_CONSTRAINTS',
-                      'THE_IOTS',
-                      'THE_INDEXES',
-                      'THE_PARTITIONS',
-                      'THE_TABLES',
-                    )
-  {
-     $stmt =
-      "
-       SELECT
-              'Present, sir!'
-       FROM
-              user_tables
-       WHERE
-              table_name = ?
-      ";
-
-    $sth = $dbh->prepare( $stmt );
-    $sth->execute( $table );
-    my $cnt = $sth->fetchrow_array;
-
-    $stmt = "DROP TABLE $table";
-    $dbh->do( $stmt )                  if $cnt;
-  }
-
-  # Dictionary view DBA_SEGMENTS is queried repeatedly by us (defrag.pl) as
-  # well as by DDL::Oracle.  It's a fairly complex view taking 3 to 10 seconds
-  # for each query on a large database (e.g., 50,000 segments).  Let's get our
-  # own, more efficient copy of this data and avoid this overhead
-  $stmt =
-      "
-       CREATE GLOBAL TEMPORARY TABLE dba_segments
-       ON COMMIT PRESERVE ROWS
-       AS
-       SELECT
-              *
-       FROM
-              dba_segments
-      ";
-
-  $dbh->do( $stmt );
-
   # This query produces a list of THE CONSTRAINTS, sans search_condition
   # which is needed for creating Check Constraints
   $stmt =
@@ -1626,7 +1644,7 @@ sub initialize_queries
   $dbh->do( $stmt );
 
   # This query produces a list of THE TABLES -- non-partitioned tables which
-  # reside in THE TABLESPACE or partitioned tables which have at least one
+  # reside in THE TABLESPACE or partitioned tables which have at every
   # partition in THE TABLESPACE.
   #
   $stmt =
@@ -1699,10 +1717,21 @@ sub move
 {
   my ( $owner, $table, $partition, $type, $tblsp ) = @_;
 
-  return "PROMPT " .
-         "ALTER TABLE \L$owner.$table \UMOVE $type \L$partition\n\n" .
-         "ALTER TABLE \L$owner.$table \UMOVE $type \L$partition\n" .
-         "TABLESPACE \L$tblsp ;\n\n";
+  my $sql = "PROMPT " .
+            "ALTER TABLE \L$owner.$table \UMOVE $type \L$partition\n\n" .
+            "ALTER TABLE \L$owner.$table \UMOVE $type \L$partition\n" .
+            "TABLESPACE \L$tblsp\n";
+
+  if ( $type eq 'PARTITION' )
+  {
+    $sql .= "STORAGE\n" .
+            "(\n" .
+            "  INITIAL  2K\n" .
+            "  NEXT     2K\n" .
+            ") ";
+  }
+
+  return $sql .= ";\n\n";
 }
 
 # sub print_help
@@ -1779,9 +1808,8 @@ sub print_help
 
   --sqldir=PATH *
 
-           Directory to place the SQL files (which will have extensions
-           of .sql, .tbl, .ndx, or .con).  Defaults to environment
-           variable DBA_SQL, or to the current directory.
+           Directory to place the SQL (.sql) files.  Defaults to
+           environment variable DBA_SQL, or to the current directory.
 
   --user=USERNAME
 
@@ -1796,11 +1824,14 @@ sub print_help
   ";
 
   $text = "
-  Program 'defrag.pl' uses 4 main SQL statements to retrieve record sets which
+  Program 'defrag.pl' uses 5 main SQL statements to retrieve record sets which
   form the basis of generated DDL.  They are sometimes UNIONed, sometimes 
   MINUSed, etc., to refine the record sets.  The queries are:
 
   THE TABLESPACE -- the Tablspace named by the '--tablespace=<name>' argument.
+
+  THE CONSTRAINTS -- provides a substitute for DBA_CONSTRAINTS, sans column
+  SEARCH_CONDITION.
 
   THE TABLES -- provides a list of Owner/Table_name's which fully reside in
   THE TABLESPACE.  These are non-partitioned tables plus partitioned tables
@@ -1918,10 +1949,10 @@ sub print_help
 
   ";
 
-  write_file( "./README.stmts", $text, '' );
+  write_file( "./README.defrag", $text, '' );
 
   print "
-  Also, see the 'README.stmts' which was just written in this directory
+  Also, see the 'README.defrag' which was just written in this directory
   for information about the DDL statements generated and their sequence.
   ";
 
@@ -1938,7 +1969,7 @@ sub set_defaults
   if ( -e "$home/.defragrc" ) 
   {
     # We've been here before -- set up per .defragrc
-    open RC, "<$home/.defragrc"      or die "Can't open\n";
+    open RC, "<$home/.defragrc"    or die "Can't open $home/.defragrc:  $!\n";
     while ( <RC> ) 
     {
       chomp;                       # no newline
@@ -1946,10 +1977,10 @@ sub set_defaults
       s/^\s+//;                    # no leading white space
       s/\s+$//;                    # no trailing white space
       next unless length;          # anything left? (or was blank)
-      my ( $key, $value) = split( /\s*=\s*/, $_, 2 );
+      my ( $key, $value ) = split( /\s*=\s*/, $_, 2 );
       $args{ $key } = $value;
     }
-    close RC                         or die "Can't close defragrc:  $!\n";
+    close RC                       or die "Can't close $home/.defragrc:  $!\n";
 
     # Just in case they farkled the .defragrc file
     $args{ expdir } = '.'       unless $args{ expdir };
@@ -2028,44 +2059,6 @@ sub write_header
             "$remark on ", scalar localtime,"\n\n\n\n";
 }
 
-# $Log: defrag.pl,v $
-# Revision 1.8  2000/12/06 00:43:45  rvsutherland
-# Significant performance improvements.
-# No, make that MAJOR gains (i.e., orders of magnitude for large databases).
-# To wit:
-#   Replaced convoluted Dictionary views with 8i Temporary Tables
-#   Widely (but not entirely) switched to bind variables (was interpolated,
-#     causing reparsing in most cases).
-# Also fixed error on REBUILD of Global and non-partitioned indexes.
-#
-# Revision 1.7  2000/12/02 14:06:20  rvsutherland
-# Completed 'exchange' method for handling partitions,
-# including REBUILD of UNUSABLE indexes.
-# Removed 'resize' method for handling partitions.
-#
-# Revision 1.6  2000/11/26 20:10:54  rvsutherland
-# Added 'exchange' method for handling partitions.  Will probably
-# remove the 'resize' method next update.
-#
-# Revision 1.5  2000/11/24 18:36:00  rvsutherland
-# Restructured file writes
-# Revamped 'resize' method for handling partitions
-#
-# Revision 1.4  2000/11/19 20:08:58  rvsutherland
-# Added 'resize' partitions option.
-# Restructured file creation.
-# Added shell scripts to simplify executing generated files.
-# Modified selection of IOT tables (now handled same as indexes)
-# Added validation of input arguments -- meaning we now check for
-# hanging chad and pregnant votes  ;-)
-#
-# Revision 1.3  2000/11/17 21:35:53  rvsutherland
-# Commented out Direct Path export -- Import has a bug (at least on Linux)
-#
-# Revision 1.2  2000/11/16 09:14:38  rvsutherland
-# Major restructure to take advantage of DDL::Oracle.pm
-#
-
 __END__
 
 ########################################################################
@@ -2137,7 +2130,7 @@ The names and number of files output varies according to the Tablespace
 specified and the options selected.  All .sql and .log files and shell
 scripts produced are displayed on STDOUT during the execution of the program.
 
-Also, see 'README.stmts', which will be created when Help is displayed (by
+Also, see 'README.defrag', which will be created when Help is displayed (by
 entering 'defrag.pl' without any arguments).
 
 =head1 AUTHOR

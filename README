@@ -9,7 +9,7 @@ QUICK START GUIDE:
 
     DDL::Oracle requires the DBI and DBD::Oracle modules to talk to the 
     database.  It is designed to reverse engineer DDL for Oracle 8i 
-    instances, but parts might work on earlier Oracle releases.
+    instances.
 
     Read the DBI README then Build/test/install the DBI by doing
 	    perl Makefile.PL
@@ -48,7 +48,7 @@ BEFORE BUILDING, TESTING AND INSTALLING DDL::Oracle you will need to:
     (You can use "Configure -Dprefix=..." to build a private copy.)
     Build, test and istall the DBI and DBD::Oracle modules.
 
-BUILDING
+BUILDING DDL::Oracle
 
     perl Makefile.PL
     make
@@ -57,7 +57,7 @@ BUILDING
 
 IF YOU HAVE PROBLEMS:
 
-If you can't fix it yourself, please post details to:
+If you can't fix it yourself, please email details to:
 
      ddl-oracle-users@lists.sourceforge.net.  
 
@@ -73,11 +73,6 @@ I'm on the mailing list, so I'll see the message.  Please include:
 2. Full details of which version of Oracle you're using.
 
 3. The output of perl -V
-
-3. If you get a core dump, try to include a stack trace from it.
-   (Try installing the Devel::CoreStack module to get a stack trace.)
-   If the stack trace mentions XS_DynaLoader_dl_load_file then rerun
-   make test after setting the environment variable PERL_DL_DEBUG to 2.
 
 Please don't post problems to comp.lang.perl.* or perl5-porters.
 This software is supported via the ddl-oracle-users mailing list.  For 

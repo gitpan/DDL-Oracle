@@ -1,10 +1,10 @@
 MANIFEST
-README
-README.stmts
 Makefile.PL
 Oracle.pm
 test.pl
 ddl.pl
+defrag.pl
 copy_user.pl
 copy_user.sh
-defrag.pl
+README
+README.defrag

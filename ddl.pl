@@ -1,5 +1,7 @@
 #! /usr/bin/perl -w
 
+# $Id: ddl.pl,v 1.5 2000/12/09 17:55:20 rvsutherland Exp $
+
 use strict;
 
 use DBI;
@@ -26,24 +28,24 @@ my $user = getlogin
         || scalar getpwuid($REAL_USER_ID)
         || undef;
 
-print "Enter Action [CREATE]: ";
-chop( my $action = <STDIN> );
+print STDERR "Enter Action [CREATE]: ";
+chomp( my $action = <STDIN> );
 $action = "create" unless $action;
 
-print "Enter Type    [TABLE]: ";
-chop( my $type = <STDIN> );
+print STDERR "Enter Type    [TABLE]: ";
+chomp( my $type = <STDIN> );
 $type = "TABLE" unless $type;
 
-print "Enter Owner [\U$user]: ";
-chop( my $owner = <STDIN> );
+print STDERR "Enter Owner [\U$user]: ";
+chomp( my $owner = <STDIN> );
 $owner = $user unless $owner;
 die "\nYou must specify an Owner.\n" unless $owner;
 
-print "Enter Name           : ";
-chop( my $name = <STDIN> );
+print STDERR "Enter Name           : ";
+chomp( my $name = <STDIN> );
 die "\nYou must specify an object.\n" unless $name;
 
-print "\n";
+print STDERR "\n";
 
 my $obj = DDL::Oracle->new(
                             type  => $type,
@@ -71,4 +73,12 @@ else{
 } ;
 
 print $sql;
+
+# $Log: Ddl.pl,v $
+# Revision 1.5  2000/12/09 17:55:20  rvsutherland
+# Re-added after CVS bug fixed.
+#
+# Revision 1.3  2000/11/11 07:48:59  rvsutherland
+# Added CVS tags
+#
 

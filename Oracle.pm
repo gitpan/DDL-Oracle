@@ -1,4 +1,4 @@
-# $Id: Oracle.pm,v 1.47 2001/05/21 21:29:26 rvsutherland Exp $ 
+# $Id: Oracle.pm,v 1.51 2002/05/22 15:26:01 rvsutherland Exp $ 
 #
 # Copyright (c) 2000, 2001 Richard Sutherland - United States of America
 #
@@ -9,7 +9,7 @@ require 5.004;
 
 BEGIN
 {
-  $DDL::Oracle::VERSION = "1.10"; # Also update version in pod text below!
+  $DDL::Oracle::VERSION = "1.11"; # Also update version in pod text below!
 }
 
 package DDL::Oracle;
@@ -125,10 +125,13 @@ sub configure
 
   $dbh               = $args{ 'dbh'  };
   $attr{ 'view' }    = ( "\U$args{ 'view'  }" eq 'USER' ) ? 'USER' : 'DBA';
-  $attr{ 'schema'  } = ( exists $args{ 'schema'  }  ) ? $args{ 'schema'  } : 1;
-  $attr{ 'resize'  } = ( exists $args{ 'resize'  }  ) ? $args{ 'resize'  } : 1;
-  $attr{ 'prompt'  } = ( exists $args{ 'prompt'  }  ) ? $args{ 'prompt'  } : 1;
-  $attr{ 'heading' } = ( exists $args{ 'heading' }  ) ? $args{ 'heading' } : 1;
+  $attr{ 'schema'  } = ( exists $args{ 'schema'  } ) ? $args{ 'schema'  } : 1;
+  $attr{ 'resize'  } = ( exists $args{ 'resize'  } ) ? $args{ 'resize'  } : 1;
+  $attr{ 'prompt'  } = ( exists $args{ 'prompt'  } ) ? $args{ 'prompt'  } : 1;
+  $attr{ 'grants'  } = ( exists $args{ 'grants'  } ) ? $args{ 'grants'  } : 0;
+  $attr{ 'heading' } = ( exists $args{ 'heading' } ) ? $args{ 'heading' } : 1;
+  $attr{ 'storage' } = ( exists $args{ 'storage' } ) ? $args{ 'storage' } : 1;
+  $attr{ 'tblspace'} = ( exists $args{ 'tblspace'} ) ? $args{ 'tblspace'} : 1;
 
   _set_sizing();
   _get_oracle_release();
@@ -796,7 +799,7 @@ sub _create_constraint
     $sth->execute( $r_cons_name, $r_owner );
     my ( $table_name ) = $sth->fetchrow_array;
 
-    $sql .= "REFERENCES \L$schema$table_name\n" .
+    $sql .= "REFERENCES \L$r_owner\.$table_name\n" .
             _constraint_columns( $r_owner, $r_cons_name, $view );
 
     if ( $delete_rule eq 'CASCADE' )
@@ -1161,7 +1164,16 @@ sub _create_exchange_table
 #
 sub _create_function
 {
-  return _display_source( @_, 'FUNCTION' );
+  my ( $schema, $owner, $name, $view ) = @_;
+
+  my $sql =  _display_source( $schema, $owner, $name, $view, 'FUNCTION' );
+
+  if ( $attr{ 'grants' } )
+  {
+    $sql .= _object_privs( $schema, $owner, $name, $view );
+  }
+
+  return $sql ;
 }
 
 # sub _create_index
@@ -1540,7 +1552,25 @@ sub _create_iot
 {
   my ( $schema, $owner, $name, $view ) = @_;
 
-  my $stmt =
+  my $stmt;
+
+  if ( $oracle_major == 8 and $oracle_minor == 0 )
+  {
+    $stmt =
+      "
+       SELECT
+              'N/A'                         AS monitoring
+            , logging
+            , blocks - NVL(empty_blocks,0)
+       FROM
+              ${view}_all_tables
+       WHERE
+                  table_name = UPPER( ? )
+      ";
+  }
+  else
+  {
+    $stmt =
       "
        SELECT
               DECODE(
@@ -1555,6 +1585,7 @@ sub _create_iot
        WHERE
                   table_name = UPPER( ? )
       ";
+  }
 
   if ( $view eq 'DBA' )
   {
@@ -1572,7 +1603,71 @@ sub _create_iot
        $blocks,
      ) = $sth->fetchrow_array;
 
-  $stmt =
+  if ( $oracle_major == 8 and $oracle_minor == 0 )
+  {
+    $stmt =
+      "
+       SELECT
+              -- Table Properties
+              'N/A'                         AS monitoring
+            , 'N/A'                         AS table_name
+              -- Parallel Clause
+            , LTRIM(degree)
+            , LTRIM(instances)
+              -- Physical Properties
+            , 'INDEX'                       AS organization
+              -- Segment Attributes
+            , 'N/A'                         AS cache
+            , 'N/A'                         AS pct_used
+            , pct_free
+            , DECODE(
+                      ini_trans
+                     ,0,1
+                     ,null,1
+                     ,ini_trans
+                    )                       AS ini_trans
+            , DECODE(
+                      max_trans
+                     ,0,255
+                     ,null,255
+                     ,max_trans
+                    )                       AS max_trans
+              -- Storage Clause
+            , initial_extent
+            , next_extent
+            , min_extents
+            , DECODE(
+                      max_extents
+                     ,2147483645,'unlimited'
+                     ,           max_extents
+                    )                       AS max_extents
+            , pct_increase
+            , NVL(freelists,1)
+            , NVL(freelist_groups,1)
+            , LOWER(buffer_pool)          AS buffer_pool
+            , DECODE(
+                      '$logging'
+                     ,'NO','NOLOGGING'
+                     ,     'LOGGING'
+                    )                       AS logging
+            , LOWER(tablespace_name)      AS tablespace_name
+            , DECODE(
+                      '$blocks'
+                      ,null,GREATEST(initial_extent,next_extent) 
+                            / ($block_size * 1024)
+                      ,'0' ,GREATEST(initial_extent,next_extent)
+                            / ($block_size * 1024)
+                      ,'$blocks'
+                    )                       AS blocks
+       FROM
+              ${view}_indexes
+       WHERE
+                  table_name  = UPPER('$name')
+      ";
+  }
+  else
+  {
+    $stmt =
       "
        SELECT
               -- Table Properties
@@ -1635,6 +1730,7 @@ sub _create_iot
        WHERE
                   table_name  = UPPER('$name')
       ";
+  }
 
   if ( $view eq 'DBA' )
   {
@@ -1644,9 +1740,16 @@ sub _create_iot
       ";
   }
 
-  return _create_table_text( $stmt, $schema, $owner, $name, $view ) .
-         "; \n\n" .
-         _create_comments( $schema, $owner, $name, $view );
+  my $sql = _create_table_text( $stmt, $schema, $owner, $name, $view ) .
+            "; \n\n" .
+            _create_comments( $schema, $owner, $name, $view );
+
+  if ( $attr{ 'grants' } )
+  {
+    $sql .= _object_privs( $schema, $owner, $name, $view );
+  }
+
+  return $sql;
 }
 
 # sub _create_materialized_view
@@ -1906,7 +2009,14 @@ sub _create_mview
 
   $sql =~ s/\n+\Z//;
 
-  return $sql . " ;\n\n";
+  $sql .= " ;\n\n";
+
+  if ( $attr{ 'grants' } )
+  {
+    $sql .= _object_privs( $schema, $owner, $name, $view );
+  }
+
+  return $sql;
 }
 
 # sub _create_mview_index
@@ -2135,9 +2245,16 @@ sub _create_mview_table
 #
 sub _create_package
 {
-  my $sql  = _display_source( @_, 'PACKAGE' );
+  my ( $schema, $owner, $name, $view ) = @_;
 
-  return $sql;
+  my $sql =  _display_source( $schema, $owner, $name, $view, 'PACKAGE' );
+
+  if ( $attr{ 'grants' } )
+  {
+    $sql .= _object_privs( $schema, $owner, $name, $view );
+  }
+
+  return $sql ;
 }
 
 # sub _create_package_body
@@ -2152,9 +2269,7 @@ sub _create_package
 #
 sub _create_package_body
 {
-  my $sql  = _display_source( @_, 'PACKAGE BODY' );
-
-  return $sql;
+  return _display_source( @_, 'PACKAGE BODY' );
 }
 
 # sub _create_partitioned_index
@@ -2655,6 +2770,11 @@ sub _create_partitioned_iot
           _range_partitions( $owner, $index, $view, 'NONE', 'IOT' ) .
           _create_comments( $schema, $owner, $name, $view );
 
+  if ( $attr{ 'grants' } )
+  {
+    $sql .= _object_privs( $schema, $owner, $name, $view );
+  }
+
   return $sql;
 }
 
@@ -3135,7 +3255,14 @@ sub _create_partitioned_table
     $sql .= "\n) ;\n\n";
   }
 
-  return $sql . _create_comments( $schema, $owner, $name, $view );
+  $sql .= _create_comments( $schema, $owner, $name, $view );
+
+  if ( $attr{ 'grants' } )
+  {
+    $sql .= _object_privs( $schema, $owner, $name, $view );
+  }
+
+  return $sql ;
 }
 
 # sub _create_procedure
@@ -3150,7 +3277,16 @@ sub _create_partitioned_table
 #
 sub _create_procedure
 {
-  return _display_source( @_, 'PROCEDURE' );
+  my ( $schema, $owner, $name, $view ) = @_;
+
+  my $sql =  _display_source( $schema, $owner, $name, $view, 'PROCEDURE' );
+
+  if ( $attr{ 'grants' } )
+  {
+    $sql .= _object_privs( $schema, $owner, $name, $view );
+  }
+
+  return $sql ;
 }
 
 # sub _create_profile
@@ -3339,6 +3475,7 @@ sub _create_rollback_segment
 #
 # Returns DDL to create all objects of the following type:
 #
+#     TYPE
 #     TABLE
 #     INDEX
 #     CONSTRAINT
@@ -3717,48 +3854,6 @@ sub _create_schema
       $sql .= _create_constraint( $schema, $owner, $cons_name, $view );
     }
   }
-
-  #
-  # Add schema's sequences
-  #
-  $stmt =
-      "
-       SELECT
-              sequence_name
-       FROM
-              ${view}_sequences
-      ";
-
-  if ( $view eq 'DBA' )
-  {
-    $stmt .=
-      "
-       WHERE
-              sequence_owner = UPPER('$owner')
-      ";
-  }
-
-  $stmt .= 
-      "
-       ORDER
-          BY
-              sequence_name
-      ";
-
-  $sth = $dbh->prepare( $stmt );
-  $sth->execute;
-  $aref = $sth->fetchall_arrayref;
-
-  foreach my $row ( @$aref )
-  {
-    $sql .= _create_sequence( $schema, $owner, @$row->[0], $view );
-  }
-
-  $schema =~ s|\.||;
-
-  $sql .= "PROMPT Recompile schema \U$owner\n\n" .
-          "BEGIN dbms_utility.compile_schema('\U$schema') ; END ;\n/\n\n"
-      unless $schema eq 'PUBLIC';
 
   #
   # Add schema's triggers
@@ -4245,17 +4340,24 @@ sub _create_sequence
        $order_flag,
      ) = @row;
 
-  return "PROMPT " .
-         "CREATE SEQUENCE \L$schema$name\n\n" .
-         "CREATE SEQUENCE \L$schema$name\n" .
-         "   $start_with\n" .
-         "   $increment_by\n" .
-         "   $min_value\n" .
-         "   $max_value\n" .
-         "   $cache_size\n" .
-         "   $cycle_flag\n" .
-         "   $order_flag\n" .
-         ";\n\n";
+  my $sql = "PROMPT " .
+            "CREATE SEQUENCE \L$schema$name\n\n" .
+            "CREATE SEQUENCE \L$schema$name\n" .
+            "   $start_with\n" .
+            "   $increment_by\n" .
+            "   $min_value\n" .
+            "   $max_value\n" .
+            "   $cache_size\n" .
+            "   $cycle_flag\n" .
+            "   $order_flag\n" .
+            ";\n\n";
+
+  if ( $attr{ 'grants' } )
+  {
+    $sql .= _object_privs( $schema, $owner, $name, $view );
+  }
+
+  return $sql;
 }
 
 # sub _create_snapshot
@@ -4317,16 +4419,23 @@ sub _create_synonym
 
   my ( $table_owner, $table_name, $db_link ) = @row;
 
-  $db_link      = ( $db_link     eq 'NULL' )   ? ''        : "\@$db_link";
-  $schema       = ( $schema      eq 'PUBLIC' ) ? ''        : $schema;
-  my $is_public = ( "\U$owner"   eq 'PUBLIC' ) ? ' PUBLIC' : '';
+  $db_link      = ( $db_link   eq 'NULL' )   ? ''        : "\@$db_link";
+  $schema       = ( $schema    eq 'PUBLIC' ) ? ''        : $schema;
+  my $is_public = ( "\U$owner" eq 'PUBLIC' ) ? ' PUBLIC' : '';
   my $table_schema = _set_schema( $table_owner );
 
-  return "PROMPT " .
-         "CREATE$is_public SYNONYM \L$schema$name " .
-            "FOR \L$table_schema$table_name$db_link \n\n" .
-         "CREATE$is_public SYNONYM \L$schema$name " .
-            "FOR \L$table_schema$table_name$db_link;\n\n";
+  my $sql = "PROMPT " .
+            "CREATE$is_public SYNONYM \L$schema$name " .
+               "FOR \L$table_schema$table_name$db_link \n\n" .
+            "CREATE$is_public SYNONYM \L$schema$name " .
+               "FOR \L$table_schema$table_name$db_link;\n\n";
+
+  if ( $attr{ 'grants' } )
+  {
+    $sql .= _object_privs( $schema, $table_owner, $table_name, $view );
+  }
+
+  return $sql;
 }
 
 # sub _create_table
@@ -4626,9 +4735,16 @@ sub _create_table
       ";
   }
 
-  return _create_table_text( $stmt, $schema, $owner, $name, $view ) .
+  $sql = _create_table_text( $stmt, $schema, $owner, $name, $view ) .
          ";\n\n" .
          _create_comments( $schema, $owner, $name, $view );
+
+  if ( $attr{ 'grants' } )
+  {
+    $sql .= _object_privs( $schema, $owner, $name, $view );
+  }
+
+  return $sql;
 }
 
 # sub _create_table_family
@@ -4933,11 +5049,17 @@ sub _create_table_text
     $sql .= "$monitoring\n";
   }
 
-  $sql .= "PARALLEL\n" .
-          "(\n" .
-          "  DEGREE            $degree\n" .
-          "  INSTANCES         $instances\n" .
-          ")\n";
+  unless (     $organization eq 'INDEX'
+           and $oracle_major == 8
+           and $oracle_minor == 0
+         )
+  {
+    $sql .= "PARALLEL\n" .
+            "(\n" .
+            "  DEGREE            $degree\n" .
+            "  INSTANCES         $instances\n" .
+            ")\n";
+  }
 
   unshift @row, ( '', $organization );
 
@@ -5083,32 +5205,6 @@ sub _create_table_text
       $sql .= "PCTTHRESHOLD        $pct_threshold\n";
       $sql .= "INCLUDING           $column\n"    if $column;
       $sql .= "OVERFLOW\n";
-
-      (
-        # Segment Attributes
-        $cache,
-        $pct_used,
-        $pct_free,
-        $ini_trans,
-        $max_trans,
-        $initial,
-        $next,
-        $min_extents,
-        $max_extents,
-        $pct_increase,
-        $freelists,
-        $freelist_groups,
-        $buffer_pool,
-        $logging,
-        $tablespace,
-        $blocks,
-      ) = @row;
-
-      ( $initial, $next ) = _initial_next( $blocks ) if $attr{ 'resize' };
-
-      unshift @row, ( '' );
-
-      $sql .= _segment_attributes( \@row );
     }
   }
 
@@ -5566,7 +5662,7 @@ sub _create_trigger
 
     my (@columns) = map { $_->[0] } @{ $sth->fetchall_arrayref };
 
-    $columns = "\nOF\n    " . join ("\n  , ", @columns) . "\n"
+    $columns = "\nOF\n    " . join ("\n  , ", @columns) . "\n" if ( @columns );
   }
 
 
@@ -5598,7 +5694,16 @@ sub _create_trigger
 #
 sub _create_type
 {
-  return _display_source( @_, 'TYPE' );
+  my ( $schema, $owner, $name, $view ) = @_;
+
+  my $sql = _display_source( $schema, $owner, $name, $view, 'TYPE' );
+
+  if ( $attr{ 'grants' } )
+  {
+    $sql .= _object_privs( $schema, $owner, $name, $view );
+  }
+
+  return $sql;
 }
 
 # sub _create_user
@@ -5612,9 +5717,9 @@ sub _create_type
 #        [QUOTA {UNLIMITED|<bytes>} ON TABLESPACE <tablespace1>]
 #        [QUOTA {UNLIMITED|<bytes>} ON TABLESPACE <tablespace2>]
 #
-#     [GRANT <role >            TO <name> {WITH ADMIN OPTION]]
-#     [GRANT <system privilege> TO <name> {WITH ADMIN OPTION]]
-#     [GRANT <privilege> ON <object> TO <name> {WITH GRANT OPTION]]
+#     [GRANT <role >            TO <name> [WITH ADMIN OPTION]]
+#     [GRANT <system privilege> TO <name> [WITH ADMIN OPTION]]
+#     [GRANT <privilege> ON <object> TO <name> [WITH GRANT OPTION]]
 # 
 sub _create_user
 {
@@ -6203,7 +6308,6 @@ sub _get_oracle_release
 #
 #     [GRANT <role >            TO <name> {WITH ADMIN OPTION]]
 #     [GRANT <system privilege> TO <name> {WITH ADMIN OPTION]]
-#     [GRANT <privilege> ON <object> TO <name> {WITH GRANT OPTION]]
 #
 sub _granted_privs
 {
@@ -6218,7 +6322,7 @@ sub _granted_privs
               granted_role
             , DECODE(
                       admin_option
-                     ,'YES','WITH ADMIN OPTION'
+                     ,'YES','WITH ADMIN OPTION '
                      ,null
                     )                         AS admin_option
        FROM
@@ -6248,7 +6352,7 @@ sub _granted_privs
               privilege
             , DECODE(
                       admin_option
-                     ,'YES','WITH ADMIN OPTION'
+                     ,'YES','WITH ADMIN OPTION '
                      ,null
                     )                         AS admin_option
        FROM
@@ -6269,50 +6373,6 @@ sub _granted_privs
     $sql .= "PROMPT " .
             "GRANT \L@$row->[0] \UTO \L$name \U@$row->[1] \n\n" .
             "GRANT \L@$row->[0] \UTO \L$name \U@$row->[1];\n\n";
-  }
-
-  # Add object privileges
-  $stmt =
-      "
-       SELECT
-              privilege
-            , owner
-            , table_name
-            , DECODE(
-                      grantable
-                     ,'YES','WITH GRANT OPTION'
-                     ,null
-                    )                         AS grantable
-       FROM
-              dba_tab_privs
-       WHERE
-              grantee = UPPER( ? )
-       ORDER
-          BY
-              table_name
-            , privilege
-      ";
-
-  $sth = $dbh->prepare( $stmt );
-  $sth->execute( $name );
-  $aref = $sth->fetchall_arrayref;
-
-  foreach my $row ( @$aref )
-  {
-    my (
-         $privilege,
-         $owner,
-         $table,
-         $grantable,,
-       ) = @$row;
-
-    my $schema = _set_schema( $owner );
-
-    $sql .= "PROMPT " .
-            "GRANT \L$privilege \UON \L$schema$table \UTO \L$name " .
-            "\U$grantable \n\n" .
-            "GRANT \L$privilege \UON \L$schema$table \UTO \L$name " .
-            "\U$grantable;\n\n";
   }
 
   return $sql;
@@ -6517,6 +6577,175 @@ sub _key_columns
   }
 
   return join ( "\n  , ", @cols );
+}
+
+# sub _object_privs
+#
+# Returns DDL to create GRANT statements in the form of:
+#
+#     GRANT <privilege> ON <object> TO <name> [WITH GRANT OPTION]
+#
+#       and/or
+#
+#     GRANT <privilege>
+#     (
+#         column_name
+#       , column_name
+#     )
+#     ON <object> TO <name> [WITH GRANT OPTION]
+#
+sub _object_privs
+{
+  my ( $schema, $owner, $name, $view ) = @_;
+
+  my $sql;
+
+  my $stmt =
+      "
+       SELECT
+              grantee
+            , privilege
+            , DECODE(
+                      grantable
+                     ,'YES','WITH GRANT OPTION '
+                     ,null
+                    )                         AS grantable
+       FROM
+              ${view}_tab_privs
+       WHERE
+                  grantor    = UPPER( ? )
+              AND table_name = UPPER( ? )
+      ";
+
+  if ( $view eq 'DBA' )
+  {
+    $stmt .=
+      "
+              AND owner      = UPPER('$owner')
+      ";
+  }
+
+  $stmt .=
+      "
+       ORDER
+          BY
+              grantee
+            , privilege
+      ";
+
+  $sth = $dbh->prepare( $stmt );
+  $sth->execute( $owner, $name );
+  my $aref = $sth->fetchall_arrayref;
+
+  foreach my $row ( @$aref )
+  {
+    my (
+         $grantee,
+         $privilege,
+         $grantable,,
+       ) = @$row;
+
+    $sql .= "PROMPT " .
+            "GRANT \L$privilege \UON \L$schema$name \UTO \L$grantee " .
+            "\U$grantable \n\n" .
+            "GRANT \L$privilege \UON \L$schema$name \UTO \L$grantee " .
+            "\U$grantable;\n\n";
+  }
+
+  $stmt =
+      "
+       SELECT DISTINCT
+              grantee
+            , privilege
+            , DECODE(
+                      grantable
+                     ,'YES','WITH GRANT OPTION '
+                     ,null
+                    )                         AS grantable
+       FROM
+              ${view}_col_privs
+       WHERE
+                  grantor    = UPPER( ? )
+              AND table_name = UPPER( ? )
+      ";
+
+  if ( $view eq 'DBA' )
+  {
+    $stmt .=
+      "
+              AND owner      = UPPER('$owner')
+      ";
+  }
+
+  $stmt .=
+      "
+       ORDER
+          BY
+              grantee
+            , privilege
+      ";
+
+  $sth = $dbh->prepare( $stmt );
+  $sth->execute( $owner, $name );
+  $aref = $sth->fetchall_arrayref;
+
+  foreach my $row ( @$aref )
+  {
+    my (
+         $grantee,
+         $privilege,
+         $grantable,,
+       ) = @$row;
+
+    $sql .= "PROMPT " .
+            "GRANT \L$privilege \UON \L$schema$name \UTO \L$grantee " .
+            "\U$grantable\n\n" .
+            "GRANT \L$privilege \n(\n    ";
+
+    $stmt =
+      "
+       SELECT
+              LOWER(column_name)
+       FROM
+              ${view}_col_privs
+       WHERE
+                  grantor    = UPPER( ? )
+              AND privilege  = UPPER( ? )
+              AND table_name = UPPER( ? )
+      ";
+
+    if ( $view eq 'DBA' )
+    {
+      $stmt .=
+      "
+              AND owner      = UPPER('$owner')
+      ";
+    }
+
+    $stmt .=
+      "
+       ORDER
+          BY
+              grantee
+            , privilege
+      ";
+
+    $sth = $dbh->prepare( $stmt );
+    $sth->execute( $owner, $privilege, $name );
+    my $aref = $sth->fetchall_arrayref;
+
+    my @cols;
+    foreach my $row ( @$aref )
+    {
+      push @cols, $row->[0];
+    }
+
+    $sql .= join ( "\n  , ", @cols );
+
+    $sql .= "\n)\n\UON \L$schema$name \UTO \L$grantee \U$grantable;\n\n";
+  }
+
+  return $sql;
 }
 
 # sub _partition_key_columns
@@ -7542,6 +7771,16 @@ sub _segment_attributes
        $blocks,
      ) = @$arrayref;
 
+  unless ( $attr{ 'storage' } )
+  {
+    if ( $attr{ 'tblspace' } )
+    {
+      $sql .= "${indent}TABLESPACE          \L$tablespace\n";
+    }
+
+    return $sql;
+  }
+
   ( $initial, $next ) = _initial_next( $blocks ) if $attr{ 'resize' };
 
   if ( $organization eq 'HEAP' )
@@ -7596,7 +7835,10 @@ sub _segment_attributes
 
   $sql .= "${indent}$logging\n"    if $oracle_major > 7;
 
-  $sql .= "${indent}TABLESPACE          \L$tablespace\n";
+  if ( $attr{ 'tblspace' } )
+  {
+    $sql .= "${indent}TABLESPACE          \L$tablespace\n";
+  }
 
   return $sql;
 }
@@ -7637,6 +7879,7 @@ sub _set_sizing
                 WHERE
                            bytes  IS NOT NULL
                        AND blocks IS NOT NULL
+                       AND rownum  < 2
                 UNION
                 SELECT
                        bytes / blocks   AS block_size
@@ -7645,6 +7888,7 @@ sub _set_sizing
                 WHERE
                            bytes  IS NOT NULL
                        AND blocks IS NOT NULL
+                       AND rownum  < 2
               )
        WHERE
               rownum < 2
@@ -8106,9 +8350,9 @@ sub _table_columns
     my ( $column, $nullable, $default ) = @$row;
 
     # Knock off any trailing newlines
-    $default =~ s| *\n*\Z||;
+    chomp $default;
 
-    $column .= "DEFAULT $default "   if $default;
+    $column .= "DEFAULT $default "   if defined $default;
     $column .= 'NOT NULL'            if $nullable eq 'N';
 
     push @cols, $column;
@@ -8129,7 +8373,7 @@ DDL::Oracle - a DDL generator for Oracle databases
 
 =head1 VERSION
 
-VERSION = 1.10
+VERSION = 1.11
 
 =head1 SYNOPSIS
 
@@ -8217,8 +8461,7 @@ the main driver for DDL::Oracle was the object management needs of
 Oracle DBA's.  The "resize" method generates DDL for a list of 
 tables or indexes.  For partitioned objects, the "appropriate" 
 size of EACH partition is calculated and supplied in the generated 
-DDL.  The original defrag.pl will be rewritten to use DDL::Oracle, 
-and supplied with its distribution.
+DDL.
 
 =head2 Initialization and Constructor 
 
@@ -8235,7 +8478,7 @@ several session level attributes.  These are:
                      USER views), but see attributes 'heading' for
                      exceptions:
 
-                         V$DATABASE
+                         V$DATABASE [i.e., sys.V_$DATABASE table]
 
                      And, in order to generate CREATE SNAPSHOT LOG
                      statements, you will also need to create a PUBLIC
@@ -8286,6 +8529,21 @@ several session level attributes.  These are:
                helpful in a multi-statement file.  "1" means include
                the prompt; "0" or "" means to suppress the prompt.
 
+      grants   Defines whether to include object grants following a
+               CREATE statement for Tables, Views, Materialized Views
+               [Snapshots], Sequences, Procedures, Functions, Packages,
+               Types and Synonyms.   "1" means include the grant state-
+               ments; "0" or "" means to suppress the grant statements.
+               The default is "0".
+
+      storage  Defines whether to include the STORAGE clause [plus
+               PCTUSED, PCTFREE, INITRANS and MAXTRANS] in DDL for tables
+               and indexes. "1" means include these clauses; "0" or ""
+               means omit them. The default is "1".
+
+      tblspace Defines whether to include the TABLESPACE clause in DDL
+               for tables and indexes.  "1" means include this clause;
+               "0" or "" means omit it. The default is "1".
 new  
 
 The B<new> method is the object constructor.  The two mandatory object

@@ -87,6 +87,39 @@ else{
 
 print $sql;
 
+# $Log: Ddl.pl,v $
+# Revision 1.13  2001/04/28 13:50:25  rvsutherland
+# Modified to facilitate the new type 'schema'.
+#
+# Revision 1.12  2001/03/31 18:27:42  rvsutherland
+# Facilitated new object type 'components', which requires neither
+# name nor owner.
+#
+# Revision 1.11  2001/03/20 01:49:51  rvsutherland
+# Facilitated instance method 'show_space'
+#
+# Revision 1.10  2001/03/03 18:41:31  rvsutherland
+# Added DESCRIPTION to pod.
+#
+# Revision 1.9  2001/01/27 16:21:44  rvsutherland
+# Added NAME section to pod.
+#
+# Revision 1.8  2001/01/14 16:47:55  rvsutherland
+# Nominal changes for version 0.32
+#
+# Revision 1.7  2001/01/07 16:43:56  rvsutherland
+# Added COPYRIGHT
+#
+# Revision 1.6  2001/01/06 16:21:15  rvsutherland
+# Facilitated 'compile' method
+#
+# Revision 1.5  2000/12/09 17:55:20  rvsutherland
+# Re-added after CVS bug fixed.
+#
+# Revision 1.3  2000/11/11 07:48:59  rvsutherland
+# Added CVS tags
+#
+
 =head1 NAME
 
 ddl.pl - Generates DDL for a single, named object

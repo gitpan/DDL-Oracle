@@ -83,6 +83,29 @@ foreach $new_user( @users )
 
 print $ddl;
 
+# $Log: copy_user.pl,v $
+# Revision 1.8  2001/04/28 13:49:32  rvsutherland
+# Changed password to be the new username.
+#
+# Revision 1.7  2001/03/03 18:41:31  rvsutherland
+# Added DESCRIPTION to pod.
+#
+# Revision 1.6  2001/01/27 16:21:44  rvsutherland
+# Added NAME section to pod.
+#
+# Revision 1.5  2001/01/14 16:47:55  rvsutherland
+# Nominal changes for version 0.32
+#
+# Revision 1.4  2001/01/07 16:43:56  rvsutherland
+# Added COPYRIGHT
+#
+# Revision 1.3  2000/11/11 07:48:59  rvsutherland
+# Added CVS tags
+#
+# Revision 1.2  2000/11/11 00:20:42  rvsutherland
+# Initial revision
+#
+
 =head1 NAME
 
 copy_user.pl - Generates CREATE USER command(s)

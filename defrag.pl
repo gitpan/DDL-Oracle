@@ -1,8 +1,8 @@
 #! /usr/bin/perl -w
 
-# $Id: defrag.pl,v 1.15 2001/01/01 22:43:21 rvsutherland Exp $
+# $Id: defrag.pl,v 1.16 2001/01/14 16:47:55 rvsutherland Exp $
 #
-# Copyright (c) 2000 Richard Sutherland - United States of America
+# Copyright (c) 2000, 2001 Richard Sutherland - United States of America
 #
 # See COPYRIGHT section in pod text below for usage and distribution rights.
 
@@ -1048,7 +1048,7 @@ exit 0;
 
 # sub check
 #
-# returns text for a shell script to check its SQL spool file for errors
+# returns text for a shell script to check its LOG file for errors
 #
 sub check
 {
@@ -1366,7 +1366,7 @@ sub get_args
     if @ARGV;
   
   #
-  # Validate arguments (maybe they type as bad as we do!
+  # Validate arguments (maybe they type as badly as we do!
   #
 
   $tblsp = uc( $args{ tablespace } ) or
@@ -2227,7 +2227,7 @@ sub print_help
            of n sets of LIMIT:INITIAL:NEXT.  LIMIT is expressed in
            Database Blocks.  The highest LIMIT may contain the string
            'UNLIMITED', and in any event will be forced to be so by
-           DDL::Oracle..
+           DDL::Oracle.
 
   --sqldir=PATH *
 
@@ -2506,6 +2506,8 @@ sub write_header
 
 __END__
 
+########################################################################
+
 =head1 NAME
 
 defrag.pl -- Creates SQL*Plus command files to defragment a tablespace.
@@ -2583,9 +2585,9 @@ entering 'defrag.pl' without any arguments).
 
 =head1 COPYRIGHT
 
-Copyright (c) 2000, Richard V. Sutherland.  All rights reserved.
-This script is free software.  It may be used, redistributed,
-and/or modified under the same terms as Perl itself.  See:
+Copyright (c) 2000, 2001 Richard V. Sutherland.  All rights reserved.
+This script is free software.  It may be used, redistributed, and/or
+modified under the same terms as Perl itself.  See:
 
     http://www.perl.com/perl/misc/Artistic.html
 

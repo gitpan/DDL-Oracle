@@ -1,6 +1,6 @@
 #! /usr/bin/perl -w
 
-# $Id: copy_user.pl,v 1.3 2000/11/11 07:48:59 rvsutherland Exp $
+# $Id: copy_user.pl,v 1.5 2001/01/14 16:47:55 rvsutherland Exp $
 
 use strict;
 
@@ -83,11 +83,18 @@ foreach $new_user( @users )
 
 print $ddl;
 
-# $Log: copy_user.pl,v $
-# Revision 1.3  2000/11/11 07:48:59  rvsutherland
-# Added CVS tags
-#
-# Revision 1.2  2000/11/11 00:20:42  rvsutherland
-# Initial revision
-#
+=head1 AUTHOR
+
+ Richard V. Sutherland
+ rvsutherland@yahoo.com
+
+=head1 COPYRIGHT
+
+Copyright (c) 2000, 2001 Richard V. Sutherland.  All rights reserved.
+This module is free software.  It may be used, redistributed, and/or
+modified under the same terms as Perl itself.  See:
+
+    http://www.perl.com/perl/misc/Artistic.html
+
+=cut
 

@@ -1,7 +1,8 @@
 DDL::Oracle - A Perl tool to reverse engineer the DDL of Oracle  
-              objects, by Richard Sutherland.
+              objects from Oracle (versions 7.3, 8.0 and 8i)
+              by Richard Sutherland.
 
-Copyright (c) 2000  Richard Sutherland, United States
+Copyright (c) 2000, 2001  Richard Sutherland, United States
 
 See COPYRIGHT section in Oracle.pm for usage and distribution rights.
 

@@ -1,4 +1,4 @@
-# $Id: Oracle.pm,v 1.30 2001/01/06 16:24:37 rvsutherland Exp $ 
+# $Id: Oracle.pm,v 1.32 2001/01/14 16:44:25 rvsutherland Exp $ 
 #
 # Copyright (c) 2000 Richard Sutherland - United States of America
 #
@@ -9,7 +9,7 @@ require 5.004;
 
 BEGIN
 {
-  $DDL::Oracle::VERSION = "0.30"; # Also update version in pod text below!
+  $DDL::Oracle::VERSION = "0.32"; # Also update version in pod text below!
 }
 
 package DDL::Oracle;
@@ -3546,8 +3546,8 @@ sub _create_table_text
 #
 # Returns DDL to create the named tablespace in the form of:
 #
-#     CREATE TABLESPACE <name>
-#     DATAFILE
+#     CREATE [TEMPORARY] TABLESPACE <name>
+#     {DATA|TEMP}FILE
 #        '<filespec>'
 #      , '<filespec>'
 #     DEFAULT STORAGE
@@ -3555,9 +3555,9 @@ sub _create_table_text
 #       <storage clause>
 #     )
 #     [MINIMUM EXTENT  <bytes>]
-#     [NO]LOGGING
-#     {PERMANENT|TEMPORARY}
-#     EXTENT MANAGEMENT {DICTIONARY|LOCAL <extent spec>}
+#     ]PERMANENT|TEMPORARY]
+#     [EXTENT MANAGEMENT {DICTIONARY|LOCAL <extent spec>}]
+#     [[NO]LOGGING]
 #
 sub _create_tablespace
 {
@@ -3568,6 +3568,7 @@ sub _create_tablespace
 
   my $sql;
   my $stmt;
+  my $file_type;
 
   if ( $oracle_major == 7 )
   {
@@ -3617,11 +3618,12 @@ sub _create_tablespace
                      ,2147483645,'unlimited'
                      ,null,DECODE(
                                    $block_size
-                                  , 2,121
-                                  , 4,'250  -- ???'
-                                  , 8,505
-                                  ,16,'1010  -- ???'
-                                  ,32,'2020  -- ???'
+                                  , 1,  57
+                                  , 2, 121
+                                  , 4, 249
+                                  , 8, 505
+                                  ,16,1017
+                                  ,32,2041
                                   ,'???'
                                  )
                      ,max_extents
@@ -3655,11 +3657,12 @@ sub _create_tablespace
                      ,2147483645,'unlimited'
                      ,null,DECODE(
                                    $block_size
-                                  , 2,121
-                                  , 4,'250  -- ???'
-                                  , 8,505
-                                  ,16,'1010  -- ???'
-                                  ,32,'2020  -- ???'
+                                  , 1,  57
+                                  , 2, 121
+                                  , 4, 249
+                                  , 8, 505
+                                  ,16,1017
+                                  ,32,2041
                                   ,'???'
                                  )
                      ,max_extents
@@ -3667,11 +3670,7 @@ sub _create_tablespace
             , pct_increase
             , min_extlen
             , contents
-            , DECODE(
-                      logging 
-                     ,'NO','NOLOGGING'
-                     ,     'LOGGING'
-                    )                       AS logging
+            , logging
             , extent_management
             , allocation_type
        FROM
@@ -3699,13 +3698,23 @@ sub _create_tablespace
        $allocation_type,
      ) = @row;
 
-  $sql  = "PROMPT " .
-          "CREATE TABLESPACE \L$name\n\n" .
-          "CREATE TABLESPACE \L$name\n" .
-          "DATAFILE\n";
+  if ( $extent_management eq 'LOCAL' and $contents eq 'TEMPORARY' )
+  {
+    $sql  = "PROMPT " .
+            "CREATE TEMPORARY TABLESPACE \L$name\n\n" .
+            "CREATE TEMPORARY TABLESPACE \L$name\n";
+  }
+  else
+  {
+    $sql  = "PROMPT " .
+            "CREATE TABLESPACE \L$name\n\n" .
+            "CREATE TABLESPACE \L$name\n";
+  }
 
   if ( $oracle_major == 7 )
   {
+    $file_type = 'DATA';
+
     $stmt =
       "
        SELECT
@@ -3728,6 +3737,21 @@ sub _create_tablespace
     $stmt =
       "
        SELECT
+              count(*)
+       FROM
+              dba_data_files
+       WHERE
+              tablespace_name = UPPER( ? )
+      ";
+
+    $sth = $dbh->prepare( $stmt );
+    $sth->execute( $name );
+    my ( $cnt ) = $sth->fetchrow_array;
+    $file_type  = ( $cnt == 0 ) ? 'TEMP' : 'DATA';
+
+    $stmt =
+      "
+       SELECT
               file_name
             , bytes
             , autoextensible
@@ -3738,7 +3762,7 @@ sub _create_tablespace
                     )                               AS maxbytes
             , increment_by * $block_size * 1024     AS increment_by
        FROM
-              dba_data_files
+              dba_${file_type}_files
        WHERE
               tablespace_name = UPPER( ? )
        ORDER
@@ -3746,6 +3770,8 @@ sub _create_tablespace
               file_name
       ";
   }
+
+  $sql .= "${file_type}FILE\n";
 
   $sth = $dbh->prepare( $stmt );
   $sth->execute( $name );
@@ -3820,7 +3846,14 @@ sub _create_tablespace
     }
   }
 
-  $sql .= "$logging\n"    if $oracle_major > 7; 
+  if ( $oracle_major > 7 )
+  {
+    $sql .= "$logging\n"    unless (
+                                         $contents          eq 'TEMPORARY'
+                                     and $extent_management eq 'LOCAL'
+                                   );
+  }
+
   $sql .= ";\n\n";
 
   return $sql;
@@ -4935,7 +4968,7 @@ sub _resize_index
     }
 
     $sth = $dbh->prepare( $stmt );
-    $sth->execute( $name, $partition, $name );
+    $sth->execute( $name, $partition );
     my ( $seq_type, $partitioning_type ) = $sth->fetchrow_array;
     die "Partition \U$partition \Lof \UI\Lndex \U$name \Ldoes not exist,\n",
         "  OR it is the parent of Hash subpartition(s)\n",
@@ -5210,123 +5243,199 @@ sub _resize_table
                                      $view
                                    );
 
-    return $sql;
-  }
-
-  # Didn't want single partition, so
-  # find out if the object is partitioned
-
-  $stmt =
-      "
-       SELECT
-              partitioned
-       FROM
-              ${view}_tables
-       WHERE
-                  table_name = UPPER( ? )
-      ";
-
-  if ( $view eq 'DBA' )
-  {
-    $stmt .=
-      "
-              AND owner      = UPPER('$owner')
-      ";
-
-  }
-
-  $sth = $dbh->prepare( $stmt );
-  $sth->execute( $name );
-  my $partitioned = $sth->fetchrow_array;
-
-  if ( $partitioned eq 'NO' )
-  {
+    # Rebuild this partition on all LOCAL indexes
     $stmt =
-      "
-       SELECT
-              s.blocks - NVL(t.empty_blocks,0)
-            , s.initial_extent
-            , s.next_extent
-       FROM
-              ${view}_segments s
-            , ${view}_tables   t
-       WHERE
-                  s.segment_name = UPPER( ? )
-              AND s.segment_type = 'TABLE'
-              AND t.table_name   = s.segment_name
-      ";
+        "
+         SELECT
+                owner
+              , index_name
+         FROM
+                ${view}_part_indexes
+         WHERE
+                    table_name = UPPER( ? )
+                AND locality   = 'LOCAL'
+        ";
+  
     if ( $view eq 'DBA' )
     {
       $stmt .= 
-      "
-                AND s.owner        = UPPER('$owner')
-                AND t.owner        = s.owner
-      ";
+        "
+                AND owner      = UPPER('$owner')
+        ";
     }
-    $sth = $dbh->prepare( $stmt );
-    $sth->execute( $name );
-    my ( $blocks, $initial, $next ) = $sth->fetchrow_array;
-
-    ( $initial, $next ) = _initial_next( $blocks ) if $attr{ 'resize' };
-
-    $sql .= "PROMPT " .
-            "ALTER TABLE \L$schema$name \UMOVE\n\n" .
-            "ALTER TABLE \L$schema$name \UMOVE\n" .
-            "STORAGE\n" .
-            "(\n" .
-            "  INITIAL  $initial\n" .
-            "  NEXT     $next\n" .
-            ") ;\n\n";
-
-    return $sql;
-  }
-  else
-  {
-    # It's partitioned -- get list of partitions
-    # and call _resize_table_partition for each one
-    $stmt =
-      "
-       SELECT
-              partition_name
-            , SUBSTR(segment_type,7)   -- PARTITION or SUBPARTITION
-       FROM
-              ${view}_segments
-       WHERE
-                  segment_name = UPPER( ? )
-      ";
-    if ( $view eq 'DBA' )
-    {
-      $stmt .= 
-      " 
-              AND owner        = UPPER('$owner')
-      ";
-    }
-    $stmt .= "
-       ORDER
-          BY
-              partition_name
-      ";
-
+  
     $sth = $dbh->prepare( $stmt );
     $sth->execute( $name );
     my $aref = $sth->fetchall_arrayref;
 
     foreach my $row ( @$aref )
     {
-      my ( $partition, $type ) = @$row;
+      my ( $owner, $index ) = @$row;
+      my $schema = _set_schema( $owner );
 
-      $sql .= _resize_table_partition(
-                                       $schema,
-                                       $owner,
-                                       $name,
-                                       $partition,
-                                       $type,
-                                       $view
-                                     );
+      $sql .= _resize_index(
+                             $schema,
+                             $owner,
+                             "$index:$partition",
+                             $view
+                           );
+    }
+  }
+  else
+  # Didn't want single partition, so move entire table.
+  # First, find out if the object is partitioned
+  {
+    $stmt =
+        "
+         SELECT
+                partitioned
+         FROM
+                ${view}_tables
+         WHERE
+                    table_name = UPPER( ? )
+        ";
+  
+    if ( $view eq 'DBA' )
+    {
+      $stmt .=
+        "
+                AND owner      = UPPER('$owner')
+        ";
+  
+    }
+  
+    $sth = $dbh->prepare( $stmt );
+    $sth->execute( $name );
+    my $partitioned = $sth->fetchrow_array;
+  
+    if ( $partitioned eq 'NO' )
+    {
+      $stmt =
+        "
+         SELECT
+                s.blocks - NVL(t.empty_blocks,0)
+              , s.initial_extent
+              , s.next_extent
+         FROM
+                ${view}_segments s
+              , ${view}_tables   t
+         WHERE
+                    s.segment_name = UPPER( ? )
+                AND s.segment_type = 'TABLE'
+                AND t.table_name   = s.segment_name
+        ";
+      if ( $view eq 'DBA' )
+      {
+        $stmt .= 
+        "
+                  AND s.owner        = UPPER('$owner')
+                  AND t.owner        = s.owner
+        ";
+      }
+      $sth = $dbh->prepare( $stmt );
+      $sth->execute( $name );
+      my ( $blocks, $initial, $next ) = $sth->fetchrow_array;
+  
+      ( $initial, $next ) = _initial_next( $blocks ) if $attr{ 'resize' };
+  
+      $sql .= "PROMPT " .
+              "ALTER TABLE \L$schema$name \UMOVE\n\n" .
+              "ALTER TABLE \L$schema$name \UMOVE\n" .
+              "STORAGE\n" .
+              "(\n" .
+              "  INITIAL  $initial\n" .
+              "  NEXT     $next\n" .
+              ") ;\n\n";
+  
+      return $sql;
+    }
+    else
+    {
+      # It's partitioned -- get list of partitions
+      # and call _resize_table_partition for each one
+      $stmt =
+        "
+         SELECT
+                partition_name
+              , SUBSTR(segment_type,7)   -- PARTITION or SUBPARTITION
+         FROM
+                ${view}_segments
+         WHERE
+                    segment_name = UPPER( ? )
+        ";
+      if ( $view eq 'DBA' )
+      {
+        $stmt .= 
+        " 
+                AND owner        = UPPER('$owner')
+        ";
+      }
+      $stmt .=
+        "
+         ORDER
+            BY
+                partition_name
+        ";
+  
+      $sth = $dbh->prepare( $stmt );
+      $sth->execute( $name );
+      my $aref = $sth->fetchall_arrayref;
+  
+      foreach my $row ( @$aref )
+      {
+        my ( $partition, $type ) = @$row;
+  
+        $sql .= _resize_table_partition(
+                                         $schema,
+                                         $owner,
+                                         $name,
+                                         $partition,
+                                         $type,
+                                         $view
+                                       );
+      }
     }
 
-    return $sql;
+    # Rebuild all indexes (partitioned or not)
+    $stmt =
+        "
+         SELECT
+                owner
+              , index_name
+         FROM
+                ${view}_indexes
+         WHERE
+                    table_name = UPPER( ? )
+        ";
+  
+    if ( $view eq 'DBA' )
+    {
+      $stmt .= 
+        "
+                AND owner      = UPPER('$owner')
+        ";
+    }
+  
+    $sth = $dbh->prepare( $stmt );
+    $sth->execute( $name );
+    my $aref = $sth->fetchall_arrayref;
+
+    foreach my $row ( @$aref )
+    {
+      my ( $owner, $index ) = @$row;
+      my $schema = _set_schema( $owner );
+
+      $sql .= _resize_index(
+                             $schema,
+                             $owner,
+                             $index,
+                             $view
+                           );
+    }
   }
+
+#here
+  return $sql;
 }
 
 # sub _resize_table_partition
@@ -5784,13 +5893,15 @@ sub _table_columns
 
 __END__
 
+########################################################################
+
 =head1 NAME
 
 DDL::Oracle - a DDL generator for Oracle databases
 
 =head1 VERSION
 
-VERSION = 0.30
+VERSION = 0.32
 
 =head1 SYNOPSIS
 
@@ -5906,6 +6017,12 @@ several session level options.  These are:
               values; any other string will be interpreted as a
               resize definition.  The default is "1".
 
+              To establish a user defined algorithm, define this with
+              a string consisting of n sets of LIMIT:INITIAL:NEXT.
+              LIMIT is expressed in Database Blocks.  The highest LIMIT
+              may contain the string 'UNLIMITED', and in any event will
+              be forced to be so by DDL::Oracle.
+
       view    Defines which Dictionary views to query:  DBA or USER
              (e.g., DBA_TABLES or USER_TABLES).  The default is DBA.
 
@@ -5958,6 +6075,12 @@ The 'type' defined in the 'new' method is limited to 'function', 'package',
 =head1 BUGS
 
 =head1 FILES
+
+ copy_user.pl
+ copy_user.sh
+ ddl.pl
+ defrag.pl
+ query.pl
 
 =head1 AUTHOR
 

@@ -6,5 +6,6 @@ ddl.pl
 defrag.pl
 copy_user.pl
 copy_user.sh
+query.pl
 README
 README.defrag

@@ -1,6 +1,6 @@
 #! /usr/bin/perl -w
 
-# $Id: ddl.pl,v 1.9 2001/01/27 16:21:44 rvsutherland Exp $
+# $Id: ddl.pl,v 1.10 2001/03/03 18:41:31 rvsutherland Exp $
 
 use strict;
 
@@ -19,9 +19,12 @@ my  $dbh = DBI->connect(
     );
 
 DDL::Oracle->configure( 
-                        dbh    => $dbh,
-#                        resize => 0,
-#                        view   => 'user',
+                        dbh      => $dbh,
+                        resize   => 1,
+#                        view     => 'user',
+#                        heading  => 0,
+#                        blksize  => 10240,
+#                        version  => '7.3.4.5.6',
                       );
 
 my $user = getlogin
@@ -79,7 +82,11 @@ print $sql;
 
 =head1 NAME
 
-ddl.pl - Calls DDL::Oracle for the DDL of a specified object.
+ddl.pl - Generates DDL for a single, named object
+
+=head1 DESCRIPTION
+
+Calls DDL::Oracle for the DDL of a specified object.
 
 =head1 AUTHOR
 

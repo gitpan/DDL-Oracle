@@ -1,6 +1,6 @@
 #! /usr/bin/perl -w
 
-# $Id: copy_user.pl,v 1.6 2001/01/27 16:21:44 rvsutherland Exp $
+# $Id: copy_user.pl,v 1.7 2001/03/03 18:41:31 rvsutherland Exp $
 
 use strict;
 
@@ -85,7 +85,12 @@ print $ddl;
 
 =head1 NAME
 
-copy_user.pl - Creates DDL to CREATE USER(s) with permissions of a named user
+copy_user.pl - Generates CREATE USER command(s)
+
+=head1 DESCRIPTION
+
+Generates the DDL to create a new user(s) with the identical privileges
+of a named, existing user in the same database.
 
 =head1 AUTHOR
 

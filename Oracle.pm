@@ -1,4 +1,4 @@
-# $Id: Oracle.pm,v 1.36 2001/02/24 22:05:56 rvsutherland Exp $ 
+# $Id: Oracle.pm,v 1.37 2001/03/03 18:53:14 rvsutherland Exp $ 
 #
 # Copyright (c) 2000, 2001 Richard Sutherland - United States of America
 #
@@ -9,7 +9,7 @@ require 5.004;
 
 BEGIN
 {
-  $DDL::Oracle::VERSION = "1.03"; # Also update version in pod text below!
+  $DDL::Oracle::VERSION = "1.04"; # Also update version in pod text below!
 }
 
 package DDL::Oracle;
@@ -122,6 +122,8 @@ sub configure
   $attr{ 'schema2' } = ( exists $args{ 'schema2' }  ) ? $args{ 'schema2' } : 1;
   $attr{ 'resize'  } = ( exists $args{ 'resize'  }  ) ? $args{ 'resize'  } : 1;
   $attr{ 'heading' } = ( exists $args{ 'heading' }  ) ? $args{ 'heading' } : 1;
+  $attr{ 'blksize' } = $args{ 'blksize' };
+  $attr{ 'version' } = $args{ 'version' };
 
   _set_sizing();
   _get_oracle_release();
@@ -4563,6 +4565,7 @@ sub _drop_user
 #
 sub _generate_heading
 {
+  $ddl = "";
   return unless $attr{ heading };
 
   my ( $module, $action, $type, $list ) = @_;
@@ -4619,7 +4622,11 @@ sub _generate_heading
 #
 sub _get_oracle_release
 {
-  $sth = $dbh->prepare(
+  $oracle_release = $attr{ version };
+
+  unless ( $oracle_release )
+  {
+    $sth = $dbh->prepare(
       "
        SELECT
               banner
@@ -4629,15 +4636,19 @@ sub _get_oracle_release
               banner LIKE 'Oracle%'
       ");
 
-  $sth->execute;
-  ( $oracle_release ) = $sth->fetchrow_array;
+    $sth->execute;
+    ( $oracle_release ) = $sth->fetchrow_array;
+  }
 
-  $oracle_release =~ /((\d+)\.(\d+)\S+)/;
-  $oracle_release = $1;
-  $oracle_major   = $2;
-  $oracle_minor   = $3;
+  (
+    $oracle_release,
+    $oracle_major,
+    $oracle_minor
+  ) = $oracle_release =~ /((\d+)\.(\d+)\S+)/;
 
-  $sth = $dbh->prepare(
+  if ( $attr{ heading } )
+  {
+    $sth = $dbh->prepare(
       "
        SELECT
               LOWER(name)
@@ -4645,28 +4656,12 @@ sub _get_oracle_release
               v\$database
       ");
 
-  $sth->execute;
-  ( $instance ) = $sth->fetchrow_array;
+    $sth->execute;
+    ( $instance ) = $sth->fetchrow_array;
 
-  $host = `hostname`;
-  chomp( $host );
-
-#  $sth = $dbh->prepare(
-#      "
-#       SELECT
-#              host_name
-#            , instance_name
-#            , version
-#       FROM
-#              v\$instance
-#      ");
-#
-#  $sth->execute;
-#  ( $host, $instance, $oracle_release ) = $sth->fetchrow_array;
-#
-#  $oracle_release =~ /(\d+)\.(\d+)/;
-#  $oracle_major   = $1;
-#  $oracle_minor   = $2;
+    $host = `hostname`;
+    chomp( $host );
+  }
 }
 
 # sub _granted_privs
@@ -5905,7 +5900,14 @@ sub _set_schema
 #
 sub _set_sizing 
 {
-  $sth = $dbh->prepare(
+  $block_size = $attr{ blksize } || 0;
+  if ( $block_size )
+  {
+    $block_size = sprintf( "%.0f", abs( $block_size /= 1024 ) );
+  }
+  else
+  {
+    $sth = $dbh->prepare(
       "
        SELECT
               value
@@ -5915,8 +5917,9 @@ sub _set_sizing
               name = 'db_block_size'
       ");
 
-  $sth->execute;
-  $block_size = $sth->fetchrow_array / 1024;
+    $sth->execute;
+    $block_size = $sth->fetchrow_array / 1024;
+  }
 
   if ( $attr{ 'resize' } == 1 )
   {
@@ -6203,7 +6206,7 @@ DDL::Oracle - a DDL generator for Oracle databases
 
 =head1 VERSION
 
-VERSION = 1.03
+VERSION = 1.04
 
 =head1 SYNOPSIS
 
@@ -6286,14 +6289,15 @@ and supplied with its distribution.
 configure
 
 The B<configure> method is used to supply the DBI connection and to set
-several session level options.  These are:
+several session level attributes.  These are:
 
       dbh      A reference to a valid DBI connection (obtained via
-               DBI->connect).  This is a mandatory argument.
+               DBI->connect).  This is the only mandatory attribute.
 
-               NOTE:  The user connecting MUST have SELECT privileges
-                     on the following (in addition to the DBA or USER
-                     views):
+               NOTE: The user connecting should have SELECT privileges
+                     on the following views (in addition to the DBA or
+                     USER views), but see attributes 'heading', 'blksize'
+                     and 'version' below for exceptions:
 
                          V$VERSION
                          V$DATABASE
@@ -6336,8 +6340,20 @@ several session level options.  These are:
                (e.g., DBA_TABLES or USER_TABLES).  The default is DBA.
 
       heading  Defines whether to include a Heading having Host, Instance,
-               Date/Time, List of generated Objects, etc.  Set to "0" to
-               suppress the heading.  The default is "1".
+               Date/Time, List of generated Objects, etc.  "1" means 
+               include the heading; "0" or "" means to suppress the
+               heading (and eliminate the query against V$DATABASE).
+               The default is "1".
+
+      blksize  Defines the database block size.  If this attribute is
+               supplied, you eliminate the query against V$PARAMETER.
+               The default is to query V$PARAMETER for this value.
+
+      version  A quoted string which defines the version of the database,
+               and must be a version supported by the module (currently
+               7.x, 8.0 and 8.1).  If this attribute is supplied, you
+               eliminate the query against V$VERSION.  The default is to
+               query V$VERSION for this value.
 
 new  
 

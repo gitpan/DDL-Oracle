@@ -6,3 +6,4 @@ test.pl
 ddl.pl
 copy_user.pl
 copy_user.sh
+defrag.pl

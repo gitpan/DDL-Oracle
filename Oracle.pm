@@ -1,4 +1,4 @@
-# $Id: Oracle.pm,v 1.16 2000/11/05 18:50:00 rvsutherland Exp $ 
+# $Id: Oracle.pm,v 1.18 2000/11/16 09:14:38 rvsutherland Exp $ 
 #
 # Copyright (c) 2000 Richard Sutherland - United States of America
 #
@@ -9,7 +9,7 @@ require 5.004;
 
 BEGIN
 {
-  $DDL::Oracle::VERSION = "0.16"; # Also update version in pod text below!
+  $DDL::Oracle::VERSION = "0.18"; # Also update version in pod text below!
 }
 
 package DDL::Oracle;
@@ -50,6 +50,7 @@ my %create =
 
 my %drop = 
 (
+  constraint             => \&_drop_constraint,
  'database link'         => \&_drop_database_link,
   dimension              => \&_drop_schema_object,
   directory              => \&_drop_object,
@@ -97,7 +98,7 @@ sub configure
   $attr{ view2 }   = ( "\U$args{ view2 }" eq 'USER' ) ? 'USER' : 'DBA';
   $attr{ schema  } = (  exists $args{ schema  }  ) ? $args{ schema  } : 1;
   $attr{ schema2 } = (  exists $args{ schema2 }  ) ? $args{ schema2 } : 1;
-  $attr{ sizing  } = (  exists $args{ resize  }  ) ? $args{ resize  } : 1;
+  $attr{ resize  } = (  exists $args{ resize  }  ) ? $args{ resize  } : 1;
 
   _set_sizing();
 }
@@ -158,7 +159,7 @@ sub drop
     my ( $owner, $name ) = @$row;
     my $schema = _set_schema( $owner );
 
-    $ddl .= $drop{ $type }->( $schema, $name, $type ); 
+    $ddl .= $drop{ $type }->( $schema, $name, $type, $owner,  $attr{ view } ); 
   }
 
   return $ddl;
@@ -307,10 +308,10 @@ sub _create_comments
 
 # sub _create_constraint
 #
-# Returns DDL to create the constraint on the named table in the form of:
+# Returns DDL to create the named constraint in the form of:
 #
-#     COMMENT ON TABLE [schema.]<name> IS '<text>'
-#     COMMENT ON COLUMN [schema.]<name>.<column> IS '<text>'
+#     ALTER TABLE [schema.]<name> ADD CONSTRAINT <name> <TYPE>
+#     [<column list>
 #
 sub _create_constraint
 {
@@ -392,7 +393,10 @@ sub _create_constraint
             _constraint_columns( $r_owner, $r_cons_name, $view );
   }
 
-  $sql .= "$deferrable INITIALLY $deferred ;\n\n";
+  $sql .= "$deferrable\n" .
+          "INITIALLY $deferred\n" .
+          "NOVALIDATE\n" .
+          ";\n\n";
 
   return $sql;
 }
@@ -724,7 +728,7 @@ sub _create_index
             , ${view}_segments  s
        WHERE
                   i.index_name   = UPPER('$name')
-              AND i.index_name   = s.segment_name
+              AND s.segment_name = i.index_name
       ";
 
   if ( $view eq 'DBA' )
@@ -882,7 +886,8 @@ sub _create_iot
   }
 
   return _create_table_text( $stmt, $schema, $owner, $name, $view ) .
-         ";\n\n";
+         "; \n\n" .
+         _create_comments( $schema, $owner, $name, $view );
 }
 
 # sub _create_partitioned_index
@@ -1140,7 +1145,8 @@ sub _create_partitioned_iot
       ";
   }
 
-  my $sql = _create_table_text( $stmt, $schema, $owner, $name, $view );
+  my $sql = _create_table_text( $stmt, $schema, $owner, $name, $view ) .
+            _create_comments( $schema, $owner, $name, $view );
 
   $stmt =
       "
@@ -1284,9 +1290,6 @@ sub _create_partitioned_table
   $sql =~ /ORGANIZATION\s+(\w+)/gm;
   my $organization = $1;
 
-  $sql =~ /\s+(N?O?CACHE)/gm;
-  my $cache = $1;
-
   $stmt =
       "
        SELECT
@@ -1341,7 +1344,7 @@ sub _create_partitioned_table
        SELECT
               partition_name
             , high_value
-            , '$cache'
+            , 'N/A'
             , pct_used
             , pct_free
             , ini_trans
@@ -1503,7 +1506,7 @@ sub _create_partitioned_table
     $sql .= "\n) ;\n\n";
   }
 
-  return $sql;
+  return $sql . _create_comments( $schema, $owner, $name, $view );
 }
 
 # sub _create_profile
@@ -1858,12 +1861,12 @@ sub _create_synonym
             "FOR \L$table_schema$table_name$db_link \n\n" .
          "CREATE$is_public SYNONYM \L$schema$name " .
             "FOR \L$table_schema$table_name$db_link;\n\n";
-#here
 }
 
 # sub _create_table
 #
-# Returns DDL to create the named table and its partition(s) in the form of:
+# Returns DDL to create the named table and its comments
+# and its partition(s) in the form of:
 #
 #     CREATE TABLE [schema.]<name>
 #     (
@@ -2015,7 +2018,8 @@ sub _create_table
   }
 
   return _create_table_text( $stmt, $schema, $owner, $name, $view ) .
-         ";\n\n";
+         ";\n\n" .
+         _create_comments( $schema, $owner, $name, $view );
 }
 
 # sub _create_table_family
@@ -2027,8 +2031,7 @@ sub _create_table_family
 {
   my ( $schema, $owner, $name, $view ) = @_;
 
-  my $sql = _create_table     ( @_ ) .
-            _create_comments  ( @_ );
+  my $sql = _create_table     ( @_ );
 
   # Add table's indexes
   my $stmt =
@@ -2065,6 +2068,7 @@ sub _create_table_family
     $sql .= _create_index( $schema, $owner, @$row->[0], $view );
   }
 
+  # Add table's constraints
   $stmt =
       "
        SELECT
@@ -2190,7 +2194,7 @@ sub _create_table_text
        $blocks,
      ) = @row;
 
-  ( $initial, $next ) = _initial_next( $blocks ) if $attr{ sizing };
+  ( $initial, $next ) = _initial_next( $blocks ) if $attr{ resize };
 
   my $sql  =
           "PROMPT " .
@@ -2722,6 +2726,36 @@ sub _display_source
   $sql .= "/\n\n";
 
   return $sql;
+}
+
+# sub _drop_constraint
+#
+# Returns DDL to drop the named constraint in the form of:
+#
+#     ALTER TABLE [schema.]<name> DROP CONSTRAINT <name>
+#
+sub _drop_constraint
+{
+  my ( $schema, $name, $type, $owner,  $view ) = @_;
+
+  my $stmt =
+      "
+       SELECT
+              table_name
+       FROM
+              ${view}_constraints
+       WHERE
+                  owner           = UPPER('$owner')
+              AND constraint_name = UPPER('$name')
+      ";
+
+  $sth = $dbh->prepare( $stmt );
+  $sth->execute;
+  my ( $table_name ) = $sth->fetchrow_array;
+
+  return "PROMPT " .
+         "ALTER TABLE \L$schema$table_name \UDROP CONSTRAINT \L$name \n\n" .
+         "ALTER TABLE \L$schema$table_name \UDROP CONSTRAINT \L$name;\n\n";
 }
 
 # sub _drop_database_link
@@ -3327,7 +3361,7 @@ sub _resize_index
     $sth->execute;
     my ( $blocks, $initial, $next ) = $sth->fetchrow_array;
 
-    ( $initial, $next ) = _initial_next( $blocks ) if $attr{ sizing };
+    ( $initial, $next ) = _initial_next( $blocks ) if $attr{ resize };
 
     $sql .= "PROMPT " .
             "ALTER INDEX \L$schema$name \UREBUILD\n\n" .
@@ -3418,7 +3452,7 @@ sub _resize_index_partition
   $sth->execute;
   my ( $blocks, $initial, $next ) = $sth->fetchrow_array;
 
-  ( $initial, $next ) = _initial_next( $blocks ) if $attr{ sizing };
+  ( $initial, $next ) = _initial_next( $blocks ) if $attr{ resize };
 
   $sql .= "PROMPT " .
           "ALTER INDEX \L$schema$name \UREBUILD\n\n" .
@@ -3550,7 +3584,7 @@ sub _resize_table
     $sth->execute;
     my ( $blocks, $initial, $next ) = $sth->fetchrow_array;
 
-    ( $initial, $next ) = _initial_next( $blocks ) if $attr{ sizing };
+    ( $initial, $next ) = _initial_next( $blocks ) if $attr{ resize };
 
     $sql .= "PROMPT " .
             "ALTER TABLE \L$schema$name \UMOVE\n\n" .
@@ -3645,7 +3679,7 @@ sub _resize_table_partition
   $sth->execute;
   my ( $blocks, $initial, $next ) = $sth->fetchrow_array;
 
-  ( $initial, $next ) = _initial_next( $blocks ) if $attr{ sizing };
+  ( $initial, $next ) = _initial_next( $blocks ) if $attr{ resize };
 
   $sql .= "PROMPT " .
           "ALTER TABLE \L$schema$name \UMOVE\n\n" .
@@ -3693,12 +3727,12 @@ sub _segment_attributes
        $blocks,
      ) = @$arrayref;
 
-  ( $initial, $next ) = _initial_next( $blocks ) if $attr{ sizing };
+  ( $initial, $next ) = _initial_next( $blocks ) if $attr{ resize };
 
   if ( $organization eq 'HEAP' )
   {
-    $sql = "${indent}$cache\n" . 
-           "${indent}PCTUSED             $pct_used\n";
+    $sql = "${indent}$cache\n"       unless $cache eq 'N/A';
+    $sql .="${indent}PCTUSED             $pct_used\n";
   }
 
   $sql .= "${indent}PCTFREE             $pct_free\n" .
@@ -3734,12 +3768,12 @@ sub _set_schema
 
 # sub _set_sizing
 #
-# If %attr has an entry for "sizing" == l, generates an arbitrary sizing
+# If %attr has an entry for "resize" == l, generates an arbitrary sizing
 # algorithm wherein the database block size is used to create an array such
 # that each object will have no more than 8 extents.  The INITIAL and NEXT
 # sizes of Tables and Indexes are set to the calculated value.
 #
-# If %attr DOES contain an entry for "sizing", it is parsed and stored in the
+# If %attr DOES contain an entry for "resize", it is parsed and stored in the
 # array called @size_arr.
 #
 sub _set_sizing 
@@ -3757,7 +3791,7 @@ sub _set_sizing
   $sth->execute;
   $block_size = $sth->fetchrow_array / 1024;
 
-  if ( $attr{ sizing } == 1 )
+  if ( $attr{ resize } == 1 )
   {
     # Create default array
     for my $i ( 0 .. 4 )
@@ -3769,16 +3803,16 @@ sub _set_sizing
     # Force upper limit bound
     $size_arr[$#size_arr][0] = 'UNLIMITED';
   }
-  elsif ( $attr{ sizing } )
+  elsif ( $attr{ resize } )
   {
     # parse user supplied string into @size_arr
-    my $remainder = $attr{ sizing };
+    my $remainder = $attr{ resize };
     while ( $remainder ) 
     {
       ( my ($limit,$initial,$next),$remainder ) = split /:/, $remainder, 4;
 
-      die "\nSupplied sizing string is malformed.\n\n" unless $initial;
-      die "\nSupplied sizing string is malformed.\n\n" unless $next;
+      die "\nSupplied resize string is malformed.\n\n" unless $initial;
+      die "\nSupplied resize string is malformed.\n\n" unless $next;
 
       push @size_arr, [$limit, $initial, $next];
     }
@@ -3918,6 +3952,13 @@ sub _table_columns
 __END__
 
 # $Log: Oracle.pm,v $
+# Revision 1.18  2000/11/16 09:14:38  rvsutherland
+# Added DROP CONSTRAINT
+# Corrected CREATE TABLE for partitions (didn't like CACHE/NOCACHE)
+#
+# Revision 1.17  2000/11/11 00:20:42  rvsutherland
+# Moved _create_comments from _create_table_family to _create_table
+#
 # Revision 1.16  2000/11/05 18:50:00  rvsutherland
 # Added CREATE SEQUENCE.
 # Added CREATE SYNONYM.
@@ -3991,7 +4032,7 @@ DDL::Oracle - a DDL generator for Oracle databases
 
 =head1 VERSION
 
-VERSION = 0.16
+VERSION = 0.18
 
 =head1 SYNOPSIS
 
@@ -4008,7 +4049,7 @@ VERSION = 0.16
                          }
      );
 
- # Use default resizing and schema options.
+ # Use default resize and schema options.
  # query default DBA_xxx tables (could use USER_xxx for non-DBA types)
  DDL::Oracle->configure( 
                          dbh    => $dbh,
@@ -4114,11 +4155,11 @@ several session level options.  These are:
               omit the schema syntax; any other arbtrary string will
               be imbedded in the DDL as the schema.  The default is "1".
 
-      sizing  Defines whether and what to use in resizing segments.
+      resize  Defines whether and what to use in resizing segments.
               "1" means resize segments using the default algorithm;
               "0" or "" means keep the current INITIAL and NEXT
               values; any other string will be interpreted as a
-              sizing definition.  The default is "1".
+              resize definition.  The default is "1".
 
       view    Defines which Dictionary views to query:  DBA or USER
              (e.g., DBA_TABLES or USER_TABLES).  The default is DBA.
@@ -4176,7 +4217,9 @@ as a colon delimited field (e.g., 'name:partition').
 
 Copyright (c) 2000, Richard V. Sutherland.  All rights reserved.
 This module is free software.  It may be used, redistributed,
-and/or modified under the same terms as Perl itself.
+and/or modified under the same terms as Perl itself.  See:
+
+    http://www.perl.com/perl/misc/Artistic.html
 
 =cut
 
